@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TXF Pro Viewer</title>
+    <link rel="stylesheet" href="style.css?v=trend10">
+    <!-- TradingView Lightweight Charts v4.1.1 -->
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <script>
+        window.onerror = function(msg, url, lineNo, columnNo, error) {
+            alert('Frontend Error: ' + msg + '\nLine: ' + lineNo + '\n' + error.stack);
+            return false;
+        };
+        window.addEventListener('unhandledrejection', function(event) {
+            alert('Unhandled Promise Rejection: ' + event.reason);
+        });
+    </script>
+    <style>
+        #panes-container {
+            flex: 1;
+            display: grid !important;
+            grid-template-columns: 1fr;
+            gap: 4px;
+            background: #111;
+            min-height: 0;
+            overflow: hidden;
+            width: 100%;
+        }
+        #panes-container.dual-view {
+            grid-template-columns: 1fr 1fr !important;
+        }
+        #panes-container.triple-view {
+            grid-template-columns: 1fr 1fr 1fr !important;
+        }
+        .chart-pane {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background: #000;
+        }
+        .pane-controls {
+            height: 40px; /* 固定高度，防止換行擠壓 */
+            padding: 0 10px;
+            background: #1A1A1A;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            font-size: 0.8rem;
+            border-bottom: 1px solid #333;
+            box-sizing: border-box;
+            flex-shrink: 0; /* 禁止收縮 */
+        }
+        .main-chart {
+            position: relative;
+            width: 100% !important;
+            flex: 1; /* 佔據所有剩餘空間 */
+        }
+        .macd-chart {
+            height: 160px; /* 固定高度，確保時間軸對齊 */
+            background: #000;
+            border-top: 1px solid #333;
+            flex-shrink: 0; /* 禁止收縮 */
+        }
+        .marker-overlay {
+            position: absolute;
+            z-index: 100;
+            font-size: 12px;
+            font-weight: bold;
+            pointer-events: none;
+            background: rgba(0,0,0,0.6);
+            padding: 2px 4px;
+            border-radius: 4px;
+            white-space: nowrap;
+        }
+        .trend-indicator {
+            position: absolute;
+            top: 10px;
+            right: 80px;
+            z-index: 1000;
+            background: rgba(0, 0, 0, 0.6);
+            border: 1px solid #444;
+            border-radius: 20px;
+            padding: 4px 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            pointer-events: none;
+            font-family: 'Inter', sans-serif;
+            font-size: 13px;
+            backdrop-filter: blur(4px);
+        }
+        .trend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: #f1c40f;
+            box-shadow: 0 0 10px currentColor;
+        }
+        .trend-text {
+            font-weight: 600;
+        }
+        @keyframes loading-spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        @keyframes loading-pulse {
+            0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+            50% { transform: translate(-50%, -50%) scale(1.15); opacity: 0.8; }
+        }
+        @keyframes loading-fadePulse {
+            0%, 100% { opacity: 0.5; }
+            50% { opacity: 1; }
+        }
+        
+        /* 🎯 股票模式下：極致淨化，隱藏其餘所有控制項、台積電下拉選單與期貨報價數據！ */
+        #app-container.market-stocks #contract-selector,
+        #app-container.market-stocks .global-controls,
+        #app-container.market-stocks .quote-row,
+        #app-container.market-stocks .grid-row,
+        #app-container.market-stocks #panes-container {
+            display: none !important;
+        }
+    </style>
+</head>
+<body class="dark-theme">
+    
+    <!-- 啟動與登入載入中遮罩 -->
+    <div id="initial-loading-overlay" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(10, 10, 10, 0.95); backdrop-filter: blur(10px); z-index: 10000; align-items: center; justify-content: center; flex-direction: column; color: #fff; font-family: 'Inter', 'Noto Sans TC', sans-serif; transition: opacity 0.5s ease;">
+        <div class="spinner-box" style="position: relative; width: 80px; height: 80px; margin-bottom: 25px;">
+            <div style="box-sizing: border-box; display: block; position: absolute; width: 80px; height: 80px; border: 6px solid rgba(255,255,255,0.1); border-radius: 50%; border-top-color: #4facfe; border-bottom-color: #00f2fe; animation: loading-spin 1.2s cubic-bezier(0.5, 0, 0.5, 1) infinite;"></div>
+            <i class="fas fa-chart-line" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #4facfe; font-size: 1.8rem; animation: loading-pulse 2s infinite;"></i>
+        </div>
+        <div id="initial-loading-title" style="font-size: 1.4rem; font-weight: bold; margin-bottom: 10px; letter-spacing: 1px; background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">系統啟動與數據同步中</div>
+        <div id="initial-loading-text" style="color: #a0a0a0; font-size: 1.05rem; animation: loading-fadePulse 1.5s infinite;">正在登入並同步永豐金證券伺服器...</div>
+    </div>
+    
+    <!-- 登入畫面 -->
+    <div id="login-container" class="container">
+        <h2>🔑 系統登入</h2>
+        <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="api_key">
+        </div>
+        <div class="form-group">
+            <label>Secret Key</label>
+            <input type="password" id="secret_key">
+        </div>
+        <div class="form-group">
+            <label>身分證字號</label>
+            <input type="text" id="person_id">
+        </div>
+        <div class="form-group row">
+            <input type="checkbox" id="is_simulation">
+            <label for="is_simulation">模擬模式 (Simulation)</label>
+        </div>
+        
+        <div id="ca-section">
+            <div class="form-group">
+                <label>憑證路徑</label>
+                <input type="text" id="ca_path" value="C:/Users/user/Desktop/Sinopac.pfx">
+            </div>
+            <div class="form-group">
+                <label>憑證密碼</label>
+                <input type="password" id="ca_passwd">
+            </div>
+        </div>
+        
+        <div class="form-group row">
+            <input type="checkbox" id="save_keys" checked>
+            <label for="save_keys">記住登入資訊 (儲存於本機 .env 檔)</label>
+        </div>
+        
+        <button id="login-btn">🚀 啟動連線</button>
+        <div id="login-msg"></div>
+    </div>
+
+    <!-- 主看盤畫面 -->
+    <div id="app-container" style="display: none; height: 100vh; flex-direction: column;">
+        <div class="header-status" style="padding: 10px;">
+            <div class="title-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <div class="logo-area" style="display: flex; align-items: center; gap: 10px; position: relative; z-index: 1000;">
+                    <i class="fas fa-chart-line" style="color: #4facfe;"></i>
+                    <!-- 市場類別選單 (期貨/股票) -->
+                    <select id="market-type-selector" style="background: #222; color: #fff; border: 1px solid #4facfe; font-size: 1.1rem; font-weight: bold; padding: 5px 12px; border-radius: 6px; cursor: pointer; outline: none; transition: all 0.3s; margin-right: 5px;">
+                        <option value="stocks">📊 股票</option>
+                        <option value="futures">📈 期貨</option>
+                    </select>
+                    <select id="contract-selector" style="background: #222; color: #fff; border: 1px solid #4facfe; font-size: 1.1rem; font-weight: bold; padding: 5px 12px; border-radius: 6px; cursor: pointer; outline: none; transition: all 0.3s;">
+                        <option value="TXFR1">台指近月全 (TXF)</option>
+                        <option value="MXFR1">小台近月全 (MXF)</option>
+                        <option value="TMFR1">微台近月全 (TMF)</option>
+                    </select>
+                </div>
+                <div class="global-controls" style="display: flex; gap: 15px; align-items: center;">
+                    <div id="ws-status" style="font-size: 0.8rem; padding: 2px 8px; border-radius: 10px; background: #333; color: #888;">⚪ 等待連線</div>
+                    <div style="font-size: 0.8rem; color: #666; margin-left: 10px;">接收報價數: <span id="tick-count" style="color: #00FF00;">0</span></div>
+                    <button id="resub-btn" style="width: auto; padding: 2px 8px; font-size: 0.7rem; background: #222; border: 1px solid #444; color: #aaa; cursor: pointer; margin-left: 5px;">🔄 重新訂閱</button>
+                    
+                    <!-- 跨週期連動開關 -->
+                    <div style="display: flex; align-items: center; gap: 5px; background: #222; padding: 4px 10px; border-radius: 4px; border: 1px solid #444; margin-left: 10px;">
+                        <input type="checkbox" id="sync-toggle-btn" checked style="cursor: pointer;">
+                        <label for="sync-toggle-btn" style="color: #aaa; font-size: 0.8rem; cursor: pointer; user-select: none;">跨週期同步</label>
+                    </div>
+
+                    <button id="view-toggle-btn" style="width: auto; padding: 4px 12px; font-size: 0.9rem; background: #4facfe; border: none; color: #fff; border-radius: 4px; margin-left: 10px; cursor: pointer;">切換視窗 (1/2/3)</button>
+                    <div id="q-time" style="color: #666; font-size: 0.9rem;">--</div>
+                </div>
+            </div>
+            <div class="quote-row">
+                <span id="q-price" class="price-huge text-flat">--</span>
+                <span id="q-change" class="price-change text-flat">--</span>
+            </div>
+            <div class="grid-row" style="margin-top: 10px;">
+                <div class="grid-item"><span>開盤</span><span id="g-open">--</span></div>
+                <div class="grid-item"><span>最高</span><span id="g-high">--</span></div>
+                <div class="grid-item"><span>最低</span><span id="g-low">--</span></div>
+                <div class="grid-item"><span>昨收</span><span id="g-ref">--</span></div>
+                <div class="grid-item"><span>總量</span><span id="g-vol">--</span></div>
+            </div>
+        </div>
+        
+        <!-- 圖表主容器：支援單/雙欄 -->
+        <div id="panes-container" style="flex: 1; display: flex; gap: 4px; background: #111; overflow: hidden; position: relative;">
+            
+            <!-- 左/主視窗 -->
+            <div id="pane-1" class="chart-pane" style="flex: 1; border-right: 1px solid #333;">
+                <div class="pane-controls">
+                    <select class="period-select" id="p1-period" style="background: #333; color: #fff; border: 1px solid #444; padding: 2px 5px;">
+                        <option value="1min">1分</option><option value="5min">5分</option><option value="15min">15分</option><option value="30min">30分</option><option value="60min">1時</option><option value="D">日線</option>
+                    </select>
+                    <label style="color: #FFFF00;"><input type="checkbox" id="p1-ma5" checked> 5EMA</label>
+                    <label style="color: #00FFFF;"><input type="checkbox" id="p1-ma10" checked> 10EMA</label>
+                    <label style="color: #B200FF;"><input type="checkbox" id="p1-ma20" checked> 20EMA</label>
+                    <label style="color: #FFF;"><input type="checkbox" id="p1-macd" checked> MACD</label>
+                    <label style="color: #4facfe;"><input type="checkbox" id="p1-pvp" checked> PVP</label>
+                    <label id="p1-trend-bg-wrap" style="color: #ff9f43; display: none;"><input type="checkbox" id="p1-trend-bg"> 趨勢背景</label>
+                </div>
+                <div class="chart-legend" id="p1-legend" style="position: absolute; top: 45px; left: 15px; z-index: 10; pointer-events: none; color: #FFF; font-size: 12px;"></div>
+                <div class="main-chart" id="p1-main"></div>
+                <div class="macd-chart" id="p1-macd-chart"></div>
+                <div class="loading-overlay" id="p1-loading" style="display:none;">載入中...</div>
+            </div>
+
+            <!-- 右視窗 (預設隱藏) -->
+            <div id="pane-2" class="chart-pane" style="flex: 1; display: none;">
+                <div class="pane-controls">
+                    <select class="period-select" id="p2-period" style="background: #333; color: #fff; border: 1px solid #444; padding: 2px 5px;">
+                        <option value="1min">1分</option><option value="5min" selected>5分</option><option value="15min">15分</option><option value="30min">30分</option><option value="60min">1時</option><option value="D">日線</option>
+                    </select>
+                    <label style="color: #FFFF00;"><input type="checkbox" id="p2-ma5" checked> 5EMA</label>
+                    <label style="color: #00FFFF;"><input type="checkbox" id="p2-ma10" checked> 10EMA</label>
+                    <label style="color: #B200FF;"><input type="checkbox" id="p2-ma20" checked> 20EMA</label>
+                    <label style="color: #FFF;"><input type="checkbox" id="p2-macd" checked> MACD</label>
+                    <label style="color: #4facfe;"><input type="checkbox" id="p2-pvp" checked> PVP</label>
+                    <label id="p2-trend-bg-wrap" style="color: #ff9f43; display: none;"><input type="checkbox" id="p2-trend-bg"> 趨勢背景</label>
+                </div>
+                <div class="chart-legend" id="p2-legend" style="position: absolute; top: 45px; left: 15px; z-index: 10; pointer-events: none; color: #FFF; font-size: 12px;"></div>
+                <div class="main-chart" id="p2-main"></div>
+                <div class="macd-chart" id="p2-macd-chart"></div>
+                <div class="loading-overlay" id="p2-loading" style="display:none;">載入中...</div>
+            </div>
+
+            <!-- 右視窗 2 (三圖模式) -->
+            <div id="pane-3" class="chart-pane" style="flex: 1; display: none;">
+                <div class="pane-controls">
+                    <select class="period-select" id="p3-period" style="background: #333; color: #fff; border: 1px solid #444; padding: 2px 5px;">
+                        <option value="1min">1分</option><option value="5min">5分</option><option value="15min">15分</option><option value="30min">30分</option><option value="60min" selected>60分</option><option value="D">日線</option>
+                    </select>
+                    <label style="color: #FFFF00;"><input type="checkbox" id="p3-ma5" checked> 5EMA</label>
+                    <label style="color: #00FFFF;"><input type="checkbox" id="p3-ma10" checked> 10EMA</label>
+                    <label style="color: #B200FF;"><input type="checkbox" id="p3-ma20" checked> 20EMA</label>
+                    <label style="color: #FFF;"><input type="checkbox" id="p3-macd" checked> MACD</label>
+                    <label style="color: #4facfe;"><input type="checkbox" id="p3-pvp" checked> PVP</label>
+                    <label id="p3-trend-bg-wrap" style="color: #ff9f43; display: none;"><input type="checkbox" id="p3-trend-bg"> 趨勢背景</label>
+                </div>
+                <div class="chart-legend" id="p3-legend" style="position: absolute; top: 45px; left: 15px; z-index: 10; pointer-events: none; color: #FFF; font-size: 12px;"></div>
+                <div class="main-chart" id="p3-main"></div>
+                <div class="macd-chart" id="p3-macd-chart"></div>
+                <div class="loading-overlay" id="p3-loading" style="display:none;">載入中...</div>
+            </div>
+
+        </div>
+
+        <!-- 股票專屬分頁頁籤 (切換 股票 模式時顯示) -->
+        <div id="stock-tabs-bar" style="display: none; background: #151515; border-bottom: 1px solid #222; padding: 0 15px; height: 35px; align-items: center; gap: 10px;">
+            <button id="tab-ranking-btn" class="stock-tab-btn" style="background: none; border: none; color: #ff9f43; font-weight: bold; font-size: 0.85rem; padding: 5px 15px; cursor: pointer; border-bottom: 2px solid #ff9f43; height: 100%; outline: none; transition: all 0.3s;">📊 法人排行</button>
+            <button id="tab-screener-btn" class="stock-tab-btn" style="background: none; border: none; color: #888; font-weight: bold; font-size: 0.85rem; padding: 5px 15px; cursor: pointer; border-bottom: 2px solid transparent; height: 100%; outline: none; transition: all 0.3s;">🔍 策略選股</button>
+        </div>
+
+        <!-- 股票看盤選股主容器 (預設隱藏) -->
+        <div id="stock-container-placeholder" style="display: none; flex: 1; flex-direction: column; background: #0a0a0a; color: #fff; padding: 15px; overflow-y: auto; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+            
+            <!-- 頂部標題與更新日期 -->
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid #222; padding-bottom: 10px; flex-shrink: 0;">
+                <div style="text-align: left;">
+                    <h1 style="font-size: 1.3rem; font-weight: 600; margin: 0; background: linear-gradient(135deg, #ff9f43, #ff5252); -webkit-background-clip: text; -webkit-text-fill-color: transparent; display: flex; align-items: center; gap: 8px;">
+                        <i class="fas fa-magic" style="color: #ff9f43;"></i> 專業級籌碼 & 動能策略選股
+                    </h1>
+                </div>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                    <button id="sync-screener-btn" style="background: rgba(255, 159, 67, 0.15); border: 1px solid rgba(255, 159, 67, 0.3); color: #ff9f43; font-weight: bold; font-size: 0.8rem; padding: 6px 15px; border-radius: 20px; cursor: pointer; display: flex; align-items: center; gap: 5px; outline: none;">
+                        🔄 同步選股數據
+                    </button>
+                    <div id="stock-rank-date" style="background: #222; border: 1px solid #333; color: #ff9f43; font-weight: bold; font-size: 0.8rem; padding: 6px 15px; border-radius: 20px;">
+                        📅 載入中...
+                    </div>
+                </div>
+            </div>
+
+            <!-- 載入中狀態 -->
+            <div id="stock-loading-view" style="flex: 1; display: none; flex-direction: column; align-items: center; justify-content: center; min-height: 400px; flex-shrink: 0;">
+                <div class="loading-spinner" style="border: 4px solid rgba(255, 159, 67, 0.1); border-top: 4px solid #ff9f43; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 15px;"></div>
+                <div id="sync-status-text" style="color: #aaa; font-size: 1rem;">正在向證交所同步今日三大法人資料與歷史K線，約需30秒...</div>
+            </div>
+
+            <!-- 主要雙欄區塊 (拆分為兩個獨立分頁面板) -->
+            <div id="stock-tables-view" style="display: flex; flex-direction: column; flex: 1; min-height: 0;">
+                
+                <!-- 1. 策略選股分頁面板 -->
+                <div id="stock-screener-view" style="background: #111; border: 1px solid #222; border-radius: 12px; padding: 15px; display: none; flex-direction: column; min-height: 0; box-shadow: 0 4px 15px rgba(0,0,0,0.4); border-top: 4px solid #ff9f43; flex: 1;">
+                    <h3 style="color: #ff9f43; margin: 0 0 12px 0; font-size: 1rem; font-weight: 600; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #222; padding-bottom: 8px; flex-shrink: 0;">
+                        <i class="fas fa-sliders-h"></i> 策略選股條件與過濾
+                    </h3>
+                    
+                    <!-- 篩選器控制面板 (已隱藏無用之技術過濾滑桿，極致淨化版面) -->
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 15px; margin-bottom: 15px; font-size: 0.85rem; background: #151515; padding: 12px 18px; border-radius: 8px; flex-shrink: 0;">
+                        <div style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap;">
+                            <!-- 隱含值保留相容性 -->
+                            <input type="hidden" id="screener-bias" value="999">
+                            <input type="hidden" id="screener-inst-ratio" value="0">
+
+                            <label style="color: #ccc; display: flex; align-items: center; gap: 6px; font-size: 0.82rem;">
+                                成交金額門檻
+                                <select id="screener-turnover-min" style="background:#222; color:#fff; border:1px solid #444; border-radius:5px; padding:3px 8px; font-size:0.82rem; outline:none; cursor:pointer;">
+                                    <option value="30000000">3,000 萬</option>
+                                    <option value="50000000">5,000 萬</option>
+                                </select>
+                            </label>
+
+                        </div>
+                        <button id="run-screener-btn" style="background: linear-gradient(135deg, #ff9f43, #ff5252); border: none; color: #fff; font-weight: bold; padding: 8px 24px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px; font-size: 0.85rem; box-shadow: 0 4px 10px rgba(255, 159, 67, 0.2); outline: none;">
+                            🔍 執行策略篩選
+                        </button>
+                    </div>
+
+                    <h3 style="color: #4facfe; margin: 0 0 10px 0; font-size: 1rem; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+                        <i class="fas fa-medal"></i> 黃金推薦名單 (依主力買氣優先度排序)
+                        <span id="tier-help-btn" style="background: rgba(165, 94, 234, 0.15); color: #e056fd; border: 1px solid rgba(165, 94, 234, 0.3); font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; margin-left: 8px; cursor: pointer; display: flex; align-items: center; gap: 4px; font-weight: 500; transition: all 0.2s; user-select: none;">
+                            <i class="fas fa-question-circle"></i> 階級說明
+                        </span>
+                    </h3>
+
+                    <!-- 階級說明小幫手卡片 (預設收合) -->
+                    <div id="tier-info-card" style="background: rgba(16, 16, 24, 0.95); border: 1px solid rgba(165, 94, 234, 0.25); border-radius: 8px; padding: 12px; margin-bottom: 12px; font-size: 0.8rem; line-height: 1.5; color: #ccc; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.5); flex-shrink: 0;">
+                        <div style="font-weight: bold; color: #e056fd; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;">
+                            <span style="display: flex; align-items: center; gap: 6px;"><i class="fas fa-graduation-cap"></i> 主力籌碼「評等階級」說明：</span>
+                            <span id="close-tier-info" style="cursor: pointer; color: #888; font-size: 1.1rem; padding: 0 5px;">&times;</span>
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px;">
+                            <div style="background: rgba(255,255,255,0.02); padding: 8px; border-radius: 6px; border-left: 3px solid #ffd700;">
+                                <strong style="color: #ffd700; display: block; margin-bottom: 2px;">👑 1. 黃金滿貫</strong>
+                                <span style="color: #aaa; font-size: 0.75rem;">投信連買 + 外資連買，且當日三大法人共識大買超。最頂級籌碼突破！</span>
+                            </div>
+                            <div style="background: rgba(255,255,255,0.02); padding: 8px; border-radius: 6px; border-left: 3px solid #e056fd;">
+                                <strong style="color: #e056fd; display: block; margin-bottom: 2px;">🥈 2. 強勢雙雄</strong>
+                                <span style="color: #aaa; font-size: 0.75rem;">投信連買 + 外資連買（雙主力共舞）。法人波段重倉與拉抬的首選標的。</span>
+                            </div>
+                            <div style="background: rgba(255,255,255,0.02); padding: 8px; border-radius: 6px; border-left: 3px solid #ff9f43;">
+                                <strong style="color: #ff9f43; display: block; margin-bottom: 2px;">🥉 3. 投信鎖碼</strong>
+                                <span style="color: #aaa; font-size: 0.75rem;">僅投信連買（內資主導）。中小型飆股與季底內資作帳行情極品。</span>
+                            </div>
+                            <div style="background: rgba(255,255,255,0.02); padding: 8px; border-radius: 6px; border-left: 3px solid #4facfe;">
+                                <strong style="color: #4facfe; display: block; margin-bottom: 2px;">🏅 4. 外資鎖碼</strong>
+                                <span style="color: #aaa; font-size: 0.75rem;">僅外資連買（外資主導）。通常為權值型、高流動性產業龍頭吃貨股。</span>
+                            </div>
+                            <div style="background: rgba(255,255,255,0.02); padding: 8px; border-radius: 6px; border-left: 3px solid #aaa; grid-column: 1 / -1;">
+                                <strong style="color: #aaa; display: block; margin-bottom: 2px;">⚪ 5. 主力佈局</strong>
+                                <span style="color: #aaa; font-size: 0.75rem;">三大法人單日或溫和買超。屬於主力低調、暗中溫和吃貨的起漲階段，防守力極佳。</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <script>
+                        // 綁定階級說明按鈕的互動事件
+                        document.addEventListener("DOMContentLoaded", function() {
+                            const btn = document.getElementById("tier-help-btn");
+                            const card = document.getElementById("tier-info-card");
+                            const closeBtn = document.getElementById("close-tier-info");
+                            if (btn && card) {
+                                btn.addEventListener("click", function() {
+                                    if (card.style.display === "none") {
+                                        card.style.display = "block";
+                                        btn.style.background = "rgba(165, 94, 234, 0.3)";
+                                        btn.style.borderColor = "#e056fd";
+                                    } else {
+                                        card.style.display = "none";
+                                        btn.style.background = "rgba(165, 94, 234, 0.15)";
+                                        btn.style.borderColor = "rgba(165, 94, 234, 0.3)";
+                                    }
+                                });
+                            }
+                            if (closeBtn && card && btn) {
+                                closeBtn.addEventListener("click", function() {
+                                    card.style.display = "none";
+                                    btn.style.background = "rgba(165, 94, 234, 0.15)";
+                                    btn.style.borderColor = "rgba(165, 94, 234, 0.3)";
+                                });
+                            }
+                        });
+                    </script>
+
+                    <div style="flex: 1; overflow-y: auto;">
+                        <table class="rank-table" style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.8rem;">
+                            <thead>
+                                <tr style="border-bottom: 2px solid #222; color: #888; font-weight: 500; position: sticky; top: 0; background: #111; z-index: 10;">
+                                    <th style="padding: 8px 4px; width: 55px;">代號</th>
+                                    <th style="padding: 8px 4px; width: 70px;">股名</th>
+                                    <th style="padding: 8px 4px; text-align: center; width: 90px; color: #a55eea;">階級</th>
+                                    <th style="padding: 8px 4px; text-align: right; width: 60px;">價格</th>
+                                    <th style="padding: 8px 4px; text-align: right; width: 50px;">乖離</th>
+                                    <th style="padding: 8px 4px; text-align: right; width: 70px;">20日漲幅</th>
+                                    <th style="padding: 8px 4px; text-align: right; width: 70px;">60日漲幅</th>
+                                    <th style="padding: 8px 4px; text-align: right; width: 70px;">法人佔比</th>
+                                    <th style="padding: 8px 4px; text-align: center; color: #ff9f43;">主力特徵 / 輿情</th>
+                                </tr>
+                            </thead>
+                            <tbody id="screener-results-body">
+                                <tr>
+                                    <td colspan="9" style="text-align: center; color: #666; padding: 40px;">
+                                        💡 請點擊「執行策略篩選」搜尋台股主力突破黃金股
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 2. 法人排行分頁面板 -->
+                <div id="stock-rankings-view" style="display: flex; gap: 15px; flex: 1; min-height: 0;">
+                    
+                    <!-- 買超前 15 名 -->
+                    <div style="background: #111; border: 1px solid #222; border-radius: 12px; padding: 15px; display: flex; flex-direction: column; box-shadow: 0 4px 15px rgba(0,0,0,0.4); border-top: 4px solid #ff4444; flex: 1; min-height: 0;">
+                        <h3 style="color: #ff4444; margin: 0 0 10px 0; font-size: 1rem; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+                            <i class="fas fa-arrow-circle-up"></i> 三大法人淨買超前 15 名 (單位: 張)
+                        </h3>
+                        <div style="flex: 1; overflow-y: auto;">
+                            <table class="rank-table" style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.85rem;">
+                                <thead>
+                                    <tr style="border-bottom: 2px solid #222; color: #888; font-weight: 500; position: sticky; top: 0; background: #111; z-index: 10;">
+                                        <th style="padding: 6px 3px; text-align: center; width: 35px;">名次</th>
+                                        <th style="padding: 6px 3px; width: 55px;">代號</th>
+                                        <th style="padding: 6px 3px;">股名</th>
+                                        <th style="padding: 6px 3px; text-align: right; width: 60px;">外資</th>
+                                        <th style="padding: 6px 3px; text-align: right; width: 60px;">投信</th>
+                                        <th style="padding: 6px 3px; text-align: right; width: 60px;">自營</th>
+                                        <th style="padding: 6px 3px; text-align: right; width: 70px; color: #ff4444;">法人總計</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="stock-buy-rank-body">
+                                    <!-- 這裡會被 JS 動態填充 -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- 賣超前 15 名 -->
+                    <div style="background: #111; border: 1px solid #222; border-radius: 12px; padding: 15px; display: flex; flex-direction: column; box-shadow: 0 4px 15px rgba(0,0,0,0.4); border-top: 4px solid #44ff44; flex: 1; min-height: 0;">
+                        <h3 style="color: #44ff44; margin: 0 0 10px 0; font-size: 1rem; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+                            <i class="fas fa-arrow-circle-down"></i> 三大法人淨賣超前 15 名 (單位: 張)
+                        </h3>
+                        <div style="flex: 1; overflow-y: auto;">
+                            <table class="rank-table" style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.85rem;">
+                                <thead>
+                                    <tr style="border-bottom: 2px solid #222; color: #888; font-weight: 500; position: sticky; top: 0; background: #111; z-index: 10;">
+                                        <th style="padding: 6px 3px; text-align: center; width: 35px;">名次</th>
+                                        <th style="padding: 6px 3px; width: 55px;">代號</th>
+                                        <th style="padding: 6px 3px;">股名</th>
+                                        <th style="padding: 6px 3px; text-align: right; width: 60px;">外資</th>
+                                        <th style="padding: 6px 3px; text-align: right; width: 60px;">投信</th>
+                                        <th style="padding: 6px 3px; text-align: right; width: 60px;">自營</th>
+                                        <th style="padding: 6px 3px; text-align: right; width: 70px; color: #44ff44;">法人總計</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="stock-sell-rank-body">
+                                    <!-- 這裡會被 JS 動態填充 -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 載入主程式 (加入版本號避免快取問題) -->
+    <script src="app_pro.js?v=trend11"></script>
+</body>
+</html>

@@ -1,0 +1,117 @@
+html, body {
+    height: 100vh !important;
+    width: 100vw !important;
+    margin: 0; padding: 0; background-color: #000; color: #d1d4dc;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    overflow: hidden;
+}
+.dark-theme { background: #000; height: 100vh; width: 100vw; display: flex; flex-direction: column; }
+.container {
+    max-width: 400px; margin: 100px auto; padding: 30px;
+    background: #111; border: 1px solid #333; border-radius: 8px;
+}
+.form-group { margin-bottom: 15px; }
+.form-group label { display: block; margin-bottom: 5px; color: #aaa; font-size: 14px; }
+.form-group input[type="text"], .form-group input[type="password"] {
+    width: 100%; padding: 8px; background: #222; border: 1px solid #444; color: #fff; box-sizing: border-box;
+}
+.form-group.row { display: flex; align-items: center; gap: 8px; }
+button {
+    width: 100%; padding: 12px; background: #2196F3; border: none; color: #fff;
+    font-size: 16px; cursor: pointer; border-radius: 4px; transition: 0.2s;
+}
+button:hover { background: #1976D2; }
+button:disabled { background: #555; cursor: not_allowed; }
+
+.price-huge { font-size: 3rem; font-weight: bold; }
+.price-change { font-size: 1.5rem; margin-left: 15px; }
+.text-up { color: #FF0000; }
+.text-down { color: #00FF00; }
+.text-flat { color: #d1d4dc; }
+
+.grid-row { display: flex; gap: 20px; font-size: 0.9rem; }
+.grid-item { display: flex; flex-direction: column; }
+.grid-item span:first-child { color: #666; font-size: 0.8rem; }
+
+#panes-container {
+    flex: 1;
+    display: grid !important;
+    grid-template-columns: 1fr; /* 預設單欄 */
+    gap: 4px;
+    background: #111;
+    min-height: 0;
+    overflow: hidden;
+}
+#panes-container.dual-view {
+    grid-template-columns: 1fr 1fr !important; /* 雙圖模式強制平分 */
+}
+.chart-pane { 
+    min-width: 0; 
+    display: flex; 
+    flex-direction: column;
+    overflow: hidden;
+    background: #000;
+}
+.main-chart, .macd-chart {
+    width: 100% !important;
+}
+.pane-controls {
+    position: relative;
+    z-index: 1005; /* 確保高於 loading-overlay (1000) */
+    border-bottom: 1px solid #333;
+}
+.loading-overlay {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.85); z-index: 1000;
+    display: flex; align-items: center; justify-content: center; 
+    color: #4facfe; font-size: 2rem; font-weight: bold;
+    text-shadow: 0 0 15px rgba(79, 172, 254, 0.8);
+    backdrop-filter: blur(5px);
+    display: none;
+}
+.marker-overlay {
+    position: absolute; font-weight: bold; font-size: 24px; z-index: 20; 
+    display: none; pointer-events: none; text-shadow: 1px 1px 2px #000;
+}
+.chart-legend { pointer-events: none; font-family: sans-serif; }
+
+select { outline: none; border-radius: 4px; }
+input[type="checkbox"] { cursor: pointer; }
+
+/* 股票市場看盤狀態切換 (CSS 狀態隔離) */
+.market-stocks #panes-container {
+    display: none !important;
+}
+.market-stocks #stock-container-placeholder {
+    display: flex !important;
+}
+.market-stocks #contract-selector {
+    display: none !important;
+}
+.market-stocks .global-controls {
+    display: none !important; /* 隱藏期貨特有的控制鈕 (同步與切換視窗) */
+}
+.market-stocks .quote-row, .market-stocks .grid-row {
+    visibility: hidden; /* 隱藏期貨價格看板，因為股票進入還先不用以任何東西 */
+    height: 0;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden;
+}
+
+/* 三大法人排行榜表格美化 */
+.rank-table tbody tr {
+    border-bottom: 1px solid #1a1a1a;
+    transition: background 0.2s;
+}
+.rank-table tbody tr:hover {
+    background: rgba(255, 159, 67, 0.08) !important;
+}
+.rank-table tbody td {
+    padding: 8px 5px;
+    vertical-align: middle;
+}
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}

@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+shioaji
+pandas
+python-dotenv
+websockets

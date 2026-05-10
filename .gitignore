@@ -1,0 +1,23 @@
+# 環境變數（含 API 金鑰與 CA 路徑，每台機器各自設定）
+.env
+
+# 永豐金 CA 憑證
+*.pfx
+
+# 資料庫與快取（執行期產生，不上 git）
+stock_cache.db
+institutional_cache.json
+shioaji.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
