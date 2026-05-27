@@ -6,6 +6,7 @@
 
 # 資料庫與快取（執行期產生，不上 git）
 stock_cache.db
+kbars_cache.db
 institutional_cache.json
 shioaji.log
 

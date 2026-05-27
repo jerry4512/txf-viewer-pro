@@ -4,3 +4,6 @@ shioaji
 pandas
 python-dotenv
 websockets
+certifi
+apscheduler
+anthropic
