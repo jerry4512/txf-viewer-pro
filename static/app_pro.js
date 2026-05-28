@@ -1997,6 +1997,157 @@ function _showTgToast(msg, isError = false) {
     toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 3500);
 }
 
+// ── 整合選股 Telegram 管理 ───────────────────────────────────────────────────
+
+function toggleIntegratedTgPanel() {
+    const panel = document.getElementById('integrated-tg-panel');
+    if (!panel) return;
+    const isOpen = panel.style.display !== 'none';
+    panel.style.display = isOpen ? 'none' : 'block';
+    if (!isOpen) {
+        _loadIntegratedTgTargets();
+        _loadIntegratedTgPushStatus();
+    }
+}
+
+async function _loadIntegratedTgPushStatus() {
+    try {
+        const res  = await fetch('/api/tg/push-status');
+        const data = await res.json();
+        const el   = document.getElementById('integrated-tg-push-status-block');
+        if (!el) return;
+        const statusColor = data.last_push_status === 'success' ? '#26de81' : data.last_push_status ? '#ff9f43' : '#555';
+        const statusLabel = {
+            success:         '✅ 成功',
+            sync_failed:     '❌ 同步失敗',
+            strategy_failed: '❌ 選股失敗',
+            all_failed:      '❌ 傳送全部失敗',
+            no_targets:      '⚠️ 無啟用目標',
+        }[data.last_push_status] || (data.last_push_status ? data.last_push_status : '—');
+        el.innerHTML = `
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;color:#888;">
+                <span>上次推送：<span style="color:#ccc;">${data.last_push_time || '—'}</span></span>
+                <span>推送狀態：<span style="color:${statusColor};font-weight:bold;">${statusLabel}</span></span>
+                <span>TG 精選數：<span style="color:#29b6f6;">${data.last_picks ?? '—'}</span></span>
+                <span>TG 備選數：<span style="color:#29b6f6;">${data.last_watch ?? '—'}</span></span>
+                <span>目標數量：<span style="color:#aaa;">${data.target_count ?? '—'}</span></span>
+                <span>成功傳送：<span style="color:#26de81;">${data.sent_count ?? '—'}</span></span>
+                ${data.last_error ? `<span style="color:#ff4444;grid-column:1/-1;">錯誤：${data.last_error}</span>` : ''}
+            </div>`;
+        // Update summary line
+        const summary = document.getElementById('integrated-tg-status-summary');
+        if (summary) {
+            summary.textContent = data.last_push_time
+                ? `上次推送：${data.last_push_time}｜精選 ${data.last_picks} 檔、備選 ${data.last_watch} 檔`
+                : '尚未推送';
+        }
+    } catch(e) { console.error('TG push status 讀取失敗', e); }
+}
+
+async function _loadIntegratedTgTargets() {
+    try {
+        const res  = await fetch('/api/tg/targets');
+        const data = await res.json();
+        _renderIntegratedTgTargets(data.targets || []);
+    } catch(e) { console.error('TG targets 讀取失敗', e); }
+}
+
+function _renderIntegratedTgTargets(targets) {
+    const list = document.getElementById('integrated-tg-targets-list');
+    if (!list) return;
+    if (!targets || targets.length === 0) {
+        list.innerHTML = `<div style="color:#555;font-size:0.75rem;padding:6px 0;">尚未新增任何目標</div>`;
+        return;
+    }
+    list.innerHTML = targets.map(t => {
+        const enabledColor = t.enabled ? '#26de81' : '#555';
+        const enabledLabel = t.enabled ? '啟用中' : '已停用';
+        return `<div style="display:flex;align-items:center;gap:8px;background:rgba(41,182,246,0.04);border:1px solid rgba(41,182,246,${t.enabled ? '0.2' : '0.08'});border-radius:6px;padding:6px 10px;">
+            <span style="color:${enabledColor};font-size:0.72rem;min-width:48px;">${enabledLabel}</span>
+            <span style="color:#29b6f6;font-size:0.8rem;font-weight:bold;min-width:80px;">👤 ${t.name || '未命名'}</span>
+            <span style="color:#888;font-size:0.75rem;font-family:monospace;flex:1;">${t.chat_id}</span>
+            <button onclick="testSingleIntegratedTgTarget(${t.id})" title="單一測試" style="width:auto;background:rgba(255,211,51,0.1);color:#ffd233;border:1px solid rgba(255,211,51,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.7rem;">🧪</button>
+            <button onclick="toggleIntegratedTgTarget(${t.id}, ${t.enabled ? 0 : 1})" style="width:auto;background:rgba(41,182,246,0.1);color:#29b6f6;border:1px solid rgba(41,182,246,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.7rem;">${t.enabled ? '停用' : '啟用'}</button>
+            <button onclick="deleteIntegratedTgTarget(${t.id})" style="width:auto;background:rgba(255,68,68,0.1);color:#ff4444;border:1px solid rgba(255,68,68,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.7rem;">✕ 刪除</button>
+        </div>`;
+    }).join('');
+}
+
+async function addIntegratedTgTarget() {
+    const name   = document.getElementById('integrated-tg-new-name')?.value.trim();
+    const chatId = document.getElementById('integrated-tg-new-chatid')?.value.trim();
+    const status = document.getElementById('integrated-tg-add-status');
+    if (!chatId) {
+        if (status) status.textContent = '❌ Chat ID 不可為空';
+        return;
+    }
+    try {
+        const res = await fetch('/api/tg/targets', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ chat_id: chatId, name: name || chatId }),
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+            if (status) status.textContent = `✅ 已新增：${name || chatId}`;
+            document.getElementById('integrated-tg-new-name').value   = '';
+            document.getElementById('integrated-tg-new-chatid').value = '';
+            _loadIntegratedTgTargets();
+        } else {
+            if (status) status.textContent = `❌ ${data.detail || '新增失敗'}`;
+        }
+    } catch(e) { if (status) status.textContent = `❌ ${e.message}`; }
+}
+
+async function toggleIntegratedTgTarget(id, enabled) {
+    try {
+        await fetch(`/api/tg/targets/${id}`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ enabled }),
+        });
+        _loadIntegratedTgTargets();
+    } catch(e) { _showTgToast(`❌ 更新失敗：${e.message}`, true); }
+}
+
+async function deleteIntegratedTgTarget(id) {
+    if (!confirm('確定要刪除此 Telegram 目標？')) return;
+    try {
+        await fetch(`/api/tg/targets/${id}`, { method: 'DELETE' });
+        _loadIntegratedTgTargets();
+    } catch(e) { _showTgToast(`❌ 刪除失敗：${e.message}`, true); }
+}
+
+async function testSingleIntegratedTgTarget(id) {
+    _showTgToast('📨 傳送測試訊息中...');
+    try {
+        const res  = await fetch(`/api/tg/test-send/${id}`, { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+            _showTgToast('✅ 單一目標測試傳送成功！');
+        } else {
+            _showTgToast(`❌ ${data.detail || '傳送失敗'}`, true);
+        }
+    } catch(e) { _showTgToast(`❌ ${e.message}`, true); }
+}
+
+async function sendIntegratedTgTest() {
+    const btn = document.getElementById('integrated-tg-test-btn');
+    const origText = btn ? btn.innerHTML : '';
+    if (btn) { btn.innerHTML = '⏳ 傳送中...'; btn.disabled = true; }
+    try {
+        const res  = await fetch('/api/tg/test-send', { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+            _showTgToast(`✅ 已傳送 — 精選 ${data.picks} 檔、備選 ${data.watch} 檔，傳送 ${data.sent} 個目標`);
+        } else {
+            _showTgToast(`❌ ${data.detail || '傳送失敗'}`, true);
+        }
+    } catch(e) {
+        _showTgToast(`❌ 網路錯誤：${e.message}`, true);
+    } finally {
+        if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+    }
+}
+
 function closeStockDrawer() {
     const drawer = document.getElementById('stock-detail-drawer');
     const overlay = document.getElementById('drawer-overlay');
@@ -2358,6 +2509,8 @@ async function startApp(contractCode) {
                 if (tabIntegratedBtn) { tabIntegratedBtn.style.color = '#26de81'; tabIntegratedBtn.style.borderBottomColor = '#26de81'; }
                 if (integratedView) integratedView.style.display = 'flex';
                 loadIntegratedStrategy();
+                _loadIntegratedTgTargets();
+                _loadIntegratedTgPushStatus();
             } else { // industry
                 if (tabIndustryBtn) { tabIndustryBtn.style.color = '#ff9f43'; tabIndustryBtn.style.borderBottomColor = '#ff9f43'; }
                 if (industryView) industryView.style.display = 'flex';
@@ -2484,6 +2637,8 @@ async function startApp(contractCode) {
                     await runScreener();
                     // 同步後刷新明日策略
                     await loadTomorrowStrategy();
+                    // 同步後刷新整合選股
+                    await loadIntegratedStrategy();
                 } else {
                     alert(`同步失敗: ${data.detail || data.message || '未知錯誤'}`);
                     loadingView.style.display = 'none';
@@ -3957,6 +4112,8 @@ async function loadIntegratedStrategy() {
         if (el) el.style.display = 'none';
     });
     if (loading) loading.style.display = 'block';
+
+    _loadIntegratedTgPushStatus();
 
     try {
         const res  = await fetch('/api/integrated-strategy');

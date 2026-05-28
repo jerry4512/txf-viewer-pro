@@ -1152,6 +1152,40 @@
                      ============================================================ -->
                 <div id="stock-integrated-view" style="display:none; flex-direction:column; flex:1; gap:14px; min-height:0; overflow-y:auto; padding-bottom:20px;">
 
+                    <!-- ── TG 推送管理面板 ── -->
+                    <div style="background:#0d1117;border:1px solid rgba(41,182,246,0.3);border-radius:10px;padding:14px 16px;flex-shrink:0;">
+                        <!-- 頂部：狀態摘要 + 按鈕 -->
+                        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+                            <span style="color:#29b6f6;font-size:0.85rem;font-weight:bold;">📨 Telegram 推送設定</span>
+                            <span style="color:#555;font-size:0.75rem;">排程時間：平日 18:00</span>
+                            <div id="integrated-tg-status-summary" style="color:#666;font-size:0.72rem;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></div>
+                            <button onclick="sendIntegratedTgTest()" id="integrated-tg-test-btn" style="width:auto;background:rgba(41,182,246,0.15);color:#29b6f6;border:1px solid rgba(41,182,246,0.4);font-size:0.75rem;padding:5px 14px;border-radius:6px;cursor:pointer;font-weight:bold;white-space:nowrap;transition:all 0.2s;">📨 測試 TG 傳送</button>
+                            <button onclick="toggleIntegratedTgPanel()" style="width:auto;background:rgba(100,100,100,0.1);color:#888;border:1px solid rgba(100,100,100,0.3);font-size:0.72rem;padding:5px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;">⚙️ 管理目標</button>
+                        </div>
+                        <div style="font-size:0.68rem;color:#555;margin-bottom:8px;">測試傳送會使用目前頁面最新整合選股資料，不會重新同步。</div>
+
+                        <!-- 可折疊管理面板 -->
+                        <div id="integrated-tg-panel" style="display:block;border-top:1px solid rgba(255,255,255,0.06);padding-top:12px;margin-top:4px;">
+                            <!-- 狀態詳情 -->
+                            <div id="integrated-tg-push-status-block" style="background:rgba(255,255,255,0.02);border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:0.75rem;line-height:1.8;"></div>
+
+                            <!-- 目標列表 -->
+                            <div style="color:#888;font-size:0.72rem;font-weight:bold;margin-bottom:6px;letter-spacing:0.5px;">目標列表</div>
+                            <div id="integrated-tg-targets-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px;min-height:20px;"></div>
+
+                            <!-- 新增目標 -->
+                            <div style="background:rgba(255,255,255,0.02);border:1px dashed rgba(41,182,246,0.3);border-radius:6px;padding:10px 12px;">
+                                <div style="color:#888;font-size:0.7rem;margin-bottom:6px;">新增 Telegram 目標</div>
+                                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                                    <input id="integrated-tg-new-name" type="text" placeholder="名稱（如：Jerry）" style="flex:0 0 130px;background:#1a1a2e;border:1px solid #333;color:#fff;padding:5px 8px;border-radius:4px;font-size:0.78rem;outline:none;">
+                                    <input id="integrated-tg-new-chatid" type="text" placeholder="Telegram Chat ID" style="flex:1;min-width:160px;background:#1a1a2e;border:1px solid #333;color:#fff;padding:5px 8px;border-radius:4px;font-size:0.78rem;outline:none;">
+                                    <button onclick="addIntegratedTgTarget()" style="width:auto;background:rgba(38,222,129,0.15);color:#26de81;border:1px solid rgba(38,222,129,0.4);padding:5px 14px;border-radius:4px;cursor:pointer;font-size:0.78rem;white-space:nowrap;">＋ 新增</button>
+                                </div>
+                                <div id="integrated-tg-add-status" style="font-size:0.7rem;color:#666;margin-top:6px;"></div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- 載入中 -->
                     <div id="integrated-loading" style="display:none; text-align:center; padding:60px 20px; color:#888;">
                         <div style="border:3px solid rgba(38,222,129,0.2); border-top:3px solid #26de81; border-radius:50%; width:36px; height:36px; animation:spin 1s linear infinite; margin:0 auto 14px;"></div>

@@ -20,6 +20,20 @@ import integrated_strategy  # 整合選股（主決策＋籌碼輔助）
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
+_BASE_DIR_MAIN = os.path.dirname(os.path.abspath(__file__))
+_STOCK_DB_PATH = os.path.join(_BASE_DIR_MAIN, "stock_cache.db")
+
+_tg_push_status = {
+    "last_push_time":   None,
+    "last_push_status": None,
+    "last_picks":       0,
+    "last_watch":       0,
+    "last_error":       None,
+    "target_count":     0,
+    "sent_count":       0,
+}
+_last_integrated_result = None
+
 app = FastAPI(title="TXF Pro Viewer Backend")
 
 def safe_float(val, default=0.0):
@@ -1494,6 +1508,305 @@ def _send_tg_to_all(message: str) -> dict:
             fail_count += 1
     return {"ok": ok_count, "fail": fail_count, "errors": errors}
 
+# ── 整合選股 TG 推送：DB 目標管理 ─────────────────────────────────────────────
+
+def _get_tg_db_conn():
+    conn = sqlite3.connect(_STOCK_DB_PATH, timeout=60.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except Exception:
+        pass
+    return conn
+
+def _init_tg_targets_table():
+    conn = _get_tg_db_conn()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_targets (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id    TEXT NOT NULL UNIQUE,
+                name       TEXT,
+                enabled    INTEGER DEFAULT 1,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
+        conn.commit()
+        # 若 DB 為空，從 .env TELEGRAM_RECIPIENTS 種子
+        count = conn.execute("SELECT COUNT(*) FROM telegram_targets").fetchone()[0]
+        if count == 0:
+            recipients = _get_tg_recipients()
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for r in recipients:
+                cid  = str(r.get("chatId") or r.get("chat_id") or "").strip()
+                name = str(r.get("name", "") or cid).strip()
+                if cid:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO telegram_targets (chat_id, name, enabled, created_at, updated_at) VALUES (?,?,1,?,?)",
+                        (cid, name, now, now),
+                    )
+            conn.commit()
+    finally:
+        conn.close()
+
+def _get_tg_db_targets(enabled_only: bool = False) -> list:
+    conn = _get_tg_db_conn()
+    try:
+        q = "SELECT * FROM telegram_targets"
+        if enabled_only:
+            q += " WHERE enabled=1"
+        q += " ORDER BY id ASC"
+        rows = conn.execute(q).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[TG-DB] 讀取目標失敗：{e}")
+        return []
+    finally:
+        conn.close()
+
+def _send_tg_with_targets(message: str, targets: list) -> dict:
+    """廣播訊息給指定的目標列表（自動分段）"""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        return {"ok": 0, "fail": 0, "errors": ["尚未設定 Bot Token"]}
+    if not targets:
+        return {"ok": 0, "fail": 0, "errors": ["無目標收件人"]}
+    url   = f"https://api.telegram.org/bot{token}/sendMessage"
+    parts = _split_tg_message(message)
+    ok_count, fail_count, errors = 0, 0, []
+    for t in targets:
+        chat_id = str(t.get("chat_id") or t.get("chatId") or "").strip()
+        if not chat_id:
+            continue
+        recipient_ok = True
+        for part in parts:
+            success, err = _tg_post(url, chat_id, part)
+            if not success:
+                recipient_ok = False
+                errors.append(f"{t.get('name', '?')}：{err}")
+                break
+        if recipient_ok:
+            ok_count += 1
+        else:
+            fail_count += 1
+    return {"ok": ok_count, "fail": fail_count, "errors": errors}
+
+def is_tw_market_trading_day(dt=None) -> bool:
+    """判斷是否為台股交易日（初版：排除週六週日）"""
+    if dt is None:
+        dt = datetime.now()
+    return dt.weekday() < 5
+
+def calculate_tg_score(stock: dict) -> float:
+    """計算 TG 精選排序分數（0~100）"""
+    score = 0.0
+
+    sl_abs = abs(stock.get("stop_loss_pct") or 0)
+    if sl_abs <= 2:
+        score += 25
+    elif sl_abs <= 3:
+        score += 20
+    elif sl_abs <= 4:
+        score += 15
+    else:
+        score += 5
+
+    dist = abs(stock.get("dist_cost20_pct") or 0)
+    if dist <= 1:
+        score += 20
+    elif dist <= 2:
+        score += 17
+    elif dist <= 3:
+        score += 12
+    else:
+        score += 4
+
+    rr = stock.get("risk_reward") or 0
+    if 2 <= rr <= 5:
+        score += 20
+    elif 1.5 <= rr < 2:
+        score += 15
+    elif 5 < rr <= 8:
+        score += 10
+    elif rr > 8:
+        score += 5
+
+    macd = stock.get("macd_status", "")
+    if macd == "負柱收斂":
+        score += 15
+    elif macd == "正柱放大":
+        score += 10
+    elif macd in ("正柱收斂", "正柱"):
+        score += 5
+
+    trust   = stock.get("trust_5d", 0) or 0
+    foreign = stock.get("foreign_5d", 0) or 0
+    tc      = stock.get("trust_consecutive", 0) or 0
+    fc      = stock.get("foreign_consecutive", 0) or 0
+    if trust > 0 and foreign > 0:
+        score += 10
+    elif trust > 0 or foreign > 0:
+        score += 6
+    if tc >= 3:
+        score += 3
+    if fc >= 3:
+        score += 2
+
+    if stock.get("has_industry_resonance"):
+        score += 5
+    elif (stock.get("industry_score") or 0) >= 80:
+        score += 3
+    elif (stock.get("industry_score") or 0) >= 60:
+        score += 1
+
+    score += (stock.get("final_score") or 0) * 0.05
+    return round(min(100.0, score), 1)
+
+
+def build_tg_pick_list(integrated_result: dict) -> dict:
+    """從整合選股結果中挑選 TG 精選（最多3）與備選（最多2）"""
+    buy = integrated_result.get("buy_candidates", [])
+    tg_picks, tg_watch, tg_skipped = [], [], []
+
+    for s in buy:
+        grade  = s.get("stock_grade", "")
+        dist   = abs(s.get("dist_cost20_pct") or 999)
+        sl_abs = abs(s.get("stop_loss_pct") or 0)
+        rr     = s.get("risk_reward") or 0
+        macd   = s.get("macd_status", "")
+
+        if grade != "A" or dist > 3 or rr < 1.5 or sl_abs > 5.5 or macd == "負柱擴大":
+            tg_skipped.append(s)
+            continue
+
+        tg_warning = "風報比偏高，需複查停損與目標" if rr > 8 else ""
+        tg_score   = calculate_tg_score(s)
+        s_copy = dict(s)
+        s_copy["tg_score"]   = tg_score
+        s_copy["tg_warning"] = tg_warning
+
+        if sl_abs <= 4 and macd in ("負柱收斂", "正柱放大"):
+            tg_picks.append(s_copy)
+        else:
+            tg_watch.append(s_copy)
+
+    tg_picks.sort(key=lambda x: -x.get("tg_score", 0))
+    tg_watch.sort(key=lambda x: -x.get("tg_score", 0))
+
+    return {
+        "tg_picks":   tg_picks[:3],
+        "tg_watch":   tg_watch[:2],
+        "tg_skipped": tg_skipped,
+    }
+
+
+def get_today_strong_industries_from_result(integrated_result: dict) -> list:
+    """從整合選股結果中計算今日強勢產業（分數≥60，最多5名）"""
+    from collections import defaultdict
+    all_stocks = (
+        integrated_result.get("buy_candidates", []) +
+        integrated_result.get("high_priority_watch", []) +
+        integrated_result.get("wait_pullback", []) +
+        integrated_result.get("other_watch", [])
+    )
+    groups: dict = defaultdict(list)
+    for s in all_stocks:
+        ind = (s.get("industry") or "").strip() or "其他"
+        groups[ind].append(s)
+
+    rankings = []
+    for ind_name, stocks in groups.items():
+        if not stocks:
+            continue
+        ind_score = stocks[0].get("industry_score", 0) or 0
+        status    = stocks[0].get("industry_status", "") or ""
+        if ind_score < 60:
+            continue
+        buy_stocks  = [s for s in stocks if s.get("final_category") == "buy_candidates"]
+        top_stocks  = [f"{s['stock_id']} {s['stock_name']}" for s in buy_stocks[:3]]
+        rankings.append({
+            "rank":            0,
+            "industry":        ind_name,
+            "score":           ind_score,
+            "status":          status,
+            "candidate_count": len(stocks),
+            "top_stocks":      top_stocks,
+        })
+
+    rankings.sort(key=lambda x: -x["score"])
+    for i, r in enumerate(rankings, 1):
+        r["rank"] = i
+    return rankings[:5]
+
+
+def format_tg_integrated_message(data_date: str, market_regime: dict, tg_list: dict, strong_industries: list) -> str:
+    """組成整合選股 TG 訊息（精選≤3、備選≤2、強勢產業≤5）"""
+    now_str   = datetime.now().strftime("%Y-%m-%d %H:%M")
+    mr        = market_regime or {}
+    mr_label  = mr.get("label", "正常多頭")
+    mr_status = mr.get("status", "normal_bull")
+    mr_emoji  = {"normal_bull": "🟢", "hot_bull": "🟡", "overheated_bull": "🔴", "weak_market": "⚪"}.get(mr_status, "📊")
+
+    tg_picks = tg_list.get("tg_picks", [])
+    tg_watch = tg_list.get("tg_watch", [])
+    SEP      = "─" * 28
+
+    lines = [f"📌 *{data_date} 明日精選股*"]
+    lines.append(f"大盤狀態：{mr_emoji} {mr_label}")
+    lines.append(f"操作原則：A級、距cost20≤3%、停損≤4%、MACD收斂或正柱放大")
+    lines.append(SEP)
+
+    if strong_industries:
+        lines.append("🏭 *今日強勢產業*")
+        for ind in strong_industries:
+            top = "、".join(ind["top_stocks"][:2]) if ind.get("top_stocks") else ""
+            lines.append(f"{ind['rank']}. {ind['industry']}｜分數 {ind['score']}｜{ind['status']}｜候選 {ind['candidate_count']} 檔")
+            if top:
+                lines.append(f"   代表：{top}")
+    else:
+        lines.append("🏭 今日無明顯強勢產業")
+    lines.append(SEP)
+
+    if tg_picks:
+        lines.append(f"🔥 *明日精選 {len(tg_picks)} 檔*")
+        num_emojis = ["1️⃣", "2️⃣", "3️⃣"]
+        for i, s in enumerate(tg_picks):
+            industry = s.get("industry") or "未分類"
+            close_p  = s.get("close", 0)
+            dist     = s.get("dist_cost20_pct") or 0
+            sl_price = s.get("stop_price", 0)
+            sl_pct   = s.get("stop_loss_pct") or 0
+            rr       = s.get("risk_reward") or 0
+            macd     = s.get("macd_status", "")
+            inst_sum = s.get("institution_5d_status", "")
+            warning  = s.get("tg_warning", "")
+            num      = num_emojis[i] if i < 3 else f"{i+1}."
+            lines.append(f"\n{num} *{s['stock_id']} {s['stock_name']}*｜{industry}")
+            lines.append(f"現價 {close_p}｜距cost20 {'+' if dist>=0 else ''}{dist:.1f}%｜停損 {sl_price}（{sl_pct:.1f}%）")
+            lines.append(f"MACD：{macd}｜風報比 {rr:.1f}｜法人：{inst_sum}")
+            lines.append(f"建議：A級股，距cost20 {dist:.1f}%，停損{sl_pct:.1f}%，MACD{macd}。")
+            if warning:
+                lines.append(f"⚠️ {warning}")
+    else:
+        lines.append("🔥 今日無符合 TG 精選條件的明日可買")
+    lines.append(SEP)
+
+    if tg_watch:
+        lines.append(f"👀 *備選 {len(tg_watch)} 檔*")
+        for s in tg_watch:
+            industry = s.get("industry") or "未分類"
+            sl_pct   = s.get("stop_loss_pct") or 0
+            reason   = s.get("final_reason") or ""
+            lines.append(f"{s['stock_id']} {s['stock_name']}｜{industry}")
+            lines.append(f"分數 {s.get('final_score', 0)}｜停損 {sl_pct:.1f}% 偏大")
+            if reason:
+                lines.append(f"原因：{reason[:60]}")
+    lines.append(SEP)
+    lines.append(f"🕐 {now_str}")
+    return "\n".join(lines)
+
+
 @app.get("/api/telegram/config")
 async def api_telegram_get_config():
     """讀取目前 Telegram 設定"""
@@ -1539,6 +1852,126 @@ async def api_telegram_send(payload: dict = {}):
         raise HTTPException(status_code=502, detail=f"全部傳送失敗：{result['errors']}")
     return {"status": "ok", "sent": len(stocks), "recipients": result["ok"], "failed": result["fail"]}
 
+# ── 整合選股 TG 目標管理 API ──────────────────────────────────────────────────
+
+@app.get("/api/tg/targets")
+async def api_tg_list_targets():
+    """列出所有 Telegram 目標（整合選股專用）"""
+    return {"success": True, "targets": _get_tg_db_targets()}
+
+@app.post("/api/tg/targets")
+async def api_tg_add_target(payload: dict = {}):
+    """新增 Telegram 目標"""
+    chat_id = str(payload.get("chat_id", "")).strip()
+    name    = str(payload.get("name", "")).strip() or chat_id
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id 不可為空")
+    now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = _get_tg_db_conn()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO telegram_targets (chat_id, name, enabled, created_at, updated_at) VALUES (?,?,1,?,?)",
+            (chat_id, name, now, now),
+        )
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.put("/api/tg/targets/{target_id}")
+async def api_tg_update_target(target_id: int, payload: dict = {}):
+    """更新目標啟用狀態或名稱"""
+    now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = _get_tg_db_conn()
+    try:
+        if "enabled" in payload:
+            conn.execute(
+                "UPDATE telegram_targets SET enabled=?, updated_at=? WHERE id=?",
+                (1 if payload["enabled"] else 0, now, target_id),
+            )
+        if "name" in payload:
+            conn.execute(
+                "UPDATE telegram_targets SET name=?, updated_at=? WHERE id=?",
+                (str(payload["name"]), now, target_id),
+            )
+        conn.commit()
+        return {"success": True}
+    finally:
+        conn.close()
+
+@app.delete("/api/tg/targets/{target_id}")
+async def api_tg_delete_target(target_id: int):
+    """刪除目標"""
+    conn = _get_tg_db_conn()
+    try:
+        conn.execute("DELETE FROM telegram_targets WHERE id=?", (target_id,))
+        conn.commit()
+        return {"success": True}
+    finally:
+        conn.close()
+
+@app.get("/api/tg/push-status")
+async def api_tg_push_status():
+    """查詢上次 TG 整合選股推送狀態"""
+    return _tg_push_status
+
+@app.post("/api/tg/test-send")
+async def api_tg_test_send_integrated():
+    """使用目前最新整合選股資料測試 TG 推送（不重新同步）"""
+    global _last_integrated_result
+    if not _last_integrated_result:
+        raise HTTPException(status_code=400, detail="目前沒有整合選股資料，請先執行整合選股。")
+    targets = _get_tg_db_targets(enabled_only=True)
+    if not targets:
+        env_recipients = _get_tg_recipients()
+        targets = [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in env_recipients]
+    if not targets:
+        raise HTTPException(status_code=400, detail="尚未設定任何 Telegram 目標，請先新增目標 ID。")
+    tg_list    = build_tg_pick_list(_last_integrated_result)
+    strong_ind = get_today_strong_industries_from_result(_last_integrated_result)
+    msg = format_tg_integrated_message(
+        _last_integrated_result.get("data_date", datetime.now().strftime("%Y-%m-%d")),
+        _last_integrated_result.get("market_regime", {}),
+        tg_list, strong_ind,
+    )
+    result = _send_tg_with_targets(msg, targets)
+    if result["ok"] == 0:
+        raise HTTPException(status_code=502, detail=f"全部傳送失敗：{result['errors']}")
+    return {
+        "status": "ok",
+        "picks":  len(tg_list["tg_picks"]),
+        "watch":  len(tg_list["tg_watch"]),
+        "sent":   result["ok"],
+        "failed": result["fail"],
+    }
+
+@app.post("/api/tg/test-send/{target_id}")
+async def api_tg_test_send_single(target_id: int):
+    """對單一目標測試 TG 推送"""
+    global _last_integrated_result
+    if not _last_integrated_result:
+        raise HTTPException(status_code=400, detail="目前沒有整合選股資料，請先執行整合選股。")
+    conn = _get_tg_db_conn()
+    try:
+        row = conn.execute("SELECT * FROM telegram_targets WHERE id=?", (target_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="找不到此目標")
+    tg_list    = build_tg_pick_list(_last_integrated_result)
+    strong_ind = get_today_strong_industries_from_result(_last_integrated_result)
+    msg = format_tg_integrated_message(
+        _last_integrated_result.get("data_date", datetime.now().strftime("%Y-%m-%d")),
+        _last_integrated_result.get("market_regime", {}),
+        tg_list, strong_ind,
+    )
+    result = _send_tg_with_targets(msg, [dict(row)])
+    if result["ok"] == 0:
+        raise HTTPException(status_code=502, detail=f"傳送失敗：{result['errors']}")
+    return {"status": "ok"}
+
 # ── 排程：每週一到五 18:00 自動同步 + 篩選 + 傳送 Telegram ─────────────────
 
 scheduler = AsyncIOScheduler(timezone="Asia/Taipei")
@@ -1552,14 +1985,21 @@ def _send_telegram_message(message: str):
         print(f"[Scheduler] Telegram 傳送失敗：{result['errors']}")
 
 async def _scheduled_sync_and_alert():
-    """排程任務主體：同步數據 → 執行篩選 → 傳送 Telegram"""
-    global api, is_logged_in
-    now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
-    print(f"[Scheduler] ▶ 排程任務啟動 {now_str}")
+    """排程任務主體：同步數據 → 整合選股 → TG 精選 → 傳送 Telegram"""
+    global api, is_logged_in, _last_integrated_result, _tg_push_status
+    now      = datetime.now()
+    now_str  = now.strftime("%Y-%m-%d %H:%M:%S")
+    date_str = now.strftime("%Y-%m-%d")
+    print(f"[{now_str}] TG stock push started")
 
-    # 1. 同步數據（需要已登入）
+    if not is_tw_market_trading_day(now):
+        print(f"[{now_str}] 今日非交易日，略過推送")
+        return
+
+    # 1. 同步數據
+    sync_ok = True
     if not is_logged_in:
-        print("[Scheduler] 尚未登入，略過 K 線同步，嘗試直接用快取篩選")
+        print(f"[{now_str}] 尚未登入，略過 K 線同步，嘗試直接用快取篩選")
     else:
         try:
             curr = datetime.now()
@@ -1574,63 +2014,74 @@ async def _scheduled_sync_and_alert():
                     if synced_days >= 5:
                         break
                 except Exception as e:
-                    print(f"[Scheduler] 法人同步 {test_date.strftime('%Y-%m-%d')} 失敗：{e}")
-
+                    print(f"[{now_str}] 法人同步 {test_date.strftime('%Y-%m-%d')} 失敗：{e}")
             candidates = screener.get_inst_5d_candidates()
             sync_codes = candidates if candidates else screener.DEFAULT_STOCKS
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: screener.sync_stock_kbars(api, sync_codes))
-            print("[Scheduler] 數據同步完成")
+            print(f"[{now_str}] sync success")
         except Exception as e:
-            print(f"[Scheduler] 數據同步失敗：{e}")
+            sync_ok = False
+            err_msg = f"同步失敗：{e}"
+            print(f"[{now_str}] {err_msg}")
+            _tg_push_status.update({"last_push_time": now_str, "last_push_status": "sync_failed", "last_error": err_msg})
+            err_tg = (f"⚠️ *{date_str} 選股同步失敗*\n原因：{e}\n系統未推送明日精選股，避免使用舊資料。")
+            targets = _get_tg_db_targets(enabled_only=True) or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
+            if targets:
+                _send_tg_with_targets(err_tg, targets)
+            return
 
-    # 2. 執行策略篩選
+    # 2. 執行整合選股
     try:
-        result_dict = screener.run_screener_query()
-        results = result_dict.get("stocks", []) if isinstance(result_dict, dict) else result_dict
-        sched_market_status = result_dict.get("market_status") if isinstance(result_dict, dict) else None
-        def _is_sendable(s):
-            return s.get("industry") != "ETF" and (s.get("buy_method") or {}).get("allowed", True)
-
-        all_priority = [s for s in results if s.get("strategyState") == "明日優先"]
-        all_priority.sort(key=lambda s: s.get("score") or 0, reverse=True)
-        priority = [s for s in all_priority if _is_sendable(s)]
-
-        # 不足5筆時從觀察中補滿
-        if len(priority) < 5:
-            watching = [s for s in results if s.get("strategyState") == "觀察中" and _is_sendable(s)]
-            watching.sort(key=lambda s: s.get("score") or 0, reverse=True)
-            priority = priority + watching[:5 - len(priority)]
-
-        print(f"[Scheduler] 篩選完成，明日優先：{len(all_priority)} 檔，傳送名單：{len(priority)} 檔（含補滿），共 {len(results)} 檔")
+        result = integrated_strategy.run_integrated_strategy()
+        _last_integrated_result = result
+        buy_count = len(result.get("buy_candidates", []))
+        print(f"[{now_str}] integrated strategy success, buy_candidates={buy_count}")
     except Exception as e:
-        print(f"[Scheduler] 篩選失敗：{e}")
-        _send_telegram_message(f"⚠️ *排程篩選失敗*\n{now_str}\n錯誤：{e}")
+        err_msg = f"整合選股失敗：{e}"
+        print(f"[{now_str}] {err_msg}")
+        _tg_push_status.update({"last_push_time": now_str, "last_push_status": "strategy_failed", "last_error": err_msg})
+        targets = _get_tg_db_targets(enabled_only=True) or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
+        if targets:
+            _send_tg_with_targets(f"⚠️ *{date_str} 排程篩選失敗*\n錯誤：{e}", targets)
         return
 
-    # 3. 組成並傳送 Telegram 訊息
-    ms_label  = (sched_market_status or {}).get('label', '正常多頭')
-    ms_status = (sched_market_status or {}).get('status', 'normal_bull')
-    ms_emoji  = {'normal_bull': '🟢', 'hot_bull': '🟡', 'overheated_bull': '🔴', 'weak_market': '⚪'}.get(ms_status, '📊')
-    ms_suggest = (sched_market_status or {}).get('suggestion', '')
+    # 3. 建立 TG 精選名單與強勢產業
+    tg_list    = build_tg_pick_list(result)
+    strong_ind = get_today_strong_industries_from_result(result)
+    print(f"[{now_str}] strong_industries={len(strong_ind)}")
+    print(f"[{now_str}] tg_picks={len(tg_list['tg_picks'])}, tg_watch={len(tg_list['tg_watch'])}")
 
-    if not priority:
-        no_stock_msg = (
-            f"📊 今日市場狀態：{ms_emoji} *{ms_label}*\n"
-            f"🕐 {now_str}\n\n"
-            f"今日無符合條件的明日優先標的。\n"
-            f"建議：{ms_suggest}"
-        )
-        _send_telegram_message(no_stock_msg)
+    # 4. 組成 TG 訊息
+    data_date = result.get("data_date", date_str)
+    msg = format_tg_integrated_message(data_date, result.get("market_regime", {}), tg_list, strong_ind)
+
+    # 5. 讀取目標並傳送
+    targets = _get_tg_db_targets(enabled_only=True)
+    if not targets:
+        targets = [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
+    print(f"[{now_str}] telegram targets={len(targets)}")
+
+    if not targets:
+        print(f"[{now_str}] 無啟用中的 Telegram 目標，略過傳送")
+        _tg_push_status.update({
+            "last_push_time": now_str, "last_push_status": "no_targets",
+            "last_picks": len(tg_list["tg_picks"]), "last_watch": len(tg_list["tg_watch"]),
+            "last_error": "無啟用中的目標", "target_count": 0, "sent_count": 0,
+        })
         return
 
-    total_priority = len(priority)
-    priority = priority[:5]
-    _send_telegram_message(_build_tg_message(
-        priority, "明日優先",
-        total=total_priority, all_stocks=results,
-        market_status=sched_market_status
-    ))
+    send_result = _send_tg_with_targets(msg, targets)
+    print(f"[{now_str}] telegram targets={len(targets)}, sent={send_result['ok']}, failed={send_result['fail']}")
+    _tg_push_status.update({
+        "last_push_time":   now_str,
+        "last_push_status": "success" if send_result["ok"] > 0 else "all_failed",
+        "last_picks":       len(tg_list["tg_picks"]),
+        "last_watch":       len(tg_list["tg_watch"]),
+        "last_error":       "; ".join(send_result["errors"]) if send_result["errors"] else None,
+        "target_count":     len(targets),
+        "sent_count":       send_result["ok"],
+    })
 
 @app.get("/api/debug/contracts")
 async def api_debug_contracts():
@@ -1738,8 +2189,10 @@ async def api_tomorrow_strategy():
 @app.get("/api/integrated-strategy")
 async def api_integrated_strategy():
     """整合選股（tomorrow_strategy 主決策 + screener 籌碼輔助）"""
+    global _last_integrated_result
     try:
         result = integrated_strategy.run_integrated_strategy()
+        _last_integrated_result = result
         return result
     except Exception as e:
         import traceback
@@ -1759,14 +2212,15 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.on_event("startup")
 async def startup_event():
+    _init_tg_targets_table()
     scheduler.add_job(
         _scheduled_sync_and_alert,
         CronTrigger(day_of_week="mon-fri", hour=18, minute=0, timezone="Asia/Taipei"),
         id="daily_alert",
-        name="每日18:00策略篩選+Telegram通知",
+        name="每日18:00整合選股+Telegram精選推送",
         replace_existing=True,
-        misfire_grace_time=3600,  # 錯過 1 小時內仍補執行
-        coalesce=True             # 多次錯過只補跑一次
+        misfire_grace_time=3600,
+        coalesce=True,
     )
     scheduler.start()
     print("[Scheduler] 排程已啟動 — 每週一至週五 18:00 自動執行")
