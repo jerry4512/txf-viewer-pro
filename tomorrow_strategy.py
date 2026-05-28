@@ -20,6 +20,7 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 from typing import Optional, Tuple
+from market_status import TAIEX_SYMBOL
 
 # ── 路徑 ──────────────────────────────────────────────────────────────────────
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -207,10 +208,11 @@ def _macd_status(hist: pd.Series) -> str:
 
 # ── 大盤狀態判斷 ──────────────────────────────────────────────────────────────
 
-def calculate_market_regime(taiex_df: Optional[pd.DataFrame]) -> dict:
+def calculate_market_regime(taiex_df: Optional[pd.DataFrame], data_date: Optional[str] = None) -> dict:
     """
     從加權指數日 K DataFrame 判斷大盤五狀態。
     taiex_df：columns = date, open, high, low, close, volume
+    data_date：若傳入，則過濾至該日期並驗證最後一筆必須等於 data_date。
     """
 
     def _build(status: str, basis: str, metrics: dict) -> dict:
@@ -240,7 +242,27 @@ def calculate_market_regime(taiex_df: Optional[pd.DataFrame]) -> dict:
 
     df = taiex_df.copy().sort_values("date").reset_index(drop=True)
 
+    # data_date 驗證：過濾到指定日期，並確認最後一筆 == data_date
+    if data_date is not None:
+        df = df[df["date"] <= data_date].reset_index(drop=True)
+        actual_last = str(df.iloc[-1]["date"]) if not df.empty else "無資料"
+        if actual_last != data_date:
+            print(f"[大盤計算] market_data_date={actual_last} ≠ data_date={data_date}，拒絕使用舊大盤狀態")
+            return _build(
+                REGIME_HEALTHY_PB,
+                f"大盤資料日期 {actual_last} ≠ 要求日期 {data_date}，拒絕使用舊大盤狀態",
+                {"data_available": False, "regime_error": True,
+                 "actual_data_date": actual_last, "expected_data_date": data_date},
+            )
+        if len(df) < _MIN_BARS:
+            return _build(
+                REGIME_HEALTHY_PB,
+                f"過濾至 data_date={data_date} 後 K 線不足（{len(df)} 根），使用預設狀態",
+                _no_data,
+            )
+
     closes  = df["close"].astype(float)
+    opens   = df["open"].astype(float)
     highs   = df["high"].astype(float)
     lows    = df["low"].astype(float)
     volumes = df["volume"].astype(float)
@@ -263,6 +285,9 @@ def calculate_market_regime(taiex_df: Optional[pd.DataFrame]) -> dict:
         macd_ok = False
 
     close    = float(closes.iloc[-1])
+    open_    = float(opens.iloc[-1])
+    high_    = float(highs.iloc[-1])
+    low_     = float(lows.iloc[-1])
     vol_now  = float(volumes.iloc[-1])
     vol_ma20_raw = float(volumes.rolling(20).mean().iloc[-1])
 
@@ -293,9 +318,19 @@ def calculate_market_regime(taiex_df: Optional[pd.DataFrame]) -> dict:
     macd_pos_expand = macd_status_str == "正柱放大"
     macd_neg_expand = macd_status_str == "負柱擴大"
 
+    _day_range      = high_ - low_
+    _close_pos      = (close - low_) / _day_range if _day_range > 0 else 0.5
+    _day_declining  = close < open_
+    _close_near_low = _close_pos < 0.4
+
     metrics = {
-        "data_available":       True,
-        "index_close":          round(close, 2),
+        "data_available":            True,
+        "index_close":               round(close, 2),
+        "index_open":                round(open_, 2),
+        "index_high":                round(high_, 2),
+        "index_low":                 round(low_, 2),
+        "market_day_declining":      _day_declining,
+        "market_close_near_low":     _close_near_low,
         "cost20":               round(c20, 2),
         "cost60":               round(c60, 2),
         "dist_cost20_pct":      round(dist_cost20_pct, 2),
@@ -517,6 +552,9 @@ def _analyze_stock(code: str, name: str, industry: str, sub_df: pd.DataFrame) ->
         "grade_label":            grade_label,
         "grade_color":            grade_color,
         "close":                  round(close, 2),
+        "open_price":             round(open_val, 2),
+        "high_price":             round(high_val, 2),
+        "low_price":              round(low_val, 2),
         "cost_20":                round(c20, 2),
         "cost_60":                round(c60, 2),
         "dist_cost20_pct":        round(dist_cost20_pct, 2),
@@ -854,7 +892,7 @@ _GRADE_SORT = {"A": 0, "B1": 1, "B2": 2, "C": 3}
 
 # ── 主函式 ────────────────────────────────────────────────────────────────────
 
-def run_tomorrow_strategy() -> dict:
+def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
     """
     主入口。回傳：
     {
@@ -876,7 +914,22 @@ def run_tomorrow_strategy() -> dict:
         taiex_df = None
         print(f"[TomorrowStrategy] TAIEX 資料取得失敗: {e}")
 
-    market_regime = calculate_market_regime(taiex_df)
+    market_regime = calculate_market_regime(taiex_df, data_date=data_date)
+
+    # 大盤資料最後日期 — 寫入 market_regime 供日期驗證使用
+    if taiex_df is not None and not taiex_df.empty:
+        try:
+            _tmp_df = taiex_df.copy().sort_values("date")
+            if data_date:
+                _tmp_df = _tmp_df[_tmp_df["date"] <= data_date]
+            taiex_last_date = str(_tmp_df.iloc[-1]["date"]) if not _tmp_df.empty else ""
+            if taiex_last_date:
+                market_regime["data_date"] = taiex_last_date
+        except Exception:
+            pass
+    print(f"[大盤計算] market_symbol={TAIEX_SYMBOL}, market_data_date={market_regime.get('data_date', '未知')}, "
+          f"market_close={market_regime.get('metrics', {}).get('index_close', 0)}, "
+          f"market_regime={market_regime.get('status', '未知')}")
 
     # 2. 個股資料
     conn = _get_conn()

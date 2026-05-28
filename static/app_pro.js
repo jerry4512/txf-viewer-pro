@@ -1286,7 +1286,11 @@ async function loadInstitutionalRankings() {
     
     try {
         const res = await fetch('/api/institutional_rankings');
-        const data = await res.json();
+        const _rawText1 = await res.text();
+        let data;
+        try { data = JSON.parse(_rawText1); } catch(_e) {
+            throw new Error(`三大法人 API 回傳非 JSON：${_rawText1.slice(0, 120)}`);
+        }
         
         if (data.status === 'success') {
             dateLabel.innerText = `📅 資料日期：${data.date}`;
@@ -3861,7 +3865,11 @@ async function loadTomorrowStrategy() {
 
     try {
         const res  = await fetch('/api/tomorrow_strategy');
-        const data = await res.json();
+        const _rawText2 = await res.text();
+        let data;
+        try { data = JSON.parse(_rawText2); } catch(_e) {
+            throw new Error(`tomorrow_strategy API 回傳非 JSON：${_rawText2.slice(0, 120)}`);
+        }
 
         if (loading) loading.style.display = 'none';
 
@@ -4117,7 +4125,11 @@ async function loadIntegratedStrategy() {
 
     try {
         const res  = await fetch('/api/integrated-strategy');
-        const data = await res.json();
+        const _rawText3 = await res.text();
+        let data;
+        try { data = JSON.parse(_rawText3); } catch(_e) {
+            throw new Error(`integrated-strategy API 回傳非 JSON：${_rawText3.slice(0, 120)}`);
+        }
 
         if (loading) loading.style.display = 'none';
 

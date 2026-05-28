@@ -435,7 +435,7 @@ def _build_action_suggestion(stock: dict) -> str:
 
 # ── 主函式 ────────────────────────────────────────────────────────────────────
 
-def run_integrated_strategy() -> dict:
+def run_integrated_strategy(data_date: str = None) -> dict:
     """
     整合選股主入口。
     Returns:
@@ -454,7 +454,7 @@ def run_integrated_strategy() -> dict:
     print("[IntegratedStrategy] 開始執行整合選股…")
 
     # ── Step 1：執行 tomorrow_strategy 取得主決策結果 ───────────────────
-    ts_result     = _ts.run_tomorrow_strategy()
+    ts_result     = _ts.run_tomorrow_strategy(data_date=data_date)
     market_regime = ts_result.get('market_regime', {})
     data_date     = ts_result.get('data_date', datetime.now().strftime('%Y-%m-%d'))
     regime_status = market_regime.get('status', '')
@@ -489,6 +489,9 @@ def run_integrated_strategy() -> dict:
             'stock_name':           s.get('name', ''),
             'industry':             s.get('industry', ''),
             'close':                s.get('close', 0),
+            'open_price':           s.get('open_price', 0),
+            'high_price':           s.get('high_price', 0),
+            'low_price':            s.get('low_price', 0),
             # ── 大盤 ─────────────────────────────────────────────────────
             'market_regime':        regime_status,
             'market_regime_label':  regime_label,

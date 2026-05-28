@@ -15,6 +15,25 @@ except Exception:
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _DB_PATH  = os.path.join(_BASE_DIR, "stock_cache.db")
 
+TAIEX_SYMBOL = "TAIEX"
+
+
+def normalize_date(value) -> str:
+    """Convert date/datetime/20260528/2026/05/28 to YYYY-MM-DD string."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime('%Y-%m-%d')
+    import datetime as _dt
+    if isinstance(value, _dt.date):
+        return value.strftime('%Y-%m-%d')
+    s = str(value).strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    if len(s) == 10 and '/' in s:
+        return s.replace('/', '-')
+    return s
+
 
 def _get_conn():
     conn = sqlite3.connect(_DB_PATH, timeout=60.0)
@@ -124,6 +143,153 @@ def fetch_market_index_daily():
         print(f"[MarketStatus] Yahoo Finance 取得 TAIEX 失敗: {e}")
 
     return df_cached if not df_cached.empty else None
+
+
+def _fetch_taiex_close_from_twse(date_str: str):
+    """
+    Fallback: fetch TAIEX daily close from TWSE MI_5MINS_HIST for a specific date.
+    Used when Yahoo Finance returns close=None for a completed trading day.
+    Returns close as float, or None on failure.
+    """
+    date_yyyymmdd = date_str.replace('-', '')
+    url = (
+        f"https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST"
+        f"?date={date_yyyymmdd}&response=json"
+    )
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=12, context=_SSL_CTX) as r:
+            raw = json.loads(r.read().decode('utf-8'))
+        if raw.get('stat') != 'OK':
+            return None
+        data = raw.get('data', [])
+        if not data:
+            return None
+        # Last row is daily summary: [ROC_date, open, high, low, close]
+        last_row = data[-1]
+        if len(last_row) < 5:
+            return None
+        # Verify date (ROC format 115/05/28 → 2026-05-28)
+        roc_parts = str(last_row[0]).split('/')
+        if len(roc_parts) == 3:
+            ad_year = int(roc_parts[0]) + 1911
+            row_date = f"{ad_year}-{roc_parts[1]}-{roc_parts[2]}"
+            if row_date != date_str:
+                return None
+        close_val = str(last_row[4]).replace(',', '')
+        return float(close_val)
+    except Exception as e:
+        print(f"[MarketStatus] TWSE close fallback for {date_str} 失敗: {e}")
+        return None
+
+
+def sync_taiex_daily_kbars(data_date=None) -> dict:
+    """
+    Force re-fetch TAIEX from Yahoo Finance and update market_index_daily cache.
+    Ignores cache age — always fetches fresh data.
+    Returns {"success": bool, "latest_date": str, "error": str | None}
+    """
+    _init_table()
+    target = normalize_date(data_date) if data_date else ""
+    print(f"[同步選股數據] sync_taiex_daily_kbars start, data_date={target or '未指定'}")
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII?interval=1d&range=6mo"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=12, context=_SSL_CTX) as r:
+            raw = json.loads(r.read().decode('utf-8'))
+
+        result   = raw['chart']['result'][0]
+        stamps   = result['timestamp']
+        q        = result['indicators']['quote'][0]
+        vol_list = q.get('volume') or [None] * len(stamps)
+
+        rows = []
+        for i, ts in enumerate(stamps):
+            try:
+                dt_obj = datetime.utcfromtimestamp(ts) + timedelta(hours=8)
+                rows.append({
+                    'date':   dt_obj.strftime('%Y-%m-%d'),
+                    'open':   q['open'][i],
+                    'high':   q['high'][i],
+                    'low':    q['low'][i],
+                    'close':  q['close'][i],
+                    'volume': vol_list[i] or 0,
+                    'amount': 0.0,
+                })
+            except Exception:
+                continue
+
+        # Patch None closes for completed trading days using TWSE as fallback.
+        # Yahoo Finance sometimes returns the previous trading day with open but close=None
+        # when the day has technically ended but the data isn't finalised yet.
+        today_tw = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+        used_twse_fallback = False
+        twse_fallback_dates = []
+        for row in rows:
+            if row.get('close') is None and row['date'] < today_tw:
+                twse_close = _fetch_taiex_close_from_twse(row['date'])
+                if twse_close is not None:
+                    row['close'] = twse_close
+                    used_twse_fallback = True
+                    twse_fallback_dates.append(row['date'])
+                    print(f"[MarketStatus] TWSE fallback 補入 {row['date']} close={twse_close}")
+
+        df_new = pd.DataFrame(rows).dropna(subset=['close'])
+        if df_new.empty:
+            return {"success": False, "latest_date": "", "error": "Yahoo Finance 返回空資料",
+                    "used_twse_fallback": False, "market_close_source": "Yahoo Finance"}
+
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        conn = _get_conn()
+        cursor = conn.cursor()
+        for _, row in df_new.iterrows():
+            cursor.execute("""
+                INSERT INTO market_index_daily
+                    (date, open, high, low, close, volume, amount, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(date) DO UPDATE SET
+                    open=excluded.open, high=excluded.high, low=excluded.low,
+                    close=excluded.close, volume=excluded.volume,
+                    updated_at=excluded.updated_at
+            """, (row['date'], row['open'], row['high'], row['low'],
+                  row['close'], row['volume'], row['amount'], now_str, now_str))
+        conn.commit()
+        conn.close()
+
+        latest_date = str(df_new.sort_values('date').iloc[-1]['date'])
+        print(f"[同步選股數據] sync_taiex_daily_kbars=success, latest={latest_date}")
+
+        market_close_source = "Yahoo Finance"
+        if used_twse_fallback:
+            market_close_source = (
+                f"Yahoo Finance + TWSE_MI_5MINS_HIST（補 {','.join(twse_fallback_dates)}）"
+            )
+
+        if target and latest_date < target:
+            return {
+                "success": False,
+                "latest_date": latest_date,
+                "error": (
+                    f"同步後最新日期 {latest_date} 仍早於要求日期 {target}"
+                    "（可能市場尚未收盤或 Yahoo Finance 資料延遲）"
+                ),
+                "used_twse_fallback": used_twse_fallback,
+                "market_close_source": market_close_source,
+            }
+        return {
+            "success": True,
+            "latest_date": latest_date,
+            "error": None,
+            "used_twse_fallback": used_twse_fallback,
+            "market_close_source": market_close_source,
+        }
+
+    except Exception as e:
+        print(f"[MarketStatus] sync_taiex_daily_kbars 失敗: {e}")
+        return {"success": False, "latest_date": "", "error": str(e),
+                "used_twse_fallback": False, "market_close_source": "Yahoo Finance"}
 
 
 def calculate_hot_stock_ratio():

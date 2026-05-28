@@ -17,6 +17,7 @@ from apscheduler.triggers.cron import CronTrigger
 import screener            # 引入我們的選股大腦
 import tomorrow_strategy  # 大盤狀態 × 明日策略選股
 import integrated_strategy  # 整合選股（主決策＋籌碼輔助）
+from market_status import sync_taiex_daily_kbars, normalize_date, TAIEX_SYMBOL
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
@@ -1060,11 +1061,19 @@ async def get_txf_amplitude(period: str = "day"):
 
 @app.get("/api/institutional_rankings")
 async def get_institutional_rankings():
+    from fastapi.responses import JSONResponse
     import urllib.request
+
+    def safe_get(row, idx, default="0"):
+        try:
+            return row[idx]
+        except (IndexError, TypeError):
+            return default
+
     # 本地快取檔案
     CACHE_FILE = "institutional_cache.json"
     today_str = datetime.now().strftime("%Y%m%d")
-    
+
     # 1. 嘗試讀取本地快取
     cache_data = None
     if os.path.exists(CACHE_FILE):
@@ -1114,7 +1123,10 @@ async def get_institutional_rankings():
         if cache_data:
             print("無法抓取最新數據，退而使用舊快取")
             return cache_data
-        raise HTTPException(status_code=500, detail="無法取得證交所三大法人數據，請稍後再試。")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "detail": "無法取得證交所三大法人數據，請稍後再試。"}
+        )
 
     # 3. 解析與清洗資料
     fields = res_data.get('fields', [])
@@ -1144,28 +1156,41 @@ async def get_institutional_rankings():
             return 0
 
     processed_list = []
+    skipped_rows = 0
     for row in raw_rows:
-        code = row[code_idx].strip()
-        name = row[name_idx].strip()
-        
-        # 轉為張數 (股數 / 1000)
-        foreign_net = parse_int(row[foreign_idx]) // 1000
-        it_net = parse_int(row[it_idx]) // 1000
-        dealer_net = parse_int(row[dealer_idx]) // 1000
-        total_net = parse_int(row[total_idx]) // 1000
-        
-        # 只過濾有實質買賣超的股票，過濾掉權證(長代號)或ETF(如果代號開頭為非數字，可留作彈性)
-        if len(code) > 6: # 排除權證、可轉債等
-            continue
-            
-        processed_list.append({
-            "code": code,
-            "name": name,
-            "foreign": foreign_net,
-            "it": it_net,
-            "dealer": dealer_net,
-            "total": total_net
-        })
+        try:
+            code_raw = safe_get(row, code_idx, "")
+            name_raw = safe_get(row, name_idx, "")
+            if not code_raw:
+                skipped_rows += 1
+                print(f"[三大法人] 警告：row 長度 {len(row)} 不足，跳過此筆")
+                continue
+            code = str(code_raw).strip()
+            name = str(name_raw).strip()
+
+            # 轉為張數 (股數 / 1000)
+            foreign_net = parse_int(safe_get(row, foreign_idx)) // 1000
+            it_net      = parse_int(safe_get(row, it_idx))      // 1000
+            dealer_net  = parse_int(safe_get(row, dealer_idx))  // 1000
+            total_net   = parse_int(safe_get(row, total_idx))   // 1000
+
+            # 排除權證、可轉債等（代號超過6碼）
+            if len(code) > 6:
+                continue
+
+            processed_list.append({
+                "code": code,
+                "name": name,
+                "foreign": foreign_net,
+                "it": it_net,
+                "dealer": dealer_net,
+                "total": total_net
+            })
+        except Exception as _row_err:
+            skipped_rows += 1
+            print(f"[三大法人] 警告：解析 row 失敗（{_row_err}），跳過此筆")
+    if skipped_rows:
+        print(f"[三大法人] 共跳過 {skipped_rows} 筆格式異常的 row")
 
     # 分別排列買超前 15 名與賣超前 15 名
     buy_rank = sorted(processed_list, key=lambda x: x["total"], reverse=True)[:15]
@@ -1598,6 +1623,283 @@ def is_tw_market_trading_day(dt=None) -> bool:
         dt = datetime.now()
     return dt.weekday() < 5
 
+def calculate_candle_risk(kbar: dict) -> dict:
+    """計算當日 K 線風險：長上影、收盤位置、衝高收低。"""
+    high  = kbar.get("high", 0) or 0
+    low   = kbar.get("low", 0) or 0
+    open_ = kbar.get("open", 0) or 0
+    close = kbar.get("close", 0) or 0
+
+    range_ = high - low
+    if range_ <= 0:
+        return {
+            "upper_shadow_ratio": 0.0,
+            "close_position": 0.5,
+            "is_long_upper_shadow": False,
+            "is_close_near_low": False,
+            "is_intraday_reversal": False,
+            "candle_warning": "",
+        }
+
+    upper_shadow      = high - max(open_, close)
+    upper_shadow_ratio = upper_shadow / range_
+    close_position    = (close - low) / range_
+
+    is_long_upper_shadow  = upper_shadow_ratio > 0.4
+    is_close_near_low     = close_position < 0.35
+    is_intraday_reversal  = (high > close * 1.04) and (close_position < 0.4)
+
+    warnings = []
+    if is_long_upper_shadow and is_close_near_low:
+        warnings.append("當日長上影且收盤靠近低點，需複查是否追價失敗")
+    elif is_long_upper_shadow:
+        warnings.append("當日上影線偏長，隔日需確認不再轉弱")
+    if is_intraday_reversal and not warnings:
+        warnings.append("當日衝高收低，需複查買盤承接力道")
+
+    return {
+        "upper_shadow_ratio":    round(upper_shadow_ratio, 3),
+        "close_position":        round(close_position, 3),
+        "is_long_upper_shadow":  is_long_upper_shadow,
+        "is_close_near_low":     is_close_near_low,
+        "is_intraday_reversal":  is_intraday_reversal,
+        "candle_warning":        warnings[0] if warnings else "",
+    }
+
+
+def apply_tg_downgrade_rules(stock: dict) -> dict:
+    """
+    根據 K 線風險、風報比、停損距離決定是否從精選降到備選。
+
+    降級（到備選）：
+      - rr > 8 且（長上影 or 衝高收低）
+      - 長上影 且 收盤靠低 且 rr > 5  ← 中高風報比才降
+      - 單純衝高收低 且 rr > 5
+
+    警告（留精選加 ⚠️）：
+      - rr > 8（無顯著 K 線問題）
+      - 長上影（其他條件尚可）
+      - 長上影 且 收盤靠低 但 rr ≤ 5（停損小、報酬合理時保留精選）
+    """
+    s = dict(stock)
+    rr     = s.get("risk_reward") or 0
+    kbar   = {"open": s.get("open_price", 0), "high": s.get("high_price", 0),
+              "low":  s.get("low_price", 0),  "close": s.get("close", 0)}
+    risk   = calculate_candle_risk(kbar)
+    s["candle_risk"] = risk
+
+    reasons   = []
+    downgrade = False
+    warn_only = False
+
+    if rr > 8 and (risk["is_long_upper_shadow"] or risk["is_intraday_reversal"]):
+        downgrade = True
+        reasons.append("風報比偏高且當日長上影，從精選降到備選")
+    elif risk["is_long_upper_shadow"] and risk["is_close_near_low"] and rr > 5:
+        downgrade = True
+        reasons.append("長上影且收盤靠近低點，降到備選")
+    elif risk["is_intraday_reversal"] and rr > 5:
+        downgrade = True
+        reasons.append("衝高收低，降到備選")
+    elif rr > 8:
+        warn_only = True
+        reasons.append("風報比偏高，需複查停損與目標")
+    elif risk["is_long_upper_shadow"] and risk["is_close_near_low"]:
+        warn_only = True
+        reasons.append("當日長上影且收盤靠近低點，需複查是否追價失敗")
+    elif risk["is_long_upper_shadow"]:
+        warn_only = True
+        reasons.append("當日上影線偏長，隔日需確認不再轉弱")
+    elif risk["candle_warning"]:
+        warn_only = True
+        reasons.append(risk["candle_warning"])
+
+    s["tg_downgraded"]    = downgrade
+    s["tg_warn_only"]     = warn_only
+    s["downgrade_reason"] = reasons[0] if reasons else ""
+    s["tg_warning"]       = reasons[0] if reasons else (s.get("tg_warning") or "")
+    return s
+
+
+def get_tg_pick_concentrated_industries(tg_picks: list, tg_watch: list) -> list:
+    """從 TG 精選與備選股票中統計產業集中度（同產業 >= 2 檔才列出）。"""
+    from collections import defaultdict
+    counter: dict = defaultdict(lambda: {"pick_count": 0, "watch_count": 0, "stocks": []})
+    for s in tg_picks:
+        ind = s.get("industry") or "未分類"
+        counter[ind]["pick_count"] += 1
+        counter[ind]["stocks"].append(f"{s['stock_id']} {s['stock_name']}")
+    for s in tg_watch:
+        ind = s.get("industry") or "未分類"
+        counter[ind]["watch_count"] += 1
+        counter[ind]["stocks"].append(f"{s['stock_id']} {s['stock_name']}")
+
+    result = []
+    for ind, data in counter.items():
+        total = data["pick_count"] + data["watch_count"]
+        if total < 2:
+            continue
+        result.append({
+            "industry":            ind,
+            "pick_count":          data["pick_count"],
+            "watch_count":         data["watch_count"],
+            "representative_stocks": data["stocks"][:5],
+        })
+    result.sort(key=lambda x: -(x["pick_count"] * 2 + x["watch_count"]))
+    return result
+
+
+def validate_screener_data_date(data_date: str) -> dict:
+    """
+    驗證整合選股所需資料是否同步到同一個 data_date。
+    直接查 DB，不依賴策略執行結果。
+    """
+    data_date = normalize_date(data_date) if data_date else ""
+    warnings, errors = [], []
+
+    stock_kbar_date = ""
+    try:
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        row = conn.execute("SELECT MAX(date) FROM daily_kbars").fetchone()
+        conn.close()
+        if row and row[0]:
+            stock_kbar_date = normalize_date(str(row[0]))
+    except Exception as e:
+        errors.append(f"無法查詢個股日K最新日期: {e}")
+
+    market_data_date = ""
+    market_close = 0.0
+    try:
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        row = conn.execute(
+            "SELECT date, close FROM market_index_daily ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if row:
+            market_data_date = normalize_date(str(row[0]))
+            market_close = float(row[1] or 0)
+    except Exception as e:
+        errors.append(f"無法查詢大盤日K最新日期: {e}")
+
+    institution_data_date = ""
+    try:
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        row = conn.execute("SELECT MAX(date) FROM institutional_trading").fetchone()
+        conn.close()
+        if row and row[0]:
+            institution_data_date = normalize_date(str(row[0]))
+    except Exception as e:
+        warnings.append(f"無法查詢法人資料最新日期: {e}")
+
+    industry_data_ok = True
+    try:
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM stock_names WHERE name IS NOT NULL AND name != ''"
+        ).fetchone()[0]
+        conn.close()
+        if count < 100:
+            warnings.append(f"股票基本資料不足（{count} 筆）")
+            industry_data_ok = False
+    except Exception as e:
+        warnings.append(f"無法查詢股票基本資料: {e}")
+
+    if data_date:
+        if stock_kbar_date and stock_kbar_date != data_date:
+            errors.append(f"個股日K最新日期 {stock_kbar_date} ≠ 選股基準日 {data_date}")
+        if market_data_date and market_data_date != data_date:
+            errors.append(f"大盤資料日 {market_data_date} ≠ 選股基準日 {data_date}")
+        if institution_data_date and institution_data_date != data_date:
+            warnings.append(f"法人資料日 {institution_data_date} ≠ 選股基準日 {data_date}")
+
+    critical_ok = len(errors) == 0
+    return {
+        "data_date":             data_date,
+        "stock_kbar_date":       stock_kbar_date,
+        "market_data_date":      market_data_date,
+        "market_close":          market_close,
+        "institution_data_date": institution_data_date,
+        "industry_data_ok":      industry_data_ok,
+        "critical_ok":           critical_ok,
+        "warnings":              warnings,
+        "errors":                errors,
+    }
+
+
+def validate_result_data_date(integrated_result: dict) -> dict:
+    """
+    檢查選股結果、大盤資料是否使用同一個 data_date。
+    回傳 {valid, critical_ok, data_date, stock_kbar_date, market_data_date, ...}。
+    """
+    data_date   = integrated_result.get("data_date", "")
+    mr          = integrated_result.get("market_regime", {}) or {}
+    market_date = mr.get("data_date", "")
+    mr_metrics  = mr.get("metrics") or {}
+    mr_error    = mr_metrics.get("regime_error", False) or (not mr_metrics.get("data_available", True))
+    # Only trust index_close when there is no data error
+    taiex_close = (mr_metrics.get("index_close") or 0) if not mr_error else None
+    mr_status   = "資料異常" if mr_error else mr.get("status", "")
+
+    warnings, errors = [], []
+
+    if not data_date:
+        errors.append("data_date 缺失，無法驗證資料一致性")
+
+    if mr_error:
+        errors.append(
+            f"大盤資料日期 {(mr.get('metrics') or {}).get('actual_data_date', '未知')} "
+            f"≠ 要求日期 {(mr.get('metrics') or {}).get('expected_data_date', data_date)}，大盤狀態計算已拒絕"
+        )
+    elif market_date and data_date and market_date != data_date:
+        errors.append(f"大盤資料日期 {market_date} ≠ 選股資料日期 {data_date}")
+
+    # 法人資料日期（從 DB 查詢）
+    institution_data_date = ""
+    try:
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        row = conn.execute("SELECT MAX(date) FROM institutional_trading").fetchone()
+        conn.close()
+        if row and row[0]:
+            institution_data_date = normalize_date(str(row[0]))
+            if data_date and institution_data_date != data_date:
+                warnings.append(f"法人資料日 {institution_data_date} ≠ 選股基準日 {data_date}")
+    except Exception:
+        pass
+
+    valid = critical_ok = (len(errors) == 0)
+
+    print(
+        f"[日期檢查] data_date={data_date}, stock_kbar_date={data_date}, "
+        f"market_data_date={market_date}, institution_data_date={institution_data_date}, "
+        f"critical_ok={critical_ok}"
+    )
+    for w in warnings:
+        print(f"[日期檢查] WARNING: {w}")
+    for e in errors:
+        print(f"[日期檢查] ERROR: {e}")
+
+    return {
+        "valid":                 valid,
+        "critical_ok":           critical_ok,
+        "data_date":             data_date,
+        "stock_kbar_date":       data_date,
+        "market_data_date":      market_date,
+        "taiex_close":           taiex_close,
+        "market_close":          taiex_close,
+        "market_regime":         mr_status,
+        "market_regime_success": not mr_error,
+        "regime_error":          mr_error,
+        "institution_data_date": institution_data_date,
+        "warnings":              warnings,
+        "errors":                errors,
+        "data_validation": {
+            "critical_ok": critical_ok,
+            "warnings":    warnings,
+            "errors":      errors,
+        },
+    }
+
+
 def calculate_tg_score(stock: dict) -> float:
     """計算 TG 精選排序分數（0~100）"""
     score = 0.0
@@ -1665,9 +1967,10 @@ def calculate_tg_score(stock: dict) -> float:
 
 
 def build_tg_pick_list(integrated_result: dict) -> dict:
-    """從整合選股結果中挑選 TG 精選（最多3）與備選（最多2）"""
+    """從整合選股結果中挑選 TG 精選（最多3）與備選（最多2），含 K 線風險降級。"""
     buy = integrated_result.get("buy_candidates", [])
-    tg_picks, tg_watch, tg_skipped = [], [], []
+    tg_picks_pre, tg_watch_pre, tg_skipped = [], [], []
+    downgraded: list = []
 
     for s in buy:
         grade  = s.get("stock_grade", "")
@@ -1680,29 +1983,64 @@ def build_tg_pick_list(integrated_result: dict) -> dict:
             tg_skipped.append(s)
             continue
 
-        tg_warning = "風報比偏高，需複查停損與目標" if rr > 8 else ""
-        tg_score   = calculate_tg_score(s)
-        s_copy = dict(s)
-        s_copy["tg_score"]   = tg_score
-        s_copy["tg_warning"] = tg_warning
+        tg_score = calculate_tg_score(s)
+        s_copy   = apply_tg_downgrade_rules(dict(s))
+        s_copy["tg_score"] = tg_score
 
         if sl_abs <= 4 and macd in ("負柱收斂", "正柱放大"):
-            tg_picks.append(s_copy)
+            tg_picks_pre.append(s_copy)
         else:
-            tg_watch.append(s_copy)
+            tg_watch_pre.append(s_copy)
 
-    tg_picks.sort(key=lambda x: -x.get("tg_score", 0))
-    tg_watch.sort(key=lambda x: -x.get("tg_score", 0))
+    tg_picks_pre.sort(key=lambda x: -x.get("tg_score", 0))
+    tg_watch_pre.sort(key=lambda x: -x.get("tg_score", 0))
+
+    # 降級：將 tg_downgraded=True 的精選股移到備選
+    tg_picks_final, tg_watch_final = [], []
+    for s in tg_picks_pre:
+        if s.get("tg_downgraded"):
+            downgraded.append({
+                "stock_id": s.get("stock_id", ""),
+                "reason":   s.get("downgrade_reason", ""),
+            })
+            tg_watch_final.append(s)
+            print(f"[TG 降級] {s.get('stock_id')} {s.get('stock_name')} downgraded: {s.get('downgrade_reason')}")
+        else:
+            tg_picks_final.append(s)
+
+    # 備選中 downgraded 的放後面，原本備選中 warn_only 也加入
+    for s in tg_watch_pre:
+        if s.get("tg_downgraded"):
+            downgraded.append({"stock_id": s.get("stock_id", ""), "reason": s.get("downgrade_reason", "")})
+        tg_watch_final.append(s)
+        if s.get("tg_downgraded"):
+            print(f"[TG 降級] {s.get('stock_id')} {s.get('stock_name')} (備選) downgraded: {s.get('downgrade_reason')}")
+        elif s.get("tg_warn_only"):
+            print(f"[TG 警告] {s.get('stock_id')} {s.get('stock_name')} warning: {s.get('tg_warning')}")
+
+    for s in tg_picks_final:
+        if s.get("tg_warn_only"):
+            print(f"[TG 警告] {s.get('stock_id')} {s.get('stock_name')} warning: {s.get('tg_warning')}")
+
+    result_picks = tg_picks_final[:3]
+    result_watch = tg_watch_final[:2]
+
+    print(f"[TG 結果] tg_picks={len(result_picks)}, tg_watch={len(result_watch)}")
 
     return {
-        "tg_picks":   tg_picks[:3],
-        "tg_watch":   tg_watch[:2],
-        "tg_skipped": tg_skipped,
+        "tg_picks":        result_picks,
+        "tg_watch":        result_watch,
+        "tg_skipped":      tg_skipped,
+        "downgraded":      downgraded,
+        "downgrade_count": len(downgraded),
     }
 
 
-def get_today_strong_industries_from_result(integrated_result: dict) -> list:
-    """從整合選股結果中計算今日強勢產業（分數≥60，最多5名）"""
+def get_resonance_industries(integrated_result: dict) -> list:
+    """
+    法人技術共振產業：分數≥60，最多5名。
+    每項加 is_strong=True（分數≥70）或 False（60-69，中性觀察）。
+    """
     from collections import defaultdict
     all_stocks = (
         integrated_result.get("buy_candidates", []) +
@@ -1719,17 +2057,26 @@ def get_today_strong_industries_from_result(integrated_result: dict) -> list:
     for ind_name, stocks in groups.items():
         if not stocks:
             continue
-        ind_score = stocks[0].get("industry_score", 0) or 0
-        status    = stocks[0].get("industry_status", "") or ""
+        ind_score  = stocks[0].get("industry_score", 0) or 0
+        raw_status = stocks[0].get("industry_status", "") or ""
         if ind_score < 60:
             continue
-        buy_stocks  = [s for s in stocks if s.get("final_category") == "buy_candidates"]
-        top_stocks  = [f"{s['stock_id']} {s['stock_name']}" for s in buy_stocks[:3]]
+        if raw_status == "過熱警戒":
+            display_status = "過熱警戒"
+        elif ind_score >= 80:
+            display_status = "資金共振強"
+        elif ind_score >= 70:
+            display_status = "偏強觀察"
+        else:
+            display_status = "中性觀察"
+        buy_stocks = [s for s in stocks if s.get("final_category") == "buy_candidates"]
+        top_stocks = [f"{s['stock_id']} {s['stock_name']}" for s in buy_stocks[:3]]
         rankings.append({
             "rank":            0,
             "industry":        ind_name,
             "score":           ind_score,
-            "status":          status,
+            "status":          display_status,
+            "is_strong":       ind_score >= 70,
             "candidate_count": len(stocks),
             "top_stocks":      top_stocks,
         })
@@ -1740,34 +2087,315 @@ def get_today_strong_industries_from_result(integrated_result: dict) -> list:
     return rankings[:5]
 
 
-def format_tg_integrated_message(data_date: str, market_regime: dict, tg_list: dict, strong_industries: list) -> str:
-    """組成整合選股 TG 訊息（精選≤3、備選≤2、強勢產業≤5）"""
+_TWSE_INDUSTRY_CODE_MAP: dict = {
+    "1": "水泥", "2": "食品", "3": "塑膠", "4": "紡織纖維",
+    "5": "電機機械", "6": "電器電纜", "8": "化學生技醫療",
+    "9": "玻璃陶瓷", "10": "造紙", "11": "鋼鐵", "12": "橡膠",
+    "13": "汽車", "14": "電子工業", "15": "建材營造", "16": "航運業",
+    "17": "觀光旅遊", "18": "金融保險", "19": "貿易百貨", "20": "其他",
+    "21": "化工", "22": "生技醫療業", "23": "油電燃氣業",
+    "24": "半導體業", "25": "電腦及週邊設備業", "26": "光電業",
+    "27": "通信網路業", "28": "電子零組件業", "29": "電子通路業",
+    "30": "資訊服務業", "31": "其他電子業", "32": "文化創意業",
+    "33": "農業科技業", "34": "電子商務業", "35": "綠能環保",
+    "36": "數位雲端", "37": "運動休閒", "38": "居家生活",
+    "39": "電動車", "80": "國內ETF", "81": "境外ETF",
+}
+
+
+def _resolve_industry_name(raw: str) -> str:
+    """將數字型產業代碼轉為中文名，找不到則回傳「其他未分類族群」。"""
+    if not raw or not raw.isdigit():
+        return raw or "其他"
+    return _TWSE_INDUSTRY_CODE_MAP.get(raw, "其他未分類族群")
+
+
+def get_industry_daily_stats_from_db() -> tuple:
+    """
+    從 stock_cache.db daily_kbars + stock_names 計算全市場各類股今日漲跌統計。
+    Returns (stats_dict, data_date_str, source_str)
+      stats_dict: { industry: {avg_change_pct, stock_count, vol_surge_ratio, rep_stocks} }
+    """
+    from collections import defaultdict
+    _db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_cache.db")
+    try:
+        conn = sqlite3.connect(_db, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        # 取最後3個交易日，確保算出「前一日收盤」
+        df = pd.read_sql_query(
+            """
+            SELECT k.code, k.date, k.close, k.volume,
+                   n.name, n.category
+            FROM daily_kbars k
+            LEFT JOIN stock_names n ON k.code = n.code
+            WHERE k.date IN (
+                SELECT DISTINCT date FROM daily_kbars ORDER BY date DESC LIMIT 22
+            )
+            ORDER BY k.code, k.date ASC
+            """,
+            conn,
+        )
+        conn.close()
+    except Exception as e:
+        print(f"[盤面族群DB] 讀取失敗: {e}")
+        return {}, "", f"DB 讀取失敗：{e}"
+
+    if df.empty:
+        return {}, "", "DB 無資料"
+
+    dates = sorted(df["date"].unique())
+    if len(dates) < 2:
+        return {}, "", f"日期不足（僅 {len(dates)} 個交易日）"
+
+    today_date = dates[-1]
+    prev_date  = dates[-2]
+
+    today_df = df[df["date"] == today_date]
+    prev_df  = df[df["date"] == prev_date]
+
+    prev_close_map = dict(zip(prev_df["code"].astype(str), prev_df["close"].astype(float)))
+
+    # 近20日均量（使用整個查詢期間）
+    vol_ma_map: dict = {}
+    for code, grp in df.groupby("code"):
+        vols = grp["volume"].astype(float).tail(20)
+        if len(vols) >= 3:
+            vol_ma_map[str(code)] = float(vols.mean())
+
+    groups: dict = defaultdict(list)
+    for _, row in today_df.iterrows():
+        code = str(row["code"])
+        prev_c = prev_close_map.get(code)
+        if not prev_c or prev_c <= 0:
+            continue
+        chg = (float(row["close"]) - prev_c) / prev_c * 100
+        ind_raw = (str(row["category"] or "") or "其他").strip() or "其他"
+        ind = _resolve_industry_name(ind_raw)
+        name = str(row["name"] or code)
+        vol_now  = float(row["volume"] or 0)
+        vol_ma20 = vol_ma_map.get(code, 0)
+        groups[ind].append({
+            "code": code, "name": name, "change_pct": chg,
+            "vol_surge": (vol_now > vol_ma20 * 1.3) if vol_ma20 > 0 else False,
+        })
+
+    stats: dict = {}
+    for ind, stocks in groups.items():
+        if len(stocks) < 2:
+            continue
+        avg_chg = sum(s["change_pct"] for s in stocks) / len(stocks)
+        if avg_chg <= 0:
+            continue
+        surge_count = sum(1 for s in stocks if s["vol_surge"])
+        top3 = sorted(stocks, key=lambda x: -x["change_pct"])[:3]
+        stats[ind] = {
+            "avg_change_pct":  round(avg_chg, 2),
+            "stock_count":     len(stocks),
+            "vol_surge_ratio": surge_count / len(stocks),
+            "rep_stocks":      [f"{s['code']} {s['name']}" for s in top3],
+        }
+
+    source = f"DB 全市場日K {today_date}（{len(today_df)} 檔）"
+    print(f"[盤面族群DB] {source}，計算出 {len(stats)} 個產業")
+    return stats, today_date, source
+
+
+def get_market_hot_industries(integrated_result: dict) -> list:
+    """
+    今日盤面強勢族群，最多5名。
+    優先：DB 全市場日 K（涵蓋所有股票，不受選股名單限制）。
+    Fallback：TWSE 今日報價 × 選股名單（資料來源受限，僅反映選股範圍內族群）。
+    """
+    from collections import defaultdict
+
+    def _status(avg_chg: float, vol_surge_ratio: float) -> str:
+        if avg_chg >= 3.0:              return "盤面偏強"
+        if vol_surge_ratio >= 0.5:      return "成交放大"
+        if avg_chg > 1.0 and vol_surge_ratio >= 0.3: return "資金活躍"
+        return "題材延續"
+
+    # ── 優先：DB 全市場計算 ──────────────────────────────────────────────────
+    stats, db_date, source = get_industry_daily_stats_from_db()
+    if stats:
+        results = []
+        for ind_name, data in stats.items():
+            results.append({
+                "rank":           0,
+                "industry":       ind_name,
+                "avg_change_pct": data["avg_change_pct"],
+                "status":         _status(data["avg_change_pct"], data["vol_surge_ratio"]),
+                "rep_stocks":     data["rep_stocks"],
+                "source":         source,
+            })
+        results.sort(key=lambda x: -x["avg_change_pct"])
+        for i, r in enumerate(results, 1):
+            r["rank"] = i
+        print(f"[TG 族群] DB全市場 industries={len(results)}, source={source}")
+        return results[:5]
+
+    # ── Fallback：TWSE 報價 × 選股名單 ───────────────────────────────────────
+    print(f"[TG 族群] DB 計算失敗（{source}），fallback 到 TWSE 報價×選股名單")
+    all_stocks = (
+        integrated_result.get("buy_candidates", []) +
+        integrated_result.get("high_priority_watch", []) +
+        integrated_result.get("wait_pullback", []) +
+        integrated_result.get("other_watch", [])
+    )
+    if not all_stocks:
+        return []
+    try:
+        daily_quotes, _ = screener.fetch_twse_daily_quotes()
+    except Exception as e:
+        print(f"[TG 族群] TWSE 報價抓取失敗：{e}")
+        return []
+
+    groups: dict = defaultdict(list)
+    for s in all_stocks:
+        ind = (s.get("industry") or "").strip() or "其他"
+        groups[ind].append(s)
+
+    results = []
+    for ind_name, stocks in groups.items():
+        chg_entries = []
+        vol_surge   = 0
+        for s in stocks:
+            q = daily_quotes.get(s.get("stock_id", ""))
+            if not q:
+                continue
+            chg       = q.get("change_pct", 0) or 0
+            amt_today = q.get("turnover", 0) or 0
+            amt_ma20  = s.get("amount_ma20", 0) or 0
+            chg_entries.append((chg, s.get("stock_id", ""), s.get("stock_name", "")))
+            if amt_ma20 > 0 and amt_today > amt_ma20 * 1.3:
+                vol_surge += 1
+        if not chg_entries:
+            continue
+        avg_chg         = sum(c[0] for c in chg_entries) / len(chg_entries)
+        vol_surge_ratio = vol_surge / len(chg_entries)
+        if avg_chg <= 0:
+            continue
+        chg_entries.sort(key=lambda x: -x[0])
+        results.append({
+            "rank":           0,
+            "industry":       ind_name,
+            "avg_change_pct": round(avg_chg, 2),
+            "status":         _status(avg_chg, vol_surge_ratio),
+            "rep_stocks":     [f"{c[1]} {c[2]}" for c in chg_entries[:3]],
+            "source":         "TWSE 今日報價（選股範圍）",
+        })
+
+    results.sort(key=lambda x: -x["avg_change_pct"])
+    for i, r in enumerate(results, 1):
+        r["rank"] = i
+    return results[:5]
+
+
+def format_tg_integrated_message(
+    data_date: str,
+    market_regime: dict,
+    tg_list: dict,
+    hot_industries: list,
+    resonance_industries: list,
+    is_test_mode: bool = False,
+) -> str:
+    """組成整合選股 TG 訊息（精選≤3、備選≤2）。"""
     now_str   = datetime.now().strftime("%Y-%m-%d %H:%M")
     mr        = market_regime or {}
     mr_label  = mr.get("label", "正常多頭")
     mr_status = mr.get("status", "normal_bull")
-    mr_emoji  = {"normal_bull": "🟢", "hot_bull": "🟡", "overheated_bull": "🔴", "weak_market": "⚪"}.get(mr_status, "📊")
+    mr_close  = mr.get("index_close") or mr.get("metrics", {}).get("index_close") or 0
+    mr_date   = mr.get("data_date", "")
+    mr_emoji  = {
+        "strong_bull": "🟢", "healthy_pullback": "🟢",
+        "high_overheated": "🟡", "weak_bounce": "🟠", "bear_break60": "🔴",
+    }.get(mr_status, "📊")
 
     tg_picks = tg_list.get("tg_picks", [])
     tg_watch = tg_list.get("tg_watch", [])
     SEP      = "─" * 28
 
-    lines = [f"📌 *{data_date} 明日精選股*"]
+    # 若大盤是「強多延伸」但當日收盤下跌或靠近低點，改顯示「強多回測」
+    if mr_status == "strong_bull":
+        _m = mr.get("metrics") or {}
+        if _m.get("market_day_declining") or _m.get("market_close_near_low"):
+            mr_label = "強多回測"
+
+    date_mismatch = bool(mr_date and data_date and mr_date != data_date)
+
+    # 1. 標題（使用 data_date，不是推送時間）
+    title_date = data_date if data_date else "未知"
+    if is_test_mode:
+        lines = [f"🔴 *【測試訊息，不可作為正式推送】*"]
+        lines.append(f"📌 *明日精選股｜資料日 {title_date}*")
+    else:
+        lines = [f"📌 *明日精選股｜資料日 {title_date}*"]
+    if data_date:
+        lines.append(f"📅 選股基準日：{data_date} 收盤")
+    else:
+        lines.append("📅 選股基準日：未知，請檢查資料同步狀態")
+        print("[日期檢查] WARNING: data_date 缺失，無法確認資料基準日")
+    # 若大盤資料日期與選股基準日不一致，顯示警告
+    if date_mismatch:
+        lines.append(f"⚠️ 大盤資料日 {mr_date} ≠ 選股基準日 {data_date}，請確認資料同步")
+        print(f"[日期檢查] WARNING: mr_date={mr_date} ≠ data_date={data_date}")
+    lines.append(f"🕐 推送時間：{now_str}")
+    lines.append(SEP)
+
+    # 2. 大盤狀態 + 操作原則
     lines.append(f"大盤狀態：{mr_emoji} {mr_label}")
+    if mr_close:
+        date_label = f"（{mr_date}）" if mr_date else ""
+        lines.append(f"大盤收盤：{mr_close:,.2f}{date_label}")
     lines.append(f"操作原則：A級、距cost20≤3%、停損≤4%、MACD收斂或正柱放大")
     lines.append(SEP)
 
-    if strong_industries:
-        lines.append("🏭 *今日強勢產業*")
-        for ind in strong_industries:
+    # 3. 今日盤面強勢族群
+    hot_source = hot_industries[0].get("source", "") if hot_industries else ""
+    lines.append("🏭 *今日盤面強勢族群*")
+    if hot_industries:
+        for ind in hot_industries:
+            rep = "、".join(ind["rep_stocks"][:3]) if ind.get("rep_stocks") else ""
+            sign = "+" if ind["avg_change_pct"] >= 0 else ""
+            lines.append(f"{ind['rank']}. {ind['industry']}｜漲幅 {sign}{ind['avg_change_pct']:.2f}%｜{ind['status']}")
+            if rep:
+                lines.append(f"   代表：{rep}")
+        if hot_source:
+            lines.append(f"（資料來源：{hot_source}）")
+    else:
+        lines.append("盤面強勢族群資料不足")
+    print(f"[TG 族群] market_strength_groups_available={bool(hot_industries)}, source={hot_source or '無'}")
+
+    # 4. 明日精選集中族群
+    concentrated = get_tg_pick_concentrated_industries(tg_picks, tg_watch)
+    if concentrated:
+        lines.append(f"\n📌 *明日精選集中族群*")
+        for c in concentrated:
+            reps = "、".join(c["representative_stocks"][:5])
+            lines.append(f"{c['industry']}｜精選 {c['pick_count']} 檔｜備選 {c['watch_count']} 檔｜代表：{reps}")
+        print(f"[TG 族群] concentrated_industries={'、'.join(c['industry'] for c in concentrated)}")
+    lines.append(SEP)
+
+    # 5. 法人技術共振產業（分層顯示）
+    lines.append("🧭 *法人技術共振產業*")
+    strong_inds  = [x for x in resonance_industries if x.get("is_strong")]
+    neutral_inds = [x for x in resonance_industries if not x.get("is_strong")]
+    if strong_inds:
+        for ind in strong_inds:
             top = "、".join(ind["top_stocks"][:2]) if ind.get("top_stocks") else ""
             lines.append(f"{ind['rank']}. {ind['industry']}｜分數 {ind['score']}｜{ind['status']}｜候選 {ind['candidate_count']} 檔")
             if top:
                 lines.append(f"   代表：{top}")
     else:
-        lines.append("🏭 今日無明顯強勢產業")
+        lines.append("今日無明顯強共振產業")
+    if neutral_inds:
+        for ind in neutral_inds:
+            top = "、".join(ind["top_stocks"][:2]) if ind.get("top_stocks") else ""
+            lines.append(f"中性觀察：{ind['industry']}｜分數 {ind['score']}｜候選 {ind['candidate_count']} 檔")
+            if top:
+                lines.append(f"   代表：{top}")
     lines.append(SEP)
 
+    # 6. 明日精選
     if tg_picks:
         lines.append(f"🔥 *明日精選 {len(tg_picks)} 檔*")
         num_emojis = ["1️⃣", "2️⃣", "3️⃣"]
@@ -1785,25 +2413,43 @@ def format_tg_integrated_message(data_date: str, market_regime: dict, tg_list: d
             lines.append(f"\n{num} *{s['stock_id']} {s['stock_name']}*｜{industry}")
             lines.append(f"現價 {close_p}｜距cost20 {'+' if dist>=0 else ''}{dist:.1f}%｜停損 {sl_price}（{sl_pct:.1f}%）")
             lines.append(f"MACD：{macd}｜風報比 {rr:.1f}｜法人：{inst_sum}")
-            lines.append(f"建議：A級股，距cost20 {dist:.1f}%，停損{sl_pct:.1f}%，MACD{macd}。")
+            dist_sign = "+" if dist >= 0 else ""
+            _candle_risk = s.get("candle_risk") or {}
+            _is_upper_shadow = _candle_risk.get("is_long_upper_shadow", False)
+            if _is_upper_shadow:
+                lines.append(
+                    f"建議：位置接近cost20，停損距離合理，MACD{macd}；"
+                    f"但當日長上影，隔日需確認不再跌破低點。"
+                )
+            elif not warning:
+                lines.append(f"建議：資料面乾淨，距cost20 {dist_sign}{dist:.1f}%，停損{sl_pct:.1f}%，MACD{macd}。")
+            else:
+                lines.append(f"建議：位置接近cost20，停損距離合理，MACD{macd}。")
             if warning:
                 lines.append(f"⚠️ {warning}")
     else:
         lines.append("🔥 今日無符合 TG 精選條件的明日可買")
     lines.append(SEP)
 
+    # 7. 備選（含降級原因）
     if tg_watch:
-        lines.append(f"👀 *備選 {len(tg_watch)} 檔*")
+        lines.append(f"👀 *備選觀察 {len(tg_watch)} 檔*")
         for s in tg_watch:
-            industry = s.get("industry") or "未分類"
-            sl_pct   = s.get("stop_loss_pct") or 0
-            reason   = s.get("final_reason") or ""
-            lines.append(f"{s['stock_id']} {s['stock_name']}｜{industry}")
-            lines.append(f"分數 {s.get('final_score', 0)}｜停損 {sl_pct:.1f}% 偏大")
-            if reason:
-                lines.append(f"原因：{reason[:60]}")
+            industry     = s.get("industry") or "未分類"
+            close_p      = s.get("close", 0)
+            dist         = s.get("dist_cost20_pct") or 0
+            sl_price     = s.get("stop_price", 0)
+            sl_pct       = s.get("stop_loss_pct") or 0
+            rr           = s.get("risk_reward") or 0
+            macd         = s.get("macd_status", "")
+            downgrade_r  = s.get("downgrade_reason") or s.get("final_reason") or ""
+            dist_sign    = "+" if dist >= 0 else ""
+            lines.append(f"\n{s['stock_id']} {s['stock_name']}｜{industry}")
+            lines.append(f"現價 {close_p}｜距cost20 {dist_sign}{dist:.1f}%｜停損 {sl_price}（{sl_pct:.1f}%）")
+            lines.append(f"MACD：{macd}｜風報比 {rr:.1f}")
+            if downgrade_r:
+                lines.append(f"原因：{downgrade_r[:80]}")
     lines.append(SEP)
-    lines.append(f"🕐 {now_str}")
     return "\n".join(lines)
 
 
@@ -1929,22 +2575,45 @@ async def api_tg_test_send_integrated():
         targets = [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in env_recipients]
     if not targets:
         raise HTTPException(status_code=400, detail="尚未設定任何 Telegram 目標，請先新增目標 ID。")
-    tg_list    = build_tg_pick_list(_last_integrated_result)
-    strong_ind = get_today_strong_industries_from_result(_last_integrated_result)
+    data_date_str = _last_integrated_result.get("data_date", datetime.now().strftime("%Y-%m-%d"))
+    tg_list       = build_tg_pick_list(_last_integrated_result)
+    hot_ind       = get_market_hot_industries(_last_integrated_result)
+    resonance_ind = get_resonance_industries(_last_integrated_result)
+    date_check    = validate_result_data_date(_last_integrated_result)
+    is_test_mode  = True  # 手動測試傳送，固定標示為測試模式
     msg = format_tg_integrated_message(
-        _last_integrated_result.get("data_date", datetime.now().strftime("%Y-%m-%d")),
+        data_date_str,
         _last_integrated_result.get("market_regime", {}),
-        tg_list, strong_ind,
+        tg_list, hot_ind, resonance_ind,
+        is_test_mode=is_test_mode,
     )
     result = _send_tg_with_targets(msg, targets)
     if result["ok"] == 0:
         raise HTTPException(status_code=502, detail=f"全部傳送失敗：{result['errors']}")
+    concentrated = get_tg_pick_concentrated_industries(tg_list["tg_picks"], tg_list["tg_watch"])
+    hot_source = hot_ind[0].get("source", "") if hot_ind else ""
     return {
-        "status": "ok",
-        "picks":  len(tg_list["tg_picks"]),
-        "watch":  len(tg_list["tg_watch"]),
-        "sent":   result["ok"],
-        "failed": result["fail"],
+        "status":                "ok",
+        "data_date":             data_date_str,
+        "send_time":             datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "stock_kbar_date":       date_check.get("stock_kbar_date", data_date_str),
+        "market_data_date":      date_check.get("market_data_date", ""),
+        "market_close":          date_check.get("market_close", 0),
+        "institution_data_date": date_check.get("institution_data_date", ""),
+        "market_regime":         date_check.get("market_regime", ""),
+        "market_regime_success": date_check.get("market_regime_success", True),
+        "date_valid":            date_check.get("valid", True),
+        "is_test_mode":          is_test_mode,
+        "data_validation":       date_check.get("data_validation", {}),
+        "market_strength_groups_available": bool(hot_ind),
+        "market_strength_groups_source":    hot_source,
+        "tg_pick_count":         len(tg_list["tg_picks"]),
+        "tg_watch_count":        len(tg_list["tg_watch"]),
+        "downgraded_count":      tg_list.get("downgrade_count", 0),
+        "downgrade_reasons":     tg_list.get("downgraded", []),
+        "concentrated_industries": [c["industry"] for c in concentrated],
+        "sent":                  result["ok"],
+        "failed":                result["fail"],
     }
 
 @app.post("/api/tg/test-send/{target_id}")
@@ -1960,21 +2629,163 @@ async def api_tg_test_send_single(target_id: int):
         conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="找不到此目標")
-    tg_list    = build_tg_pick_list(_last_integrated_result)
-    strong_ind = get_today_strong_industries_from_result(_last_integrated_result)
+    data_date_str = _last_integrated_result.get("data_date", datetime.now().strftime("%Y-%m-%d"))
+    tg_list       = build_tg_pick_list(_last_integrated_result)
+    hot_ind       = get_market_hot_industries(_last_integrated_result)
+    resonance_ind = get_resonance_industries(_last_integrated_result)
+    date_check    = validate_result_data_date(_last_integrated_result)
+    is_test_mode  = True  # 單目標測試傳送，固定標示為測試模式
     msg = format_tg_integrated_message(
-        _last_integrated_result.get("data_date", datetime.now().strftime("%Y-%m-%d")),
+        data_date_str,
         _last_integrated_result.get("market_regime", {}),
-        tg_list, strong_ind,
+        tg_list, hot_ind, resonance_ind,
+        is_test_mode=is_test_mode,
     )
     result = _send_tg_with_targets(msg, [dict(row)])
     if result["ok"] == 0:
         raise HTTPException(status_code=502, detail=f"傳送失敗：{result['errors']}")
-    return {"status": "ok"}
+    concentrated = get_tg_pick_concentrated_industries(tg_list["tg_picks"], tg_list["tg_watch"])
+    hot_source = hot_ind[0].get("source", "") if hot_ind else ""
+    return {
+        "status":                "ok",
+        "data_date":             data_date_str,
+        "send_time":             datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "stock_kbar_date":       date_check.get("stock_kbar_date", data_date_str),
+        "market_data_date":      date_check.get("market_data_date", ""),
+        "market_close":          date_check.get("market_close", 0),
+        "institution_data_date": date_check.get("institution_data_date", ""),
+        "market_regime":         date_check.get("market_regime", ""),
+        "market_regime_success": date_check.get("market_regime_success", True),
+        "date_valid":            date_check.get("valid", True),
+        "is_test_mode":          is_test_mode,
+        "data_validation":       date_check.get("data_validation", {}),
+        "market_strength_groups_available": bool(hot_ind),
+        "market_strength_groups_source":    hot_source,
+        "tg_pick_count":         len(tg_list["tg_picks"]),
+        "tg_watch_count":        len(tg_list["tg_watch"]),
+        "downgraded_count":      tg_list.get("downgrade_count", 0),
+        "downgrade_reasons":     tg_list.get("downgraded", []),
+        "concentrated_industries": [c["industry"] for c in concentrated],
+    }
 
 # ── 排程：每週一到五 18:00 自動同步 + 篩選 + 傳送 Telegram ─────────────────
 
 scheduler = AsyncIOScheduler(timezone="Asia/Taipei")
+
+
+async def sync_all_stock_screener_data(target_date: str = "") -> dict:
+    """
+    統一同步整合選股所需資料：法人 + 個股日K + 大盤TAIEX日K。
+    給前端同步選股數據按鈕與 TG 每日排程共用。
+    """
+    global api, is_logged_in
+    now = datetime.now()
+
+    # 決定 data_date（最近交易日）
+    if not target_date:
+        curr = now
+        for _ in range(10):
+            if curr.weekday() not in [5, 6]:
+                target_date = curr.strftime("%Y-%m-%d")
+                break
+            curr -= timedelta(days=1)
+
+    print(f"[同步選股數據] data_date={target_date}")
+
+    # 1. 法人資料同步（最近 5 個交易日）
+    inst_result = {"success": False, "synced_days": 0, "latest_date": "", "error": None}
+    synced_days = 0
+    last_inst_date = ""
+    for i in range(15):
+        test_date = now - timedelta(days=i)
+        if test_date.weekday() in [5, 6]:
+            continue
+        try:
+            screener.sync_twse_institutional_data(test_date)
+            synced_days += 1
+            if not last_inst_date:
+                last_inst_date = test_date.strftime("%Y-%m-%d")
+            if synced_days >= 5:
+                break
+        except Exception as e:
+            print(f"[同步選股數據] 法人同步 {test_date.strftime('%Y-%m-%d')} 失敗：{e}")
+    inst_result = {
+        "success": synced_days > 0, "synced_days": synced_days,
+        "latest_date": last_inst_date, "error": None,
+    }
+    print(f"[同步選股數據] sync_institutional={'success' if synced_days > 0 else 'warning'}, latest={last_inst_date}")
+
+    # 2. 個股日K同步（需要 API 登入）
+    kbar_result = {"success": False, "latest_date": "", "error": None}
+    if is_logged_in and api:
+        try:
+            candidates = screener.get_inst_5d_candidates()
+            sync_codes = candidates if candidates else screener.DEFAULT_STOCKS
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: screener.sync_stock_kbars(api, sync_codes))
+            kbar_result = {"success": True, "latest_date": target_date, "error": None}
+            print(f"[同步選股數據] sync_stock_daily_kbars=success, latest={target_date}")
+        except Exception as e:
+            kbar_result = {"success": False, "latest_date": "", "error": str(e)}
+            print(f"[同步選股數據] sync_stock_daily_kbars=failed: {e}")
+    else:
+        kbar_result = {"success": False, "latest_date": "", "error": "尚未登入，略過個股日K同步"}
+        print("[同步選股數據] sync_stock_daily_kbars=skipped (not logged in)")
+
+    # 3. 大盤 TAIEX 日K同步（不需要登入）
+    market_result = sync_taiex_daily_kbars(target_date)
+    if market_result["success"]:
+        print(f"[同步選股數據] sync_taiex_daily_kbars=success, latest={market_result['latest_date']}")
+    else:
+        print(f"[同步選股數據] sync_taiex_daily_kbars=failed: {market_result.get('error', '')}")
+
+    # 3.5 Re-derive target_date from actual data availability.
+    # Calendar weekday may point to today before today's close is available.
+    # Use MAX(daily_kbars.date) — the last date for which we have validated stock data —
+    # as the effective data_date when it falls within 3 calendar days of the original target.
+    effective_data_date_reason = "最近非假日（行事曆推算）"
+    try:
+        _conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        _kb_row = _conn.execute("SELECT MAX(date) FROM daily_kbars").fetchone()
+        _conn.close()
+        _kb_latest = normalize_date(str(_kb_row[0])) if _kb_row and _kb_row[0] else ""
+        if _kb_latest:
+            _days_diff = (
+                datetime.strptime(target_date, "%Y-%m-%d")
+                - datetime.strptime(_kb_latest, "%Y-%m-%d")
+            ).days
+            if 0 <= _days_diff <= 3:
+                if _kb_latest != target_date:
+                    effective_data_date_reason = (
+                        f"調整為daily_kbars最新日期（{_kb_latest}，原行事曆推算{target_date}）"
+                    )
+                    print(f"[同步選股數據] data_date 調整 {target_date} → {_kb_latest} (daily_kbars latest)")
+                else:
+                    effective_data_date_reason = "daily_kbars最新日期（與行事曆推算一致）"
+                target_date = _kb_latest
+    except Exception as _e:
+        print(f"[同步選股數據] data_date re-derive 失敗: {_e}")
+
+    # 4. 資料一致性驗證
+    validation = validate_screener_data_date(target_date)
+    print(f"[同步選股數據] validation.critical_ok={validation['critical_ok']}")
+
+    return {
+        "success":                    validation["critical_ok"],
+        "data_date":                  target_date,
+        "stock_kbar_date":            validation["stock_kbar_date"],
+        "market_data_date":           validation["market_data_date"],
+        "market_close":               validation.get("market_close", 0),
+        "institution_data_date":      validation["institution_data_date"],
+        "stock_result":               kbar_result,
+        "institution_result":         inst_result,
+        "market_result":              market_result,
+        "validation":                 validation,
+        "effective_data_date_reason": effective_data_date_reason,
+        "market_close_source":        market_result.get("market_close_source", "Yahoo Finance"),
+        "used_twse_fallback":         market_result.get("used_twse_fallback", False),
+    }
+
 
 def _send_telegram_message(message: str):
     """廣播訊息給所有收件人（供排程 job 使用）"""
@@ -1996,44 +2807,25 @@ async def _scheduled_sync_and_alert():
         print(f"[{now_str}] 今日非交易日，略過推送")
         return
 
-    # 1. 同步數據
-    sync_ok = True
-    if not is_logged_in:
-        print(f"[{now_str}] 尚未登入，略過 K 線同步，嘗試直接用快取篩選")
-    else:
-        try:
-            curr = datetime.now()
-            synced_days = 0
-            for i in range(15):
-                test_date = curr - timedelta(days=i)
-                if test_date.weekday() in [5, 6]:
-                    continue
-                try:
-                    screener.sync_twse_institutional_data(test_date)
-                    synced_days += 1
-                    if synced_days >= 5:
-                        break
-                except Exception as e:
-                    print(f"[{now_str}] 法人同步 {test_date.strftime('%Y-%m-%d')} 失敗：{e}")
-            candidates = screener.get_inst_5d_candidates()
-            sync_codes = candidates if candidates else screener.DEFAULT_STOCKS
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: screener.sync_stock_kbars(api, sync_codes))
-            print(f"[{now_str}] sync success")
-        except Exception as e:
-            sync_ok = False
-            err_msg = f"同步失敗：{e}"
-            print(f"[{now_str}] {err_msg}")
-            _tg_push_status.update({"last_push_time": now_str, "last_push_status": "sync_failed", "last_error": err_msg})
-            err_tg = (f"⚠️ *{date_str} 選股同步失敗*\n原因：{e}\n系統未推送明日精選股，避免使用舊資料。")
-            targets = _get_tg_db_targets(enabled_only=True) or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
-            if targets:
-                _send_tg_with_targets(err_tg, targets)
-            return
-
-    # 2. 執行整合選股
+    # 1. 同步全部選股數據（法人 + 個股日K + 大盤 TAIEX）
     try:
-        result = integrated_strategy.run_integrated_strategy()
+        sync_res = await sync_all_stock_screener_data(date_str)
+        print(f"[{now_str}] sync_all: critical_ok={sync_res['success']}, "
+              f"market_latest={sync_res.get('market_data_date', '')}, "
+              f"stock_latest={sync_res.get('stock_kbar_date', '')}")
+    except Exception as e:
+        err_msg = f"同步失敗：{e}"
+        print(f"[{now_str}] {err_msg}")
+        _tg_push_status.update({"last_push_time": now_str, "last_push_status": "sync_failed", "last_error": err_msg})
+        err_tg = (f"⚠️ *{date_str} 選股同步失敗*\n原因：{e}\n系統未推送明日精選股，避免使用舊資料。")
+        targets = _get_tg_db_targets(enabled_only=True) or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
+        if targets:
+            _send_tg_with_targets(err_tg, targets)
+        return
+
+    # 2. 執行整合選股（明確傳入 data_date，讓 market_regime 驗證日期一致性）
+    try:
+        result = integrated_strategy.run_integrated_strategy(data_date=date_str)
         _last_integrated_result = result
         buy_count = len(result.get("buy_candidates", []))
         print(f"[{now_str}] integrated strategy success, buy_candidates={buy_count}")
@@ -2046,15 +2838,53 @@ async def _scheduled_sync_and_alert():
             _send_tg_with_targets(f"⚠️ *{date_str} 排程篩選失敗*\n錯誤：{e}", targets)
         return
 
-    # 3. 建立 TG 精選名單與強勢產業
-    tg_list    = build_tg_pick_list(result)
-    strong_ind = get_today_strong_industries_from_result(result)
-    print(f"[{now_str}] strong_industries={len(strong_ind)}")
-    print(f"[{now_str}] tg_picks={len(tg_list['tg_picks'])}, tg_watch={len(tg_list['tg_watch'])}")
+    # 2b. 資料日期驗證
+    data_date  = result.get("data_date", date_str)
+    date_check = validate_result_data_date(result)
+    mkt_date         = date_check.get("market_data_date", "？")
+    taiex_close_val  = date_check.get("taiex_close", 0)
+    mkt_regime_val   = date_check.get("market_regime", "")
+    inst_date        = date_check.get("institution_data_date", "？")
+    critical_ok      = date_check.get("critical_ok", True)
+    print(
+        f"[{now_str}] data_date={data_date}, market_data_date={mkt_date}, "
+        f"institution_data_date={inst_date}, taiex_close={taiex_close_val}, "
+        f"market_regime={mkt_regime_val}, tg_blocked={not critical_ok}"
+    )
+
+    if not critical_ok:
+        err_lines = date_check.get("errors", [])
+        stock_date = date_check.get("stock_kbar_date", date_str)
+        err_tg = (
+            f"⚠️ *選股資料異常｜資料日 {data_date}*\n\n"
+            f"大盤資料日：{mkt_date}\n"
+            f"個股資料日：{stock_date}\n\n"
+            f"系統未推送明日精選股，避免使用舊資料。\n"
+            f"請先執行「同步選股數據」，並確認大盤資料已同步。\n"
+            f"原因：{chr(10).join(err_lines)}"
+        )
+        print(f"[TG 推送阻擋] data_date={data_date}, market_data_date={mkt_date}, reason=market data stale")
+        targets = _get_tg_db_targets(enabled_only=True) or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
+        if targets:
+            _send_tg_with_targets(err_tg, targets)
+        _tg_push_status.update({"last_push_time": now_str, "last_push_status": "date_mismatch",
+                                 "last_error": "; ".join(err_lines)})
+        return
+
+    # 3. 建立 TG 精選名單與兩個產業區塊
+    tg_list       = build_tg_pick_list(result)
+    hot_ind       = get_market_hot_industries(result)
+    resonance_ind = get_resonance_industries(result)
+    hot_source = hot_ind[0].get("source", "") if hot_ind else ""
+    print(
+        f"[{now_str}] hot_industries={len(hot_ind)}, source={hot_source}, "
+        f"resonance_industries={len(resonance_ind)}"
+    )
+    print(f"[TG 推送] mode=scheduled, data_date={data_date}, market_data_date={mkt_date}, "
+          f"tg_blocked=false, tg_picks={len(tg_list['tg_picks'])}, tg_watch={len(tg_list['tg_watch'])}")
 
     # 4. 組成 TG 訊息
-    data_date = result.get("data_date", date_str)
-    msg = format_tg_integrated_message(data_date, result.get("market_regime", {}), tg_list, strong_ind)
+    msg = format_tg_integrated_message(data_date, result.get("market_regime", {}), tg_list, hot_ind, resonance_ind)
 
     # 5. 讀取目標並傳送
     targets = _get_tg_db_targets(enabled_only=True)
@@ -2139,47 +2969,82 @@ async def api_screener_trace(payload: dict = {}):
 
 @app.post("/api/screener/sync")
 async def api_sync_screener():
-    """觸發背景日 K 與三大法人、PTT 數據同步"""
-    global api, is_logged_in
-    if not is_logged_in:
-        raise HTTPException(status_code=400, detail="請先登入系統（啟動連線）才能同步股票數據。")
-        
+    """觸發背景日 K、三大法人與大盤 TAIEX 數據同步"""
+    global _last_integrated_result
     try:
-        # 1. 抓取證交所三大法人 (自動回溯抓取最近 5 個交易日，確保 5 日法人佔比有完整歷史數據)
-        curr = datetime.now()
-        synced_days = 0
-        for i in range(15):  # 往回找最多 15 天以湊齊 5 個交易日
-            test_date = curr - timedelta(days=i)
-            if test_date.weekday() in [5, 6]:  # 排除週末
-                continue
-            try:
-                screener.sync_twse_institutional_data(test_date)
-                synced_days += 1
-                if synced_days >= 5:
-                    break
-            except Exception as eSync:
-                print(f"背景同步 {test_date.strftime('%Y-%m-%d')} 三大法人失敗: {eSync}")
-        
-        # 2. 取得法人候選名單，只對這些股票下載 K 線（大幅縮短同步時間）
-        candidates = screener.get_inst_5d_candidates()
-        sync_codes = candidates if candidates else screener.DEFAULT_STOCKS
-        print(f"[Sync] K-bar sync target: {len(sync_codes)} stocks")
-
-        # 3. 下載 K 線日數據（只抓候選股，避免阻塞主線程）
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: screener.sync_stock_kbars(api, sync_codes))
-        
-        return {"status": "success", "message": "股票選股數據同步完成！"}
+        result = await sync_all_stock_screener_data()
+        validation = result.get("validation", {})
+        # 同步成功後清除舊的整合選股快取，確保 TG 測試傳送使用最新資料
+        if result["success"]:
+            _last_integrated_result = None
+            print("[同步選股數據] 已清除舊整合選股快取（_last_integrated_result = None）")
+        return {
+            "status":                      "success" if result["success"] else "warning",
+            "message":                     "選股數據同步完成！" if result["success"] else "同步完成但資料未完全對齊，請確認大盤資料",
+            "data_date":                   result["data_date"],
+            "stock_kbar_date":             validation.get("stock_kbar_date", ""),
+            "market_data_date":            validation.get("market_data_date", ""),
+            "market_close":                validation.get("market_close", 0),
+            "institution_data_date":       validation.get("institution_data_date", ""),
+            "critical_ok":                 validation.get("critical_ok", False),
+            "market_regime_success":       result["market_result"].get("success", False),
+            "warnings":                    validation.get("warnings", []),
+            "errors":                      validation.get("errors", []),
+            "data_validation":             validation,
+            "market_close_source":         result.get("market_close_source", "Yahoo Finance"),
+            "effective_data_date_reason":  result.get("effective_data_date_reason", ""),
+            "used_twse_fallback":          result.get("used_twse_fallback", False),
+        }
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"同步選股數據失敗: {str(e)}")
 
+def get_effective_screener_data_date() -> dict:
+    """
+    回傳目前選股可用的有效資料日。
+    優先使用 MAX(daily_kbars.date)。
+    若與 calendar target 差距 <= 3 天，使用 daily_kbars 最新日期。
+    回傳 data_date 與 reason。
+    """
+    _now = datetime.now()
+    _curr = _now
+    for _ in range(10):
+        if _curr.weekday() not in [5, 6]:
+            break
+        _curr -= timedelta(days=1)
+    target_date = _curr.strftime("%Y-%m-%d")
+    reason = "最近非假日（行事曆推算）"
+    try:
+        _conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        _kb_row = _conn.execute("SELECT MAX(date) FROM daily_kbars").fetchone()
+        _conn.close()
+        _kb_latest = normalize_date(str(_kb_row[0])) if _kb_row and _kb_row[0] else ""
+        if _kb_latest:
+            _days_diff = (
+                datetime.strptime(target_date, "%Y-%m-%d")
+                - datetime.strptime(_kb_latest, "%Y-%m-%d")
+            ).days
+            if 0 <= _days_diff <= 3:
+                if _kb_latest != target_date:
+                    reason = f"調整為daily_kbars最新日期（{_kb_latest}，原行事曆推算{target_date}）"
+                    print(f"[effective_data_date] {target_date} → {_kb_latest}")
+                else:
+                    reason = "daily_kbars最新日期（與行事曆推算一致）"
+                target_date = _kb_latest
+    except Exception as _e:
+        print(f"[effective_data_date] 計算失敗: {_e}")
+    return {"data_date": target_date, "reason": reason}
+
+
 @app.get("/api/tomorrow_strategy")
 async def api_tomorrow_strategy():
     """大盤狀態 × 明日策略選股"""
     try:
-        result = tomorrow_strategy.run_tomorrow_strategy()
+        _eff = get_effective_screener_data_date()
+        _data_date = _eff["data_date"]
+        print(f"[api/tomorrow_strategy] data_date={_data_date}, reason={_eff['reason']}")
+        result = tomorrow_strategy.run_tomorrow_strategy(data_date=_data_date)
         return {"status": "success", **result}
     except Exception as e:
         import traceback
@@ -2191,9 +3056,21 @@ async def api_integrated_strategy():
     """整合選股（tomorrow_strategy 主決策 + screener 籌碼輔助）"""
     global _last_integrated_result
     try:
-        result = integrated_strategy.run_integrated_strategy()
+        _eff = get_effective_screener_data_date()
+        _data_date = _eff["data_date"]
+        print(f"[api/integrated-strategy] data_date={_data_date}, reason={_eff['reason']}")
+        result = integrated_strategy.run_integrated_strategy(data_date=_data_date)
         _last_integrated_result = result
-        return result
+        date_check = validate_result_data_date(result)
+        return {
+            **result,
+            "stock_kbar_date":       date_check.get("stock_kbar_date", result.get("data_date", "")),
+            "market_data_date":      date_check.get("market_data_date", ""),
+            "market_close":          date_check.get("market_close", 0),
+            "institution_data_date": date_check.get("institution_data_date", ""),
+            "market_regime_success": date_check.get("market_regime_success", True),
+            "data_validation":       date_check.get("data_validation", {}),
+        }
     except Exception as e:
         import traceback
         traceback.print_exc()
