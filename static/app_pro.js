@@ -2063,23 +2063,44 @@ function _renderIntegratedTgTargets(targets) {
         list.innerHTML = `<div style="color:#555;font-size:0.75rem;padding:6px 0;">尚未新增任何目標</div>`;
         return;
     }
+    const typeLabel = { stock: '股票', amplitude: '震幅統計', all: '全部' };
+    const typeColor = { stock: '#ffd233', amplitude: '#4facfe', all: '#26de81' };
     list.innerHTML = targets.map(t => {
         const enabledColor = t.enabled ? '#26de81' : '#555';
         const enabledLabel = t.enabled ? '啟用中' : '已停用';
+        const tt    = t.target_type || 'stock';
+        const tLbl  = typeLabel[tt] || tt;
+        const tClr  = typeColor[tt] || '#888';
+        const nextTypes = { stock: 'amplitude', amplitude: 'all', all: 'stock' };
+        const safeName   = (t.name || '').replace(/'/g, "\\'");
+        const safeChatId = (t.chat_id || '').replace(/'/g, "\\'");
         return `<div style="display:flex;align-items:center;gap:8px;background:rgba(41,182,246,0.04);border:1px solid rgba(41,182,246,${t.enabled ? '0.2' : '0.08'});border-radius:6px;padding:6px 10px;">
             <span style="color:${enabledColor};font-size:0.72rem;min-width:48px;">${enabledLabel}</span>
             <span style="color:#29b6f6;font-size:0.8rem;font-weight:bold;min-width:80px;">👤 ${t.name || '未命名'}</span>
             <span style="color:#888;font-size:0.75rem;font-family:monospace;flex:1;">${t.chat_id}</span>
+            <span title="推送類型（點擊切換）" onclick="changeIntegratedTgTargetType(${t.id}, '${nextTypes[tt]}')" style="color:${tClr};font-size:0.68rem;border:1px solid ${tClr};border-radius:4px;padding:1px 6px;cursor:pointer;white-space:nowrap;">${tLbl}</span>
             <button onclick="testSingleIntegratedTgTarget(${t.id})" title="單一測試" style="width:auto;background:rgba(255,211,51,0.1);color:#ffd233;border:1px solid rgba(255,211,51,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.7rem;">🧪</button>
+            <button onclick="editIntegratedTgTarget(${t.id}, '${safeName}', '${safeChatId}')" title="編輯名稱與 Chat ID" style="width:auto;background:rgba(165,94,234,0.1);color:#e056fd;border:1px solid rgba(165,94,234,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.7rem;">✏️</button>
             <button onclick="toggleIntegratedTgTarget(${t.id}, ${t.enabled ? 0 : 1})" style="width:auto;background:rgba(41,182,246,0.1);color:#29b6f6;border:1px solid rgba(41,182,246,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.7rem;">${t.enabled ? '停用' : '啟用'}</button>
             <button onclick="deleteIntegratedTgTarget(${t.id})" style="width:auto;background:rgba(255,68,68,0.1);color:#ff4444;border:1px solid rgba(255,68,68,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.7rem;">✕ 刪除</button>
         </div>`;
     }).join('');
 }
 
+async function changeIntegratedTgTargetType(id, newType) {
+    try {
+        await fetch(`/api/tg/targets/${id}`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ target_type: newType }),
+        });
+        _loadIntegratedTgTargets();
+    } catch(e) { _showTgToast(`❌ 更新類型失敗：${e.message}`, true); }
+}
+
 async function addIntegratedTgTarget() {
-    const name   = document.getElementById('integrated-tg-new-name')?.value.trim();
-    const chatId = document.getElementById('integrated-tg-new-chatid')?.value.trim();
+    const name       = document.getElementById('integrated-tg-new-name')?.value.trim();
+    const chatId     = document.getElementById('integrated-tg-new-chatid')?.value.trim();
+    const targetType = document.getElementById('integrated-tg-new-type')?.value || 'stock';
     const status = document.getElementById('integrated-tg-add-status');
     if (!chatId) {
         if (status) status.textContent = '❌ Chat ID 不可為空';
@@ -2088,7 +2109,7 @@ async function addIntegratedTgTarget() {
     try {
         const res = await fetch('/api/tg/targets', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ chat_id: chatId, name: name || chatId }),
+            body: JSON.stringify({ chat_id: chatId, name: name || chatId, target_type: targetType }),
         });
         const data = await res.json();
         if (res.ok && data.success) {
@@ -2120,10 +2141,34 @@ async function deleteIntegratedTgTarget(id) {
     } catch(e) { _showTgToast(`❌ 刪除失敗：${e.message}`, true); }
 }
 
+async function editIntegratedTgTarget(id, currentName, currentChatId) {
+    const newName = prompt('修改名稱：', currentName);
+    if (newName === null) return;
+    const newChatId = prompt('修改 Chat ID：', currentChatId);
+    if (newChatId === null) return;
+    if (!newChatId.trim()) {
+        _showTgToast('❌ Chat ID 不可為空', true);
+        return;
+    }
+    try {
+        const res = await fetch(`/api/tg/targets/${id}`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ name: newName.trim(), chat_id: newChatId.trim() }),
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+            _showTgToast('✅ 已更新名稱與 Chat ID');
+            _loadIntegratedTgTargets();
+        } else {
+            _showTgToast(`❌ ${data.detail || '更新失敗'}`, true);
+        }
+    } catch(e) { _showTgToast(`❌ ${e.message}`, true); }
+}
+
 async function testSingleIntegratedTgTarget(id) {
     _showTgToast('📨 傳送測試訊息中...');
     try {
-        const res  = await fetch(`/api/tg/test-send/${id}`, { method: 'POST' });
+        const res  = await fetch(`/api/tg/targets/${id}/test`, { method: 'POST' });
         const data = await res.json();
         if (res.ok) {
             _showTgToast('✅ 單一目標測試傳送成功！');
@@ -2474,11 +2519,18 @@ async function startApp(contractCode) {
         const tomorrowView   = document.getElementById('stock-tomorrow-view');
         const integratedView = document.getElementById('stock-integrated-view');
         const freelancerContainer = document.getElementById('freelancer-container');
+        const ampStatsContainer   = document.getElementById('amplitude-statistics-container');
+        const panesEl             = document.getElementById('panes-container');
 
-        // 先全部清除所有模式 class
-        appContainer.classList.remove('market-stocks', 'market-freelancer');
-        // 確保自由人容器預設隱藏
+        // ── 全域 reset：清除所有模式 class，隱藏所有可切換容器 ──
+        appContainer.classList.remove('market-stocks', 'market-freelancer', 'market-amplitude-statistics');
         if (freelancerContainer) freelancerContainer.style.display = 'none';
+        if (ampStatsContainer)   ampStatsContainer.style.display   = 'none';
+        // 移除震幅統計模式注入的動態 style 覆蓋（讓 CSS 重新接管 panes-container）
+        const _existOverride = document.getElementById('_amp-panes-override');
+        if (_existOverride) _existOverride.remove();
+        // 停止震幅統計自動更新
+        stopAmplitudeStatisticsAutoRefresh();
 
         if (market === 'stocks') {
             appContainer.classList.add('market-stocks');
@@ -2525,6 +2577,24 @@ async function startApp(contractCode) {
             if (freelancerContainer) freelancerContainer.style.display = 'flex';
             // stock tabs/placeholder 由 CSS market-freelancer class 隱藏
             flStartAmplitudeRefresh();
+        } else if (market === 'amplitude-statistics') {
+            // ── 震幅統計：動態注入 <style> 來隱藏 panes-container ──
+            // CSS style.css 有 `#panes-container { display: grid !important }`，
+            // 任何 inline style（含 setProperty !important）都無法可靠覆蓋它。
+            // 動態插入的 <style> 在 head 末端，source order 最晚，同 specificity 下必勝。
+            let _override = document.getElementById('_amp-panes-override');
+            if (!_override) {
+                _override = document.createElement('style');
+                _override.id = '_amp-panes-override';
+                document.head.appendChild(_override);
+            }
+            _override.textContent = '#panes-container { display: none !important; }';
+            if (tabsBar)     tabsBar.style.display     = 'none';
+            if (placeholder) placeholder.style.display = 'none';
+            appContainer.classList.add('market-amplitude-statistics');
+            if (ampStatsContainer) ampStatsContainer.style.display = 'flex';
+            loadAmplitudeStatistics();
+            loadAmplitudeTgTargets();
         } else { // futures
             flStopAmplitudeRefresh();
             if (tabsBar) tabsBar.style.display = 'none';
@@ -2543,8 +2613,8 @@ async function startApp(contractCode) {
         // 從本地暫存讀取上一次的選擇市場，預設為期貨看盤
         const savedMarket = localStorage.getItem('global-market-type') || 'futures';
         
-        // 初始載入時，生成對應市場的選單項目（自由人模式不需要合約選單）
-        if (savedMarket !== 'freelancer') updateContractSelector(savedMarket, contractCode);
+        // 初始載入時，生成對應市場的選單項目（自由人/震幅統計模式不需要合約選單）
+        if (savedMarket !== 'freelancer' && savedMarket !== 'amplitude-statistics') updateContractSelector(savedMarket, contractCode);
         
         marketSelector.value = savedMarket;
         applyMarket(savedMarket);
@@ -4195,5 +4265,274 @@ async function loadIntegratedStrategy() {
             emptyEl.innerHTML = `⚠️ 載入失敗：${e.message}<br><span style="font-size:0.75rem; color:#555;">請確認伺服器是否正常運行</span>`;
         }
         console.error('[IntegratedStrategy] 載入失敗:', e);
+    }
+}
+
+// ── 震幅統計分頁 ──────────────────────────────────────────────────────────────
+
+let _ampStatsTimer   = null;
+let _ampStatsHelpOpen = true;
+let _ampDateMode     = 'calendar_date';
+
+function toggleAmpStatsHelp() {
+    _ampStatsHelpOpen = !_ampStatsHelpOpen;
+    const body   = document.getElementById('amp-stats-help-body');
+    const toggle = document.getElementById('amp-stats-help-toggle');
+    if (body)   body.style.display   = _ampStatsHelpOpen ? 'flex' : 'none';
+    if (toggle) toggle.textContent   = _ampStatsHelpOpen ? '▲ 收合' : '▼ 展開';
+}
+
+function setAmpDateMode(mode) {
+    _ampDateMode = mode;
+    const btnTd = document.getElementById('amp-mode-btn-trading');
+    const btnCal = document.getElementById('amp-mode-btn-calendar');
+    if (btnTd)  btnTd.style.background  = mode === 'trading_date' ? '#1a4a7a' : '#0d1f2d';
+    if (btnCal) btnCal.style.background = mode === 'calendar_date' ? '#1a4a7a' : '#0d1f2d';
+    loadAmplitudeStatistics();
+}
+
+async function loadAmplitudeStatistics() {
+    const inner = document.getElementById('amp-stats-table-inner');
+    if (!inner) return;
+    inner.innerHTML = '<div style="color:#555; padding:30px; text-align:center;">載入中...</div>';
+
+    try {
+        const res = await fetch(`/api/amplitude_statistics?days=20&contract=TXFR1&date_mode=${_ampDateMode}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'API error');
+
+        const updEl = document.getElementById('amp-stats-updated-at');
+        if (updEl) updEl.textContent = data.updated_at;
+
+        renderAmplitudeStatisticsTable(data);
+    } catch (e) {
+        if (inner) inner.innerHTML = `<div style="color:#f55; padding:30px;">⚠️ 載入失敗：${e.message}</div>`;
+        console.warn('[AmpStats] 載入失敗:', e);
+    }
+}
+
+function getAmplitudeStatusClass(status) {
+    return {
+        super_large: 'amp-status-super-large',
+        large:       'amp-status-large',
+        small:       'amp-status-small',
+        compressed:  'amp-status-compressed',
+        normal:      'amp-status-normal',
+        empty:       'amp-status-empty',
+        avg:         'amp-row-avg-cell',
+    }[status] || '';
+}
+
+function renderAmplitudeStatisticsTable(data) {
+    const inner = document.getElementById('amp-stats-table-inner');
+    if (!inner) return;
+
+    const { columns, rows } = data;
+
+    let html = '<table class="amp-stats-table"><thead><tr>';
+    html += '<th class="amp-stats-label-col">時段</th>';
+    for (const col of columns) {
+        const cls = col.is_today ? 'amp-col-today' : '';
+        html += `<th class="${cls}">${col.label}<br><span style="font-size:0.65rem; color:#555;">${col.weekday}</span></th>`;
+    }
+    html += '</tr></thead><tbody>';
+
+    for (const row of rows) {
+        const isTotal = row.key === 'total';
+        const isAvg   = row.key.endsWith('_avg20');
+        const rowCls  = isTotal ? 'amp-row-total' : (isAvg ? 'amp-row-avg' : '');
+
+        html += `<tr class="${rowCls}">`;
+        html += `<td class="amp-stats-label-col">${row.label}</td>`;
+
+        for (const cell of row.cells) {
+            const colIsToday = columns.find(c => c.date === cell.date)?.is_today;
+            const cellCls  = getAmplitudeStatusClass(cell.status);
+            const todayCls = colIsToday ? 'amp-col-today' : '';
+            const val      = cell.value !== null ? cell.value : '-';
+            const tip      = (cell.high && cell.low) ? ` title="H:${cell.high} L:${cell.low}"` : '';
+            html += `<td class="${cellCls} ${todayCls}"${tip}>${val}</td>`;
+        }
+
+        html += '</tr>';
+    }
+
+    html += '</tbody></table>';
+    inner.innerHTML = html;
+}
+
+function stopAmplitudeStatisticsAutoRefresh() {
+    if (_ampStatsTimer) { clearInterval(_ampStatsTimer); _ampStatsTimer = null; }
+}
+
+async function sendAmplitudeDailyReport() {
+    const btn    = document.getElementById('amp-send-tg-btn');
+    const status = document.getElementById('amp-send-tg-status');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ 傳送中...'; }
+    if (status) status.textContent = '';
+    try {
+        const res  = await fetch('/api/amplitude/send_daily_report', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) {
+            if (status) status.textContent = `❌ ${data.detail || '傳送失敗'}`;
+            return;
+        }
+        if (!data.success) {
+            if (status) status.textContent = `⚠️ ${data.message || '未成功'}`;
+            if (data.message && data.message.includes('尚未設定')) {
+                const panel = document.getElementById('amp-tg-panel');
+                if (panel) {
+                    panel.scrollIntoView({ behavior: 'smooth' });
+                    if (!_ampTgPanelOpen) toggleAmpTgPanel();
+                }
+            }
+            return;
+        }
+        if (status) status.textContent = `✅ 已傳送 ${data.sent}/${data.target_count} 個目標（${data.data_date}）`;
+    } catch(e) {
+        if (status) status.textContent = `❌ ${e.message}`;
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '📤 發送昨日震幅狀態'; }
+    }
+}
+
+// ── 震幅 TG 接收者管理 ──────────────────────────────────────────────────────
+
+let _ampTgPanelOpen = true;
+
+function toggleAmpTgPanel() {
+    _ampTgPanelOpen = !_ampTgPanelOpen;
+    const body   = document.getElementById('amp-tg-panel-body');
+    const toggle = document.getElementById('amp-tg-panel-toggle');
+    if (body)   body.style.display = _ampTgPanelOpen ? 'block' : 'none';
+    if (toggle) toggle.textContent = _ampTgPanelOpen ? '▲ 收合' : '▼ 展開';
+}
+
+async function loadAmplitudeTgTargets() {
+    try {
+        const res  = await fetch('/api/tg/targets');
+        const data = await res.json();
+        const amp  = (data.targets || []).filter(t => t.target_type === 'amplitude' || t.target_type === 'all');
+        renderAmplitudeTgTargets(amp);
+    } catch(e) { console.error('震幅 TG targets 讀取失敗', e); }
+}
+
+function renderAmplitudeTgTargets(targets) {
+    const list = document.getElementById('amp-tg-targets-list');
+    if (!list) return;
+    if (!targets || targets.length === 0) {
+        list.innerHTML = `<div style="color:#555; font-size:0.75rem; padding:6px 0;">尚未新增任何震幅接收者</div>`;
+        return;
+    }
+    const typeLabel = { amplitude: '震幅統計', all: '全部' };
+    const typeColor = { amplitude: '#4facfe', all: '#26de81' };
+    list.innerHTML = targets.map(t => {
+        const enabledColor = t.enabled ? '#26de81' : '#555';
+        const enabledLabel = t.enabled ? '啟用中' : '已停用';
+        const tt    = t.target_type || 'amplitude';
+        const tLbl  = typeLabel[tt] || tt;
+        const tClr  = typeColor[tt] || '#4facfe';
+        const safeName   = (t.name   || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const safeChatId = (t.chat_id || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        return `<div style="display:flex;align-items:center;gap:8px;background:rgba(79,172,254,0.04);border:1px solid rgba(79,172,254,${t.enabled ? '0.2' : '0.08'});border-radius:6px;padding:6px 10px;flex-wrap:wrap;">
+            <span style="color:#ccc;font-size:0.8rem;min-width:80px;">${t.name || '未命名'}</span>
+            <span style="color:#666;font-size:0.75rem;font-family:monospace;">${t.chat_id}</span>
+            <span style="color:${tClr};font-size:0.7rem;background:rgba(79,172,254,0.1);padding:1px 8px;border-radius:10px;">${tLbl}</span>
+            <span style="color:${enabledColor};font-size:0.7rem;">${enabledLabel}</span>
+            <div style="margin-left:auto;display:flex;gap:5px;">
+                <button onclick="testAmplitudeTgTarget(${t.id})" style="width:auto;background:rgba(255,211,51,0.1);color:#ffd233;border:1px solid rgba(255,211,51,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.72rem;">測試</button>
+                <button onclick="editAmplitudeTgTarget(${t.id},'${safeName}','${safeChatId}')" style="width:auto;background:rgba(255,159,67,0.1);color:#ff9f43;border:1px solid rgba(255,159,67,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.72rem;">編輯</button>
+                <button onclick="toggleAmplitudeTgTargetEnabled(${t.id},${!t.enabled})" style="width:auto;background:rgba(100,100,100,0.1);color:#888;border:1px solid rgba(100,100,100,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.72rem;">${t.enabled ? '停用' : '啟用'}</button>
+                <button onclick="deleteAmplitudeTgTarget(${t.id})" style="width:auto;background:rgba(255,68,68,0.1);color:#ff4444;border:1px solid rgba(255,68,68,0.3);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:0.72rem;">刪除</button>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+async function addAmplitudeTgTarget() {
+    const nameEl   = document.getElementById('amp-tg-new-name');
+    const chatIdEl = document.getElementById('amp-tg-new-chatid');
+    const status   = document.getElementById('amp-tg-add-status');
+    const name   = nameEl?.value.trim() || '';
+    const chatId = chatIdEl?.value.trim() || '';
+    if (!name) {
+        if (status) { status.style.color = '#f55'; status.textContent = '❌ 名稱不可為空'; }
+        return;
+    }
+    if (!chatId) {
+        if (status) { status.style.color = '#f55'; status.textContent = '❌ Telegram Chat ID 不可為空'; }
+        return;
+    }
+    if (status) { status.style.color = '#888'; status.textContent = '新增中...'; }
+    try {
+        const res  = await fetch('/api/tg/targets', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ chat_id: chatId, name, target_type: 'amplitude', enabled: true }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            if (status) { status.style.color = '#f55'; status.textContent = `❌ ${data.detail || '新增失敗'}`; }
+            return;
+        }
+        if (status) { status.style.color = '#26de81'; status.textContent = '✅ 新增成功'; }
+        if (nameEl)   nameEl.value   = '';
+        if (chatIdEl) chatIdEl.value = '';
+        loadAmplitudeTgTargets();
+        setTimeout(() => { if (status) status.textContent = ''; }, 3000);
+    } catch(e) {
+        if (status) { status.style.color = '#f55'; status.textContent = `❌ ${e.message}`; }
+    }
+}
+
+async function editAmplitudeTgTarget(id, currentName, currentChatId) {
+    const newName   = prompt('請輸入新的名稱：', currentName);
+    if (newName === null) return;
+    const newChatId = prompt('請輸入新的 Telegram Chat ID：', currentChatId);
+    if (newChatId === null) return;
+    if (!newChatId.trim()) { alert('Chat ID 不可為空'); return; }
+    try {
+        const res  = await fetch(`/api/tg/targets/${id}`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ name: newName.trim(), chat_id: newChatId.trim() }),
+        });
+        const data = await res.json();
+        if (!res.ok) { alert(`❌ 更新失敗：${data.detail || '未知錯誤'}`); return; }
+        loadAmplitudeTgTargets();
+    } catch(e) { alert(`❌ 更新失敗：${e.message}`); }
+}
+
+async function deleteAmplitudeTgTarget(id) {
+    if (!confirm('確定要刪除這個 Telegram 接收對象嗎？')) return;
+    try {
+        await fetch(`/api/tg/targets/${id}`, { method: 'DELETE' });
+        loadAmplitudeTgTargets();
+    } catch(e) { alert(`❌ 刪除失敗：${e.message}`); }
+}
+
+async function toggleAmplitudeTgTargetEnabled(id, enabled) {
+    try {
+        await fetch(`/api/tg/targets/${id}`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ enabled }),
+        });
+        loadAmplitudeTgTargets();
+    } catch(e) { alert(`❌ 更新失敗：${e.message}`); }
+}
+
+async function testAmplitudeTgTarget(id) {
+    const status = document.getElementById('amp-tg-add-status');
+    if (status) { status.style.color = '#888'; status.textContent = '📨 傳送震幅日報中...'; }
+    try {
+        const res  = await fetch(`/api/amplitude/send_daily_report/${id}`, { method: 'POST' });
+        const data = await res.json();
+        if (res.ok && data.success) {
+            if (status) { status.style.color = '#26de81'; status.textContent = `✅ 已發送（${data.data_date}）`; }
+        } else {
+            if (status) { status.style.color = '#f55'; status.textContent = `❌ ${data.detail || data.message || '傳送失敗'}`; }
+        }
+        setTimeout(() => { if (status) status.textContent = ''; }, 5000);
+    } catch(e) {
+        if (status) { status.style.color = '#f55'; status.textContent = `❌ ${e.message}`; }
     }
 }

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TXF Pro Viewer</title>
-    <link rel="stylesheet" href="style.css?v=trend10">
+    <link rel="stylesheet" href="style.css?v=trend11">
     <!-- TradingView Lightweight Charts v4.1.1 -->
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <script>
@@ -231,6 +231,81 @@
             background: transparent;
             color: #666;
         }
+
+        /* 震幅統計模式：隱藏期貨/股票相關元素 */
+        #app-container.market-amplitude-statistics #contract-selector,
+        #app-container.market-amplitude-statistics .global-controls,
+        #app-container.market-amplitude-statistics .quote-row,
+        #app-container.market-amplitude-statistics .grid-row,
+        #app-container.market-amplitude-statistics #panes-container,
+        #app-container.market-amplitude-statistics #stock-tabs-bar,
+        #app-container.market-amplitude-statistics #stock-container-placeholder {
+            display: none !important;
+        }
+
+        /* 震幅統計表格 */
+        .amp-stats-table {
+            border-collapse: separate;
+            border-spacing: 0;
+            min-width: 100%;
+            font-size: 0.82rem;
+            white-space: nowrap;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft JhengHei', 'PingFang TC', 'Noto Sans TC', sans-serif;
+        }
+        .amp-stats-table th,
+        .amp-stats-table td {
+            border-top: 1px solid #222;
+            border-right: 1px solid #222;
+            border-bottom: 1px solid #222;
+            border-left: none;
+            padding: 5px 10px;
+            text-align: center;
+            min-width: 58px;
+        }
+        /* leftmost column gets its left border */
+        .amp-stats-table tr > :first-child {
+            border-left: 1px solid #222;
+        }
+        .amp-stats-table th {
+            background: #181818;
+            color: #888;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+            z-index: 2;
+        }
+        .amp-stats-label-col {
+            background: #141414 !important;
+            color: #aaa !important;
+            text-align: left !important;
+            width: 140px !important;
+            min-width: 140px !important;
+            max-width: 140px !important;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-weight: 600;
+            position: sticky;
+            left: 0;
+            z-index: 3;
+            /* right shadow acts as the column divider when scrolled */
+            box-shadow: 2px 0 4px rgba(0,0,0,0.6);
+        }
+        th.amp-stats-label-col { z-index: 4; }
+        .amp-col-today {
+            border-left: 2px solid #4facfe !important;
+            border-right: 2px solid #4facfe !important;
+            font-weight: bold;
+        }
+        .amp-row-total td { background: rgba(255,200,0,0.10) !important; color: #ffd700 !important; font-weight: bold; }
+        .amp-row-avg   td { background: rgba(255,150,0,0.08) !important; color: #ff9f43 !important; }
+        .amp-status-super-large { background: rgba(192,57,43,0.55) !important; color: #ff6b6b !important; font-weight: bold; }
+        .amp-status-large       { background: rgba(169,50,38,0.30) !important; color: #ffaaaa !important; }
+        .amp-status-small       { background: #151515 !important; color: #777 !important; }
+        .amp-status-compressed  { background: rgba(26,42,74,0.55) !important; color: #7fb3d3 !important; }
+        .amp-status-normal      { background: #181818 !important; color: #ccc; }
+        .amp-status-empty       { background: #111 !important; color: #333 !important; }
+        .amp-row-avg-cell       { background: rgba(255,150,0,0.08) !important; color: #ff9f43 !important; }
     </style>
 </head>
 <body class="dark-theme">
@@ -296,6 +371,7 @@
                         <option value="stocks">📊 股票</option>
                         <option value="futures">📈 期貨</option>
                         <option value="freelancer">🧑‍💻 自由人</option>
+                        <option value="amplitude-statistics">📈 震幅統計</option>
                     </select>
                     <select id="contract-selector" style="background: #222; color: #fff; border: 1px solid #4facfe; font-size: 1.1rem; font-weight: bold; padding: 5px 12px; border-radius: 6px; cursor: pointer; outline: none; transition: all 0.3s;">
                         <option value="TXFR1">台指近月全 (TXF)</option>
@@ -1177,8 +1253,13 @@
                             <div style="background:rgba(255,255,255,0.02);border:1px dashed rgba(41,182,246,0.3);border-radius:6px;padding:10px 12px;">
                                 <div style="color:#888;font-size:0.7rem;margin-bottom:6px;">新增 Telegram 目標</div>
                                 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-                                    <input id="integrated-tg-new-name" type="text" placeholder="名稱（如：Jerry）" style="flex:0 0 130px;background:#1a1a2e;border:1px solid #333;color:#fff;padding:5px 8px;border-radius:4px;font-size:0.78rem;outline:none;">
-                                    <input id="integrated-tg-new-chatid" type="text" placeholder="Telegram Chat ID" style="flex:1;min-width:160px;background:#1a1a2e;border:1px solid #333;color:#fff;padding:5px 8px;border-radius:4px;font-size:0.78rem;outline:none;">
+                                    <input id="integrated-tg-new-name" type="text" placeholder="名稱（如：Jerry）" style="flex:0 0 120px;background:#1a1a2e;border:1px solid #333;color:#fff;padding:5px 8px;border-radius:4px;font-size:0.78rem;outline:none;">
+                                    <input id="integrated-tg-new-chatid" type="text" placeholder="Telegram Chat ID" style="flex:1;min-width:140px;background:#1a1a2e;border:1px solid #333;color:#fff;padding:5px 8px;border-radius:4px;font-size:0.78rem;outline:none;">
+                                    <select id="integrated-tg-new-type" style="background:#1a1a2e;border:1px solid #333;color:#aaa;padding:5px 8px;border-radius:4px;font-size:0.78rem;outline:none;cursor:pointer;">
+                                        <option value="stock">股票</option>
+                                        <option value="amplitude">震幅統計</option>
+                                        <option value="all">全部</option>
+                                    </select>
                                     <button onclick="addIntegratedTgTarget()" style="width:auto;background:rgba(38,222,129,0.15);color:#26de81;border:1px solid rgba(38,222,129,0.4);padding:5px 14px;border-radius:4px;cursor:pointer;font-size:0.78rem;white-space:nowrap;">＋ 新增</button>
                                 </div>
                                 <div id="integrated-tg-add-status" style="font-size:0.7rem;color:#666;margin-top:6px;"></div>
@@ -1588,6 +1669,72 @@
         </div><!-- /#fl-right-panel -->
 
         </div><!-- /#freelancer-container -->
+
+        <!-- 震幅統計分頁 (預設隱藏) -->
+        <div id="amplitude-statistics-container" style="display:none; flex:1; flex-direction:column; background:#0a0a0a; overflow:hidden; padding:12px; min-height:0; color:#fff; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft JhengHei', 'PingFang TC', 'Noto Sans TC', sans-serif;">
+
+            <!-- 判讀說明區塊 (可收合) -->
+            <div id="amp-stats-help-panel" style="margin-bottom:10px; border-radius:8px; border:1px solid #1a3a5c; background:#0d1f2d; overflow:hidden; flex-shrink:0;">
+                <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 14px; cursor:pointer; user-select:none;" onclick="toggleAmpStatsHelp()">
+                    <span style="color:#4facfe; font-weight:bold; font-size:0.9rem;">📖 震幅判讀說明</span>
+                    <span id="amp-stats-help-toggle" style="color:#4facfe; font-size:0.8rem;">▲ 收合</span>
+                </div>
+                <div id="amp-stats-help-body" style="padding:6px 14px 10px; font-size:0.82rem; line-height:2; color:#ccc; display:flex; gap:24px; flex-wrap:wrap; border-top:1px solid #1a3a5c;">
+                    <span><strong style="color:#ff6b6b;">超級大波動</strong>：接近或超過20天最大值 (≥95%)</span>
+                    <span><strong style="color:#ffaaaa;">大波動</strong>：大於20天平均值</span>
+                    <span><strong style="color:#777;">小波動</strong>：小於20天平均值</span>
+                    <span><strong style="color:#7fb3d3;">壓縮</strong>：接近或低於20天最小值 (≤105%)</span>
+                </div>
+            </div>
+
+            <!-- 標題列 -->
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-shrink:0;">
+                <div style="display:flex; align-items:center; gap:12px;">
+                    <h2 style="color:#4facfe; font-size:1rem; margin:0; font-weight:bold;">📊 台指期三時段震幅統計</h2>
+                    <div style="display:flex; align-items:center; gap:4px; font-size:0.75rem;">
+                        <span style="color:#666;">日期歸屬：</span>
+                        <button id="amp-mode-btn-trading"  onclick="setAmpDateMode('trading_date')"  style="background:#0d1f2d; border:1px solid #334;   color:#4facfe; font-size:0.72rem; padding:2px 8px; border-radius:4px; cursor:pointer;">交易日</button>
+                        <button id="amp-mode-btn-calendar" onclick="setAmpDateMode('calendar_date')" style="background:#1a4a7a; border:1px solid #2a5a8a; color:#4facfe; font-size:0.72rem; padding:2px 8px; border-radius:4px; cursor:pointer;">日曆日</button>
+                    </div>
+                </div>
+                <div style="color:#555; font-size:0.78rem; display:flex; align-items:center; gap:8px;">
+                    <span style="color:#444; font-size:0.68rem;">資料來源：永豐 Shioaji TXFR1 / 近月合約 1分K</span>
+                    <span>更新：<span id="amp-stats-updated-at">-</span></span>
+                    <button onclick="loadAmplitudeStatistics()" style="background:#1a2a3a; border:1px solid #334; color:#4facfe; font-size:0.72rem; padding:2px 8px; border-radius:4px; cursor:pointer;">🔄</button>
+                    <button id="amp-send-tg-btn" onclick="sendAmplitudeDailyReport()" style="background:rgba(79,172,254,0.12); border:1px solid rgba(79,172,254,0.4); color:#4facfe; font-size:0.72rem; padding:2px 10px; border-radius:4px; cursor:pointer; white-space:nowrap;">📤 發送昨日震幅狀態</button>
+                    <span id="amp-send-tg-status" style="font-size:0.68rem; color:#666;"></span>
+                </div>
+            </div>
+
+            <!-- 表格容器 (橫向滾動) -->
+            <div id="amp-stats-table-container" style="flex:1; overflow:auto; min-height:0; border-radius:6px;">
+                <div id="amp-stats-table-inner" style="color:#555; padding:30px; text-align:center; font-size:0.9rem;">載入中...</div>
+            </div>
+
+            <!-- 震幅 TG 接收者管理 -->
+            <div id="amp-tg-panel" style="margin-top:10px; border-radius:8px; border:1px solid #1a3a5c; background:#0d1f2d; overflow:hidden; flex-shrink:0;">
+                <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 14px; cursor:pointer; user-select:none;" onclick="toggleAmpTgPanel()">
+                    <span style="color:#4facfe; font-weight:bold; font-size:0.9rem;">📨 震幅 TG 接收者管理</span>
+                    <span id="amp-tg-panel-toggle" style="color:#4facfe; font-size:0.8rem;">▲ 收合</span>
+                </div>
+                <div id="amp-tg-panel-body" style="padding:10px 14px 14px; border-top:1px solid #1a3a5c;">
+                    <div style="color:#888; font-size:0.75rem; margin-bottom:10px;">此處只管理震幅統計日報接收者，不影響股票推送對象。</div>
+
+                    <!-- 新增表單 -->
+                    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; background:rgba(255,255,255,0.02); padding:8px 10px; border-radius:6px; border:1px dashed #333; margin-bottom:10px;">
+                        <input id="amp-tg-new-name" type="text" placeholder="名稱（如：Jerry 震幅）" style="flex:0 0 150px; background:#1a1a2e; border:1px solid #333; color:#fff; padding:5px 8px; border-radius:4px; font-size:0.78rem; outline:none;">
+                        <input id="amp-tg-new-chatid" type="text" placeholder="Telegram Chat ID（如：123456789 或 -100...）" style="flex:1; min-width:200px; background:#1a1a2e; border:1px solid #333; color:#fff; padding:5px 8px; border-radius:4px; font-size:0.78rem; outline:none;">
+                        <span style="color:#4facfe; font-size:0.72rem; white-space:nowrap; background:rgba(79,172,254,0.08); border:1px solid rgba(79,172,254,0.2); padding:2px 8px; border-radius:4px;">推送類型：震幅統計</span>
+                        <button onclick="addAmplitudeTgTarget()" style="width:auto; background:rgba(79,172,254,0.15); color:#4facfe; border:1px solid rgba(79,172,254,0.4); padding:5px 14px; border-radius:4px; cursor:pointer; font-size:0.78rem; white-space:nowrap;">＋ 新增震幅接收者</button>
+                        <div id="amp-tg-add-status" style="font-size:0.72rem; color:#888; width:100%;"></div>
+                    </div>
+
+                    <!-- 接收者列表 -->
+                    <div style="color:#666; font-size:0.72rem; margin-bottom:6px;">目前接收者（顯示 amplitude / all 類型）：</div>
+                    <div id="amp-tg-targets-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+                </div>
+            </div>
+        </div><!-- /#amplitude-statistics-container -->
     </div><!-- /#app-container -->
 
     <!-- 股票策略詳情 Drawer -->
@@ -1687,6 +1834,6 @@
     <div id="drawer-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998;" onclick="closeStockDrawer()"></div>
 
     <!-- 載入主程式 (加入版本號避免快取問題) -->
-    <script src="app_pro.js?v=market2"></script>
+    <script src="app_pro.js?v=amp-fix2"></script>
 </body>
 </html>

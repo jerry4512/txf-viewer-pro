@@ -1,5 +1,6 @@
 import os
 import json
+import html as _html_mod
 import asyncio
 import sqlite3
 import threading
@@ -1059,6 +1060,297 @@ async def get_txf_amplitude(period: str = "day"):
     }
 
 
+@app.get("/api/amplitude_statistics")
+async def get_amplitude_statistics(days: int = 20, contract: str = "TXFR1", date_mode: str = "trading_date"):
+    """
+    三時段震幅統計：早盤(08:45-13:45) / 午盤(15:00-21:30) / 晚盤(21:30-05:00)
+    回傳最近 N 個完整交易日 + 今日的震幅表格。
+    """
+    import numpy as np
+    import calendar as _cal
+
+    now_tw = datetime.utcnow() + timedelta(hours=8)
+    today = now_tw.date()
+
+    look_back_days = (days + 25) * 3 + 14  # 顯示N天 + 20天rolling歷史 + buffer
+    start_dt = now_tw - timedelta(days=look_back_days)
+    start_ns = int(_cal.timegm(start_dt.timetuple()) * 1e9)
+    end_ns   = int(_cal.timegm(now_tw.timetuple()) * 1e9)
+
+    try:
+        with sqlite3.connect(_KBARS_CACHE_DB, timeout=10) as conn:
+            rows = conn.execute(
+                "SELECT ts, High, Low FROM kbars1m "
+                "WHERE contract_code=? AND ts >= ? AND ts < ? ORDER BY ts",
+                (contract, start_ns, end_ns)
+            ).fetchall()
+            if not rows:
+                rows = conn.execute(
+                    "SELECT ts, High, Low FROM kbars1m "
+                    "WHERE contract_code LIKE 'TXF%' AND ts >= ? AND ts < ? ORDER BY ts",
+                    (start_ns, end_ns)
+                ).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    if not rows:
+        return {"success": False, "error": "no_data", "columns": [], "rows": [], "stats": {}}
+
+    df = pd.DataFrame(rows, columns=['ts', 'High', 'Low'])
+    # Shioaji 時間戳：UTC+8 編碼為 UTC，以 UTC 解析後直接得到台灣時間
+    df_ts = pd.to_datetime(df['ts'], unit='ns', utc=True)
+
+    tw_hour   = df_ts.dt.hour.values
+    tw_minute = df_ts.dt.minute.values
+    tw_date   = df_ts.dt.date.values
+
+    # 從早盤資料中取得已知的有效交易日（排除國定假日等無早盤日）
+    _ktd_set = set()
+    for i in range(len(tw_hour)):
+        t = int(tw_hour[i]) * 60 + int(tw_minute[i])
+        if 8*60+45 <= t < 13*60+45:
+            _ktd_set.add(tw_date[i])
+    _known_trading_days = sorted(_ktd_set)
+
+    def next_trading_day(d):
+        """下一個有效交易日：優先查 DB 中有早盤資料的日期，fallback 跳週末。"""
+        for td in _known_trading_days:
+            if td > d:
+                return td
+        next_d = d + timedelta(days=1)
+        while next_d.weekday() >= 5:
+            next_d += timedelta(days=1)
+        return next_d
+
+    sessions       = []
+    trading_dates  = []
+    for i in range(len(df)):
+        h, m, d = int(tw_hour[i]), int(tw_minute[i]), tw_date[i]
+        t = h * 60 + m
+        if 8*60+45 <= t < 13*60+45:
+            sessions.append('morning');   trading_dates.append(d)
+        elif 15*60 <= t < 21*60+30:
+            if date_mode == 'trading_date':
+                sessions.append('afternoon'); trading_dates.append(next_trading_day(d))
+            else:
+                sessions.append('afternoon'); trading_dates.append(d)
+        elif t >= 21*60+30:
+            if date_mode == 'trading_date':
+                sessions.append('night');     trading_dates.append(next_trading_day(d))
+            else:
+                sessions.append('night');     trading_dates.append(d)
+        elif t < 5*60:
+            if date_mode == 'trading_date':
+                sessions.append('night');     trading_dates.append(next_trading_day(d - timedelta(days=1)))
+            else:
+                sessions.append('night');     trading_dates.append(d - timedelta(days=1))
+        else:
+            sessions.append(None);        trading_dates.append(d)
+
+    df['session']      = sessions
+    df['trading_date'] = trading_dates
+    df = df[df['session'].notna()].copy()
+
+    grp = df.groupby(['trading_date', 'session']).agg(
+        high=('High', 'max'), low=('Low', 'min')
+    ).reset_index()
+    grp['amplitude'] = (grp['high'] - grp['low']).astype(int)
+
+    session_lookup = {
+        (row['trading_date'], row['session']): {
+            'value': int(row['amplitude']),
+            'high':  int(row['high']),
+            'low':   int(row['low']),
+        }
+        for _, row in grp.iterrows()
+    }
+
+    # ── 今日資料補取：DB 若無今日任何時段，從 Shioaji 即時取 ───────────────────
+    if is_logged_in and api and _rt_contract_code:
+        has_today = any((today, s) in session_lookup for s in ('morning', 'afternoon', 'night'))
+        if not has_today:
+            try:
+                base_sym = _rt_contract_code[:3]
+                futures_cat = getattr(api.Contracts.Futures, base_sym, None)
+                rt_obj = (getattr(futures_cat, _rt_contract_code, None)
+                          if futures_cat else None)
+                if rt_obj is None and futures_cat:
+                    try: rt_obj = futures_cat[_rt_contract_code]
+                    except Exception: pass
+                if rt_obj:
+                    today_str = today.isoformat()
+                    loop = asyncio.get_running_loop()
+                    async with _kbars_lock:
+                        today_kbars = await loop.run_in_executor(
+                            None,
+                            lambda: api.kbars(rt_obj, start=today_str, end=today_str, timeout=15000)
+                        )
+                    if today_kbars and today_kbars.ts and len(today_kbars.ts) > 0:
+                        df_t = pd.DataFrame(dict(today_kbars))
+                        dts_t = pd.to_datetime(df_t['ts'], unit='ns', utc=True)
+                        # 累積各時段高低點
+                        sess_acc = {}
+                        for i in range(len(df_t)):
+                            h = int(dts_t.iloc[i].hour)
+                            m = int(dts_t.iloc[i].minute)
+                            t_min = h * 60 + m
+                            bar_d = dts_t.iloc[i].date()
+                            hi = float(df_t['High'].iloc[i])
+                            lo = float(df_t['Low'].iloc[i])
+                            if 8*60+45 <= t_min < 13*60+45:
+                                key = (bar_d, 'morning')
+                            elif 15*60 <= t_min < 21*60+30:
+                                td = next_trading_day(bar_d) if date_mode == 'trading_date' else bar_d
+                                key = (td, 'afternoon')
+                            elif t_min >= 21*60+30:
+                                td = next_trading_day(bar_d) if date_mode == 'trading_date' else bar_d
+                                key = (td, 'night')
+                            elif t_min < 5*60:
+                                prev = bar_d - timedelta(days=1)
+                                td = next_trading_day(prev) if date_mode == 'trading_date' else prev
+                                key = (td, 'night')
+                            else:
+                                continue
+                            if key not in sess_acc:
+                                sess_acc[key] = {'high': hi, 'low': lo}
+                            else:
+                                sess_acc[key]['high'] = max(sess_acc[key]['high'], hi)
+                                sess_acc[key]['low']  = min(sess_acc[key]['low'], lo)
+                        for key, sd in sess_acc.items():
+                            if key not in session_lookup:
+                                session_lookup[key] = {
+                                    'value': int(sd['high'] - sd['low']),
+                                    'high': int(sd['high']),
+                                    'low':  int(sd['low']),
+                                }
+            except Exception as e:
+                print(f"[AmpStats] today fetch fallback failed: {e}")
+
+    # 完整交易日 = 有早盤資料且早於今日（保留所有查到的，供 rolling 計算用）
+    all_complete_days = sorted(
+        d for (d, s) in session_lookup if s == 'morning' and d < today
+    )
+
+    # 顯示視窗：僅最近 days 天
+    display_days = all_complete_days[-days:]
+
+    # ── Per-date rolling 統計（每個日期欄使用「該日期之前」的最近 20 個完整交易日）──
+    # prior 必須從 all_complete_days 取，確保第一個顯示日期也有足夠的歷史基礎
+    all_dates = display_days + [today]
+    date_stats = {}
+    for d in all_dates:
+        prior = [cd for cd in all_complete_days if cd < d][-20:]
+        date_stats[d] = {}
+        for sess in ('morning', 'afternoon', 'night'):
+            amps = [session_lookup[(cd, sess)]['value']
+                    for cd in prior if (cd, sess) in session_lookup]
+            if amps:
+                date_stats[d][sess] = {
+                    'avg20': float(np.mean(amps)),
+                    'max20': float(np.max(amps)),
+                    'min20': float(np.min(amps)),
+                }
+            else:
+                date_stats[d][sess] = {'avg20': None, 'max20': None, 'min20': None}
+
+    # 最新 20 日統計（供 response.stats 摘要使用）
+    stats = date_stats.get(today, {
+        s: {'avg20': None, 'max20': None, 'min20': None}
+        for s in ('morning', 'afternoon', 'night')
+    })
+
+    def _status(value, sess, d):
+        if value is None:
+            return 'empty'
+        st = date_stats.get(d, {}).get(sess, {})
+        avg20, max20, min20 = st.get('avg20'), st.get('max20'), st.get('min20')
+        if avg20 is None:
+            return 'empty'
+        if max20 and value >= max20 * 0.95:
+            return 'super_large'
+        if min20 and value <= min20 * 1.05:
+            return 'compressed'
+        if value > avg20:
+            return 'large'
+        if value < avg20:
+            return 'small'
+        return 'normal'
+
+    _wday = {0: '一', 1: '二', 2: '三', 3: '四', 4: '五', 5: '六', 6: '日'}
+    columns_out = [
+        {
+            'date':     d.isoformat(),
+            'weekday':  _wday[d.weekday()],
+            'label':    f"{d.month}/{d.day}",
+            'is_today': d == today,
+        }
+        for d in all_dates
+    ]
+
+    session_defs = [
+        ('morning',   '08:45~13:45'),
+        ('afternoon', '15:00~21:30'),
+        ('night',     '21:30~05:00'),
+    ]
+    rows_out = []
+    for sess_key, sess_label in session_defs:
+        cells = []
+        for d in all_dates:
+            info = session_lookup.get((d, sess_key))
+            if info is None:
+                cells.append({'date': d.isoformat(), 'value': None,
+                              'status': 'empty', 'high': None, 'low': None})
+            else:
+                cells.append({
+                    'date':   d.isoformat(),
+                    'value':  info['value'],
+                    'status': _status(info['value'], sess_key, d),
+                    'high':   info['high'],
+                    'low':    info['low'],
+                })
+        rows_out.append({'key': sess_key, 'label': sess_label, 'cells': cells})
+
+    # 振幅總和 row
+    total_cells = []
+    for d in all_dates:
+        parts = [session_lookup.get((d, s)) for s in ('morning', 'afternoon', 'night')]
+        avail = [p['value'] for p in parts if p is not None]
+        if avail:
+            total_cells.append({'date': d.isoformat(), 'value': sum(avail),
+                                 'status': 'normal', 'high': None, 'low': None})
+        else:
+            total_cells.append({'date': d.isoformat(), 'value': None,
+                                 'status': 'empty', 'high': None, 'low': None})
+    rows_out.append({'key': 'total', 'label': '振幅總和', 'cells': total_cells})
+
+    # 各時段 rolling 20 日平均 rows（每欄顯示該日期之前的 rolling avg，非固定值）
+    for sess_key, avg_label in [
+        ('morning',   '早盤20日Avg.'),
+        ('afternoon', '午盤20日Avg.'),
+        ('night',     '晚盤20日Avg.'),
+    ]:
+        cells = []
+        for d in all_dates:
+            avg_val = date_stats[d][sess_key].get('avg20')
+            avg_rounded = round(avg_val) if avg_val is not None else None
+            cells.append({'date': d.isoformat(), 'value': avg_rounded,
+                          'status': 'avg', 'high': None, 'low': None})
+        rows_out.append({'key': f'{sess_key}_avg20', 'label': avg_label, 'cells': cells})
+
+    return {
+        'success':    True,
+        'contract':   contract,
+        'days':       len(display_days),
+        'updated_at': now_tw.strftime('%Y-%m-%d %H:%M:%S'),
+        'columns':    columns_out,
+        'rows':       rows_out,
+        'stats': {
+            k: {sk: round(sv) if sv is not None else None for sk, sv in v.items()}
+            for k, v in stats.items()
+        },
+    }
+
+
 @app.get("/api/institutional_rankings")
 async def get_institutional_rankings():
     from fastapi.responses import JSONResponse
@@ -1340,7 +1632,7 @@ async def _generate_ai_insights(stocks: list) -> dict:
         return {}
 
 def _build_tg_message(stocks: list, label: str, total: int = 0, all_stocks: list = None, market_status: dict = None) -> str:
-    """組成 Telegram 訊息文字（含產業摘要、市場狀態與個股建議買法）"""
+    """組成 Telegram 訊息文字（HTML 模式，含產業摘要、市場狀態與個股建議買法）"""
     now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
 
     # ── 計算產業排行：用完整名單（含 ETF）確保產業摘要不受推薦過濾影響 ──
@@ -1369,11 +1661,11 @@ def _build_tg_message(stocks: list, label: str, total: int = 0, all_stocks: list
         ms_emoji   = {'normal_bull': '🟢', 'hot_bull': '🟡', 'overheated_bull': '🔴', 'weak_market': '⚪'}.get(ms_status, '📊')
         m = market_status.get('metrics', {})
         lines.append(
-            f"📊 今日市場狀態：{ms_emoji} *{ms_label}*\n"
+            f"📊 今日市場狀態：{ms_emoji} <b>{_he(ms_label)}</b>\n"
             f"大盤：{m.get('index_close',0):,.0f}  20MA：{m.get('index_ma20',0):,.0f}  60MA：{m.get('index_ma60',0):,.0f}\n"
             f"距20MA：{m.get('bias_ma20_pct',0):+.1f}%  距60MA：{m.get('bias_ma60_pct',0):+.1f}%  "
             f"過熱個股：{m.get('hot_stock_ratio',0):.0f}%\n"
-            f"操作原則：{ms_suggest}\n"
+            f"操作原則：{_he(ms_suggest)}\n"
             f"{'─'*28}"
         )
     lines.append(f"🕐 {now_str}")
@@ -1381,22 +1673,22 @@ def _build_tg_message(stocks: list, label: str, total: int = 0, all_stocks: list
     top3 = ind_rankings[:3]
     if top3:
         medals = ["🥇", "🥈", "🥉"]
-        ind_lines = ["🏭 *今日強勢產業*"]
+        ind_lines = ["🏭 <b>今日強勢產業</b>"]
         for i, ind in enumerate(top3):
             ind_lines.append(
-                f"{medals[i]} {ind['industryName']}　"
+                f"{medals[i]} {_he(ind['industryName'])}　"
                 f"分數 {ind['industryScore']}　"
                 f"候選 {ind['candidateCount']} 檔"
             )
         ind_lines.append('─' * 28)
         lines.append("\n".join(ind_lines))
 
-    lines.append(f"📊 *{label} 交易清單*")
+    lines.append(f"📊 <b>{_he(label)} 交易清單</b>")
 
     # ── 個股區塊 ──
     for s in stocks:
-        code  = s.get("stockCode") or s.get("code", "?")
-        name  = s.get("stockName") or s.get("name", "?")
+        code  = _he(s.get("stockCode") or s.get("code", "?"))
+        name  = _he(s.get("stockName") or s.get("name", "?"))
         price = s.get("closePrice") or s.get("close", 0)
         score = s.get("score") or s.get("priority", 0)
         bias  = s.get("bias20") or s.get("bias", 0)
@@ -1413,12 +1705,12 @@ def _build_tg_message(stocks: list, label: str, total: int = 0, all_stocks: list
         major_features = s.get("majorFeatures") or []
         major_line = ""
         if major_features:
-            tags = "  ".join(f"#{f}" for f in major_features)
+            tags = "  ".join(f"#{_he(f)}" for f in major_features)
             major_line = f"⭐ 主力特徵｜{tags}\n"
 
         # 產業標註行
-        ind_info = ind_lookup.get(code, {})
-        ind_name  = ind_info.get("name", s.get("industry", ""))
+        ind_info  = ind_lookup.get(s.get("stockCode") or s.get("code", ""), {})
+        ind_name  = _he(ind_info.get("name", s.get("industry", "")))
         ind_score = ind_info.get("score", 0)
         resonance = ind_info.get("resonance", False)
         if ind_name:
@@ -1427,11 +1719,11 @@ def _build_tg_message(stocks: list, label: str, total: int = 0, all_stocks: list
         else:
             ind_line = ""
 
-        state      = s.get("strategyState", "")
+        state       = s.get("strategyState", "")
         stock_emoji = "🔵" if state == "觀察中" else "🟢"
         state_tag   = "  〔觀察中〕" if state == "觀察中" else ""
         block = (
-            f"\n{stock_emoji} *#{code} {name}*  ｜ 分數 {score}{state_tag}\n"
+            f"\n{stock_emoji} <b>#{code} {name}</b>  ｜ 分數 {score}{state_tag}\n"
             f"{ind_line}"
             f"💰 收盤 {price:.2f}  ｜ 乖離 {bias_sign}{bias}%  ｜ 20日強度 {r20_sign}{r20}%\n"
             f"👥 法人佔比 {inst:.2f}%  ｜ 停損價 {sl_text}\n"
@@ -1441,33 +1733,39 @@ def _build_tg_message(stocks: list, label: str, total: int = 0, all_stocks: list
         bm = s.get("buy_method") or {}
         if bm:
             bm_allowed = bm.get("allowed", True)
-            bm_label   = bm.get("label", "")
-            bm_entry   = bm.get("entry_condition", "")
-            bm_sl_rule = bm.get("stop_loss_rule", "")
+            bm_label   = _he(bm.get("label", ""))
+            bm_entry   = _he(bm.get("entry_condition", ""))
+            bm_sl_rule = _he(bm.get("stop_loss_rule", ""))
             allow_tag  = "✅" if bm_allowed else "🚫"
             block += (
-                f"\n{allow_tag} *建議買法*：{bm_label}\n"
+                f"\n{allow_tag} <b>建議買法</b>：{bm_label}\n"
                 f"進場條件：{bm_entry}\n"
                 f"停損規則：{bm_sl_rule}\n"
             )
         if plan.get("conservative"):
-            block += f"\n📌 *保守進場*\n{plan['conservative']}\n"
+            block += f"\n📌 <b>保守進場</b>\n{_he(plan['conservative'])}\n"
         if plan.get("aggressive"):
-            block += f"\n🚀 *積極進場*\n{plan['aggressive']}\n"
+            block += f"\n🚀 <b>積極進場</b>\n{_he(plan['aggressive'])}\n"
         if plan.get("avoid"):
-            block += f"\n⚠️ *不進場條件*\n{plan['avoid']}\n"
+            block += f"\n⚠️ <b>不進場條件</b>\n{_he(plan['avoid'])}\n"
         if plan.get("stopLoss"):
-            block += f"\n🛡 *停損條件*\n{plan['stopLoss']}\n"
+            block += f"\n🛡 <b>停損條件</b>\n{_he(plan['stopLoss'])}\n"
         block += f"{'─'*28}"
         lines.append(block)
 
     if total and total > len(stocks):
-        lines.append(f"\n前 *{len(stocks)}* 名 ／ 共 *{total}* 檔候選")
+        lines.append(f"\n前 <b>{len(stocks)}</b> 名 ／ 共 <b>{total}</b> 檔候選")
     else:
-        lines.append(f"\n共 *{len(stocks)}* 檔候選")
+        lines.append(f"\n共 <b>{len(stocks)}</b> 檔候選")
     return "\n".join(lines)
 
 _TG_MAX_LEN = 4000  # Telegram 上限 4096，留緩衝
+
+
+def _he(text) -> str:
+    """Escape HTML entities for Telegram HTML mode (<, >, &)."""
+    return _html_mod.escape(str(text))
+
 
 def _split_tg_message(message: str) -> list[str]:
     """以個股分隔線為邊界切割訊息，確保每段 <= _TG_MAX_LEN"""
@@ -1488,9 +1786,9 @@ def _split_tg_message(message: str) -> list[str]:
         parts.append(current.rstrip(SEPARATOR))
     return parts or [message[:_TG_MAX_LEN]]
 
-def _tg_post(url: str, chat_id: str, text: str) -> tuple[bool, str]:
+def _tg_post(url: str, chat_id: str, text: str, parse_mode: str = "HTML") -> tuple[bool, str]:
     """送出單則訊息，回傳 (success, error_str)"""
-    body = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}).encode("utf-8")
+    body = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": parse_mode}).encode("utf-8")
     req  = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -1549,15 +1847,55 @@ def _init_tg_targets_table():
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS telegram_targets (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id    TEXT NOT NULL UNIQUE,
-                name       TEXT,
-                enabled    INTEGER DEFAULT 1,
-                created_at TEXT,
-                updated_at TEXT
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id     TEXT NOT NULL UNIQUE,
+                name        TEXT,
+                enabled     INTEGER DEFAULT 1,
+                target_type TEXT DEFAULT 'stock',
+                created_at  TEXT,
+                updated_at  TEXT
             )
         """)
         conn.commit()
+        # Migration v1: 既有 DB 若缺少 target_type 欄位則補上
+        try:
+            conn.execute("ALTER TABLE telegram_targets ADD COLUMN target_type TEXT DEFAULT 'stock'")
+            conn.commit()
+        except Exception:
+            pass  # 欄位已存在，忽略
+        # Migration v2: 將 UNIQUE(chat_id) 升級為 UNIQUE(chat_id, target_type)
+        # 讓同一個人可以分別作為 stock 和 amplitude 目標
+        try:
+            indexes = conn.execute("PRAGMA index_list(telegram_targets)").fetchall()
+            has_composite = any(
+                len(conn.execute(f"PRAGMA index_info({dict(idx)['name']})").fetchall()) == 2
+                for idx in indexes
+                if dict(idx).get('unique') == 1
+            )
+            if not has_composite:
+                conn.execute("""
+                    CREATE TABLE _tg_targets_v2 (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id     TEXT NOT NULL,
+                        name        TEXT,
+                        enabled     INTEGER DEFAULT 1,
+                        target_type TEXT DEFAULT 'stock',
+                        created_at  TEXT,
+                        updated_at  TEXT,
+                        UNIQUE(chat_id, target_type)
+                    )
+                """)
+                conn.execute(
+                    "INSERT OR IGNORE INTO _tg_targets_v2 "
+                    "(id, chat_id, name, enabled, target_type, created_at, updated_at) "
+                    "SELECT id, chat_id, name, enabled, target_type, created_at, updated_at FROM telegram_targets"
+                )
+                conn.execute("DROP TABLE telegram_targets")
+                conn.execute("ALTER TABLE _tg_targets_v2 RENAME TO telegram_targets")
+                conn.commit()
+                print("[TG-DB] Migration v2 完成：UNIQUE(chat_id) → UNIQUE(chat_id, target_type)")
+        except Exception as e:
+            print(f"[TG-DB] Migration v2 失敗（忽略）：{e}")
         # 若 DB 為空，從 .env TELEGRAM_RECIPIENTS 種子
         count = conn.execute("SELECT COUNT(*) FROM telegram_targets").fetchone()[0]
         if count == 0:
@@ -1568,7 +1906,7 @@ def _init_tg_targets_table():
                 name = str(r.get("name", "") or cid).strip()
                 if cid:
                     conn.execute(
-                        "INSERT OR IGNORE INTO telegram_targets (chat_id, name, enabled, created_at, updated_at) VALUES (?,?,1,?,?)",
+                        "INSERT OR IGNORE INTO telegram_targets (chat_id, name, enabled, target_type, created_at, updated_at) VALUES (?,?,1,'stock',?,?)",
                         (cid, name, now, now),
                     )
             conn.commit()
@@ -1590,7 +1928,25 @@ def _get_tg_db_targets(enabled_only: bool = False) -> list:
     finally:
         conn.close()
 
-def _send_tg_with_targets(message: str, targets: list) -> dict:
+def get_telegram_targets(target_type: str) -> list:
+    """取得指定推送類型的啟用目標。
+    stock     → target_type IN ('stock', 'all')
+    amplitude → target_type IN ('amplitude', 'all')
+    """
+    conn = _get_tg_db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM telegram_targets WHERE enabled=1 AND target_type IN (?, 'all') ORDER BY id ASC",
+            (target_type,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[TG-DB] get_telegram_targets({target_type}) 失敗：{e}")
+        return []
+    finally:
+        conn.close()
+
+def _send_tg_with_targets(message: str, targets: list, parse_mode: str = "HTML") -> dict:
     """廣播訊息給指定的目標列表（自動分段）"""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     if not token:
@@ -1606,7 +1962,7 @@ def _send_tg_with_targets(message: str, targets: list) -> dict:
             continue
         recipient_ok = True
         for part in parts:
-            success, err = _tg_post(url, chat_id, part)
+            success, err = _tg_post(url, chat_id, part, parse_mode)
             if not success:
                 recipient_ok = False
                 errors.append(f"{t.get('name', '?')}：{err}")
@@ -1726,11 +2082,11 @@ def get_tg_pick_concentrated_industries(tg_picks: list, tg_watch: list) -> list:
     from collections import defaultdict
     counter: dict = defaultdict(lambda: {"pick_count": 0, "watch_count": 0, "stocks": []})
     for s in tg_picks:
-        ind = s.get("industry") or "未分類"
+        ind = _resolve_industry_name(s.get("industry") or "未分類")
         counter[ind]["pick_count"] += 1
         counter[ind]["stocks"].append(f"{s['stock_id']} {s['stock_name']}")
     for s in tg_watch:
-        ind = s.get("industry") or "未分類"
+        ind = _resolve_industry_name(s.get("industry") or "未分類")
         counter[ind]["watch_count"] += 1
         counter[ind]["stocks"].append(f"{s['stock_id']} {s['stock_name']}")
 
@@ -2050,7 +2406,8 @@ def get_resonance_industries(integrated_result: dict) -> list:
     )
     groups: dict = defaultdict(list)
     for s in all_stocks:
-        ind = (s.get("industry") or "").strip() or "其他"
+        ind_raw = (s.get("industry") or "").strip() or "其他"
+        ind = _resolve_industry_name(ind_raw)
         groups[ind].append(s)
 
     rankings = []
@@ -2290,6 +2647,11 @@ def get_market_hot_industries(integrated_result: dict) -> list:
     return results[:5]
 
 
+def _md_escape(text: str) -> str:
+    """Escape HTML special characters for Telegram HTML parse mode."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def format_tg_integrated_message(
     data_date: str,
     market_regime: dict,
@@ -2346,7 +2708,10 @@ def format_tg_integrated_message(
     if mr_close:
         date_label = f"（{mr_date}）" if mr_date else ""
         lines.append(f"大盤收盤：{mr_close:,.2f}{date_label}")
-    lines.append(f"操作原則：A級、距cost20≤3%、停損≤4%、MACD收斂或正柱放大")
+    if mr_status == "strong_bull":
+        lines.append("操作原則：A級、距cost20≤3%、停損≤4%、MACD收斂或正柱放大；強多延伸不追高，優先等回測不破或開盤轉強確認。")
+    else:
+        lines.append("操作原則：A級、距cost20≤3%、停損≤4%、MACD收斂或正柱放大")
     lines.append(SEP)
 
     # 3. 今日盤面強勢族群
@@ -2354,25 +2719,27 @@ def format_tg_integrated_message(
     lines.append("🏭 *今日盤面強勢族群*")
     if hot_industries:
         for ind in hot_industries:
-            rep = "、".join(ind["rep_stocks"][:3]) if ind.get("rep_stocks") else ""
+            rep = "、".join(_md_escape(r) for r in ind["rep_stocks"][:3]) if ind.get("rep_stocks") else ""
             sign = "+" if ind["avg_change_pct"] >= 0 else ""
-            lines.append(f"{ind['rank']}. {ind['industry']}｜漲幅 {sign}{ind['avg_change_pct']:.2f}%｜{ind['status']}")
+            lines.append(f"{_md_escape(ind['industry'])}｜漲幅 {sign}{ind['avg_change_pct']:.2f}%｜{_md_escape(ind['status'])}")
             if rep:
                 lines.append(f"   代表：{rep}")
         if hot_source:
-            lines.append(f"（資料來源：{hot_source}）")
+            lines.append(f"（資料來源：{_md_escape(hot_source)}）")
     else:
         lines.append("盤面強勢族群資料不足")
     print(f"[TG 族群] market_strength_groups_available={bool(hot_industries)}, source={hot_source or '無'}")
 
     # 4. 明日精選集中族群
     concentrated = get_tg_pick_concentrated_industries(tg_picks, tg_watch)
+    lines.append(f"\n📌 *明日精選集中族群*")
     if concentrated:
-        lines.append(f"\n📌 *明日精選集中族群*")
         for c in concentrated:
-            reps = "、".join(c["representative_stocks"][:5])
-            lines.append(f"{c['industry']}｜精選 {c['pick_count']} 檔｜備選 {c['watch_count']} 檔｜代表：{reps}")
+            reps = "、".join(_md_escape(r) for r in c["representative_stocks"][:5])
+            lines.append(f"{_md_escape(c['industry'])}｜精選 {c['pick_count']} 檔｜備選 {c['watch_count']} 檔｜代表：{reps}")
         print(f"[TG 族群] concentrated_industries={'、'.join(c['industry'] for c in concentrated)}")
+    else:
+        lines.append("今日精選股無明顯產業集中")
     lines.append(SEP)
 
     # 5. 法人技術共振產業（分層顯示）
@@ -2381,18 +2748,19 @@ def format_tg_integrated_message(
     neutral_inds = [x for x in resonance_industries if not x.get("is_strong")]
     if strong_inds:
         for ind in strong_inds:
-            top = "、".join(ind["top_stocks"][:2]) if ind.get("top_stocks") else ""
-            lines.append(f"{ind['rank']}. {ind['industry']}｜分數 {ind['score']}｜{ind['status']}｜候選 {ind['candidate_count']} 檔")
+            top = "、".join(_md_escape(t) for t in ind["top_stocks"][:2]) if ind.get("top_stocks") else ""
+            lines.append(f"{ind['rank']}. {_md_escape(ind['industry'])}｜分數 {ind['score']}｜{_md_escape(ind['status'])}｜候選 {ind['candidate_count']} 檔")
             if top:
                 lines.append(f"   代表：{top}")
     else:
         lines.append("今日無明顯強共振產業")
     if neutral_inds:
         for ind in neutral_inds:
-            top = "、".join(ind["top_stocks"][:2]) if ind.get("top_stocks") else ""
-            lines.append(f"中性觀察：{ind['industry']}｜分數 {ind['score']}｜候選 {ind['candidate_count']} 檔")
+            top = "、".join(_md_escape(t) for t in ind["top_stocks"][:2]) if ind.get("top_stocks") else ""
+            lines.append(f"中性觀察：{_md_escape(ind['industry'])}｜分數 {ind['score']}｜候選 {ind['candidate_count']} 檔")
             if top:
                 lines.append(f"   代表：{top}")
+    lines.append("註：法人技術共振產業為產業層級觀察，明日精選仍以個股等級、成本線、停損與MACD條件排序。")
     lines.append(SEP)
 
     # 6. 明日精選
@@ -2400,17 +2768,18 @@ def format_tg_integrated_message(
         lines.append(f"🔥 *明日精選 {len(tg_picks)} 檔*")
         num_emojis = ["1️⃣", "2️⃣", "3️⃣"]
         for i, s in enumerate(tg_picks):
-            industry = s.get("industry") or "未分類"
+            industry = _md_escape(s.get("industry") or "未分類")
             close_p  = s.get("close", 0)
             dist     = s.get("dist_cost20_pct") or 0
             sl_price = s.get("stop_price", 0)
             sl_pct   = s.get("stop_loss_pct") or 0
             rr       = s.get("risk_reward") or 0
-            macd     = s.get("macd_status", "")
-            inst_sum = s.get("institution_5d_status", "")
-            warning  = s.get("tg_warning", "")
+            macd     = _md_escape(s.get("macd_status", ""))
+            inst_sum = _md_escape(s.get("institution_5d_status", ""))
+            warning  = _md_escape(s.get("tg_warning", ""))
+            sname    = _md_escape(s.get("stock_name", ""))
             num      = num_emojis[i] if i < 3 else f"{i+1}."
-            lines.append(f"\n{num} *{s['stock_id']} {s['stock_name']}*｜{industry}")
+            lines.append(f"\n{num} *{s['stock_id']} {sname}*｜{industry}")
             lines.append(f"現價 {close_p}｜距cost20 {'+' if dist>=0 else ''}{dist:.1f}%｜停損 {sl_price}（{sl_pct:.1f}%）")
             lines.append(f"MACD：{macd}｜風報比 {rr:.1f}｜法人：{inst_sum}")
             dist_sign = "+" if dist >= 0 else ""
@@ -2422,7 +2791,12 @@ def format_tg_integrated_message(
                     f"但當日長上影，隔日需確認不再跌破低點。"
                 )
             elif not warning:
-                lines.append(f"建議：資料面乾淨，距cost20 {dist_sign}{dist:.1f}%，停損{sl_pct:.1f}%，MACD{macd}。")
+                if macd == "負柱收斂":
+                    lines.append(f"建議：位置接近cost20，停損距離小，MACD負柱收斂；隔日不追高，等回測不破或轉強確認。")
+                elif macd == "正柱放大":
+                    lines.append(f"建議：站在cost20附近，停損距離仍可控，MACD正柱放大；若開高過大不追，等回測守穩。")
+                else:
+                    lines.append(f"建議：資料面乾淨，距cost20 {dist_sign}{dist:.1f}%，停損{sl_pct:.1f}%，MACD{macd}。")
             else:
                 lines.append(f"建議：位置接近cost20，停損距離合理，MACD{macd}。")
             if warning:
@@ -2435,21 +2809,22 @@ def format_tg_integrated_message(
     if tg_watch:
         lines.append(f"👀 *備選觀察 {len(tg_watch)} 檔*")
         for s in tg_watch:
-            industry     = s.get("industry") or "未分類"
+            industry     = _md_escape(s.get("industry") or "未分類")
             close_p      = s.get("close", 0)
             dist         = s.get("dist_cost20_pct") or 0
             sl_price     = s.get("stop_price", 0)
             sl_pct       = s.get("stop_loss_pct") or 0
             rr           = s.get("risk_reward") or 0
-            macd         = s.get("macd_status", "")
-            downgrade_r  = s.get("downgrade_reason") or s.get("final_reason") or ""
+            macd         = _md_escape(s.get("macd_status", ""))
+            downgrade_r  = _md_escape((s.get("downgrade_reason") or s.get("final_reason") or "")[:80])
+            sname        = _md_escape(s.get("stock_name", ""))
             dist_sign    = "+" if dist >= 0 else ""
-            lines.append(f"\n{s['stock_id']} {s['stock_name']}｜{industry}")
+            lines.append(f"\n{s['stock_id']} {sname}｜{industry}")
             lines.append(f"現價 {close_p}｜距cost20 {dist_sign}{dist:.1f}%｜停損 {sl_price}（{sl_pct:.1f}%）")
             lines.append(f"MACD：{macd}｜風報比 {rr:.1f}")
             if downgrade_r:
-                lines.append(f"原因：{downgrade_r[:80]}")
-    lines.append(SEP)
+                lines.append(f"原因：{downgrade_r}")
+        lines.append(SEP)
     return "\n".join(lines)
 
 
@@ -2508,19 +2883,31 @@ async def api_tg_list_targets():
 @app.post("/api/tg/targets")
 async def api_tg_add_target(payload: dict = {}):
     """新增 Telegram 目標"""
-    chat_id = str(payload.get("chat_id", "")).strip()
-    name    = str(payload.get("name", "")).strip() or chat_id
+    chat_id     = str(payload.get("chat_id", "")).strip()
+    name        = str(payload.get("name", "")).strip() or chat_id
+    target_type = str(payload.get("target_type", "stock")).strip()
+    if target_type not in ("stock", "amplitude", "all"):
+        target_type = "stock"
     if not chat_id:
         raise HTTPException(status_code=400, detail="chat_id 不可為空")
     now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = _get_tg_db_conn()
     try:
+        existing = conn.execute(
+            "SELECT id FROM telegram_targets WHERE chat_id=? AND target_type=?",
+            (chat_id, target_type)
+        ).fetchone()
+        if existing:
+            type_label = {"stock": "股票", "amplitude": "震幅統計", "all": "全部"}.get(target_type, target_type)
+            raise HTTPException(status_code=409, detail=f"此 Chat ID 已以「{type_label}」類型存在，請勿重複新增")
         conn.execute(
-            "INSERT OR IGNORE INTO telegram_targets (chat_id, name, enabled, created_at, updated_at) VALUES (?,?,1,?,?)",
-            (chat_id, name, now, now),
+            "INSERT INTO telegram_targets (chat_id, name, enabled, target_type, created_at, updated_at) VALUES (?,?,1,?,?,?)",
+            (chat_id, name, target_type, now, now),
         )
         conn.commit()
         return {"success": True}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -2528,7 +2915,7 @@ async def api_tg_add_target(payload: dict = {}):
 
 @app.put("/api/tg/targets/{target_id}")
 async def api_tg_update_target(target_id: int, payload: dict = {}):
-    """更新目標啟用狀態或名稱"""
+    """更新目標啟用狀態、名稱、Chat ID 或推送類型"""
     now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = _get_tg_db_conn()
     try:
@@ -2542,10 +2929,66 @@ async def api_tg_update_target(target_id: int, payload: dict = {}):
                 "UPDATE telegram_targets SET name=?, updated_at=? WHERE id=?",
                 (str(payload["name"]), now, target_id),
             )
+        if "chat_id" in payload:
+            cid = str(payload["chat_id"]).strip()
+            if not cid:
+                raise HTTPException(status_code=400, detail="chat_id 不可為空")
+            row = conn.execute("SELECT target_type FROM telegram_targets WHERE id=?", (target_id,)).fetchone()
+            cur_type = dict(row)["target_type"] if row else "stock"
+            dup = conn.execute(
+                "SELECT id FROM telegram_targets WHERE chat_id=? AND target_type=? AND id!=?",
+                (cid, cur_type, target_id)
+            ).fetchone()
+            if dup:
+                raise HTTPException(status_code=409, detail="此 Chat ID 已以相同類型存在")
+            try:
+                conn.execute(
+                    "UPDATE telegram_targets SET chat_id=?, updated_at=? WHERE id=?",
+                    (cid, now, target_id),
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(status_code=409, detail="此 Chat ID 已被其他目標使用")
+        if "target_type" in payload:
+            tt = str(payload["target_type"])
+            if tt not in ("stock", "amplitude", "all"):
+                tt = "stock"
+            conn.execute(
+                "UPDATE telegram_targets SET target_type=?, updated_at=? WHERE id=?",
+                (tt, now, target_id),
+            )
         conn.commit()
         return {"success": True}
     finally:
         conn.close()
+
+@app.post("/api/tg/targets/{target_id}/test")
+async def api_tg_simple_test(target_id: int):
+    """對單一目標發送簡易測試訊息（不需整合選股資料）"""
+    conn = _get_tg_db_conn()
+    try:
+        row = conn.execute("SELECT * FROM telegram_targets WHERE id=?", (target_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="找不到此目標")
+    target = dict(row)
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        raise HTTPException(status_code=400, detail="尚未設定 Bot Token")
+    type_label = {"stock": "股票", "amplitude": "震幅統計", "all": "全部"}.get(
+        target.get("target_type", "stock"), "未知"
+    )
+    msg = (
+        f"✅ <b>Telegram 測試訊息</b>\n"
+        f"名稱：{target.get('name', '未命名')}\n"
+        f"類型：{type_label}\n"
+        f"來源：txf_viewer_pro"
+    )
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    success, err = _tg_post(url, target["chat_id"], msg)
+    if not success:
+        raise HTTPException(status_code=502, detail=f"傳送失敗：{err}")
+    return {"success": True}
 
 @app.delete("/api/tg/targets/{target_id}")
 async def api_tg_delete_target(target_id: int):
@@ -2563,18 +3006,124 @@ async def api_tg_push_status():
     """查詢上次 TG 整合選股推送狀態"""
     return _tg_push_status
 
+async def _build_amplitude_report_msg():
+    """產生震幅日報訊息（calendar_date 模式），回傳 (msg, yesterday_date)"""
+    try:
+        amp_data = await get_amplitude_statistics(days=20, contract="TXFR1", date_mode="calendar_date")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"震幅資料讀取失敗：{e}")
+
+    if not amp_data.get("success") or not amp_data.get("columns"):
+        raise HTTPException(status_code=500, detail="震幅資料不足，無法產生報告")
+
+    columns = amp_data["columns"]
+    rows    = amp_data["rows"]
+
+    yesterday_col = None
+    for col in reversed(columns):
+        if not col.get("is_today"):
+            yesterday_col = col
+            break
+
+    if not yesterday_col:
+        raise HTTPException(status_code=500, detail="找不到昨日完整資料")
+
+    yesterday_date = yesterday_col["date"]
+    weekday_str    = yesterday_col.get("weekday", "")
+
+    status_label = {
+        "super_large": "🔴 超大波動",
+        "large":       "🟠 大波動",
+        "normal":      "⚪ 正常",
+        "small":       "🔵 小波動",
+        "compressed":  "🟢 壓縮",
+        "empty":       "－",
+    }
+
+    def get_cell(row_key, date_str):
+        for row in rows:
+            if row["key"] == row_key:
+                for cell in row["cells"]:
+                    if cell["date"] == date_str:
+                        return cell
+        return None
+
+    def fmt_cell(cell):
+        if not cell or cell.get("value") is None:
+            return "－"
+        v   = cell["value"]
+        lbl = status_label.get(cell.get("status", ""), "")
+        return f"{v}點 {lbl}"
+
+    morning   = get_cell("morning",   yesterday_date)
+    afternoon = get_cell("afternoon", yesterday_date)
+    night     = get_cell("night",     yesterday_date)
+    total     = get_cell("total",     yesterday_date)
+
+    msg = (
+        f"📊 <b>台指期震幅日報</b>\n"
+        f"日期：{yesterday_date}（週{weekday_str}）\n\n"
+        f"🌅 早盤 08:45~13:45\n{fmt_cell(morning)}\n\n"
+        f"🌇 午盤 15:00~21:30\n{fmt_cell(afternoon)}\n\n"
+        f"🌙 晚盤 21:30~05:00\n{fmt_cell(night)}\n\n"
+        f"📐 振幅總和：{fmt_cell(total)}"
+    )
+    return msg, yesterday_date
+
+
+@app.post("/api/amplitude/send_daily_report")
+async def api_amplitude_send_daily_report():
+    """推送震幅統計日報給所有 amplitude 類型目標"""
+    targets = get_telegram_targets('amplitude')
+    if not targets:
+        return {"success": False, "message": "尚未設定震幅統計 Telegram 接收對象，請先到 Telegram 目標管理新增。"}
+
+    msg, yesterday_date = await _build_amplitude_report_msg()
+    result = _send_tg_with_targets(msg, targets)
+    if result["ok"] == 0:
+        raise HTTPException(status_code=502, detail=f"全部傳送失敗：{result['errors']}")
+    return {
+        "success":      True,
+        "data_date":    yesterday_date,
+        "sent":         result["ok"],
+        "failed":       result["fail"],
+        "target_count": len(targets),
+    }
+
+
+@app.post("/api/amplitude/send_daily_report/{target_id}")
+async def api_amplitude_send_report_to_target(target_id: int):
+    """推送震幅統計日報給單一指定目標"""
+    conn = _get_tg_db_conn()
+    try:
+        row = conn.execute("SELECT * FROM telegram_targets WHERE id=?", (target_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="找不到此目標")
+    target = dict(row)
+    token  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        raise HTTPException(status_code=400, detail="尚未設定 Bot Token")
+
+    msg, yesterday_date = await _build_amplitude_report_msg()
+    result = _send_tg_with_targets(msg, [target])
+    if result["ok"] == 0:
+        raise HTTPException(status_code=502, detail=f"傳送失敗：{result['errors']}")
+    return {"success": True, "data_date": yesterday_date}
+
 @app.post("/api/tg/test-send")
 async def api_tg_test_send_integrated():
     """使用目前最新整合選股資料測試 TG 推送（不重新同步）"""
     global _last_integrated_result
     if not _last_integrated_result:
         raise HTTPException(status_code=400, detail="目前沒有整合選股資料，請先執行整合選股。")
-    targets = _get_tg_db_targets(enabled_only=True)
+    targets = get_telegram_targets('stock')
     if not targets:
         env_recipients = _get_tg_recipients()
         targets = [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in env_recipients]
     if not targets:
-        raise HTTPException(status_code=400, detail="尚未設定任何 Telegram 目標，請先新增目標 ID。")
+        raise HTTPException(status_code=400, detail="尚未設定任何股票 Telegram 目標，請先新增目標 ID。")
     data_date_str = _last_integrated_result.get("data_date", datetime.now().strftime("%Y-%m-%d"))
     tg_list       = build_tg_pick_list(_last_integrated_result)
     hot_ind       = get_market_hot_industries(_last_integrated_result)
@@ -2788,8 +3337,9 @@ async def sync_all_stock_screener_data(target_date: str = "") -> dict:
 
 
 def _send_telegram_message(message: str):
-    """廣播訊息給所有收件人（供排程 job 使用）"""
-    result = _send_tg_to_all(message)
+    """廣播訊息給股票推送對象（供排程 job 使用）"""
+    targets = get_telegram_targets('stock') or _get_tg_recipients()
+    result = _send_tg_with_targets(message, targets) if targets else {"ok": 0, "fail": 0, "errors": ["無目標"]}
     if result["ok"] > 0:
         print(f"[Scheduler] Telegram 傳送成功：{result['ok']} 人")
     if result["fail"] > 0:
@@ -2818,7 +3368,7 @@ async def _scheduled_sync_and_alert():
         print(f"[{now_str}] {err_msg}")
         _tg_push_status.update({"last_push_time": now_str, "last_push_status": "sync_failed", "last_error": err_msg})
         err_tg = (f"⚠️ *{date_str} 選股同步失敗*\n原因：{e}\n系統未推送明日精選股，避免使用舊資料。")
-        targets = _get_tg_db_targets(enabled_only=True) or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
+        targets = get_telegram_targets('stock') or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
         if targets:
             _send_tg_with_targets(err_tg, targets)
         return
@@ -2833,7 +3383,7 @@ async def _scheduled_sync_and_alert():
         err_msg = f"整合選股失敗：{e}"
         print(f"[{now_str}] {err_msg}")
         _tg_push_status.update({"last_push_time": now_str, "last_push_status": "strategy_failed", "last_error": err_msg})
-        targets = _get_tg_db_targets(enabled_only=True) or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
+        targets = get_telegram_targets('stock') or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
         if targets:
             _send_tg_with_targets(f"⚠️ *{date_str} 排程篩選失敗*\n錯誤：{e}", targets)
         return
@@ -2864,7 +3414,7 @@ async def _scheduled_sync_and_alert():
             f"原因：{chr(10).join(err_lines)}"
         )
         print(f"[TG 推送阻擋] data_date={data_date}, market_data_date={mkt_date}, reason=market data stale")
-        targets = _get_tg_db_targets(enabled_only=True) or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
+        targets = get_telegram_targets('stock') or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
         if targets:
             _send_tg_with_targets(err_tg, targets)
         _tg_push_status.update({"last_push_time": now_str, "last_push_status": "date_mismatch",
@@ -2886,8 +3436,8 @@ async def _scheduled_sync_and_alert():
     # 4. 組成 TG 訊息
     msg = format_tg_integrated_message(data_date, result.get("market_regime", {}), tg_list, hot_ind, resonance_ind)
 
-    # 5. 讀取目標並傳送
-    targets = _get_tg_db_targets(enabled_only=True)
+    # 5. 讀取目標並傳送（只送股票推送對象）
+    targets = get_telegram_targets('stock')
     if not targets:
         targets = [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
     print(f"[{now_str}] telegram targets={len(targets)}")
