@@ -601,7 +601,7 @@ def compute_macd(close_series):
 
 def run_screener_query(
     max_decline_pct=-3.5,        # Step 3：今日跌幅過濾（%），預設 -3.5%
-    trace_code: str | None = None  # 單股追蹤代號，None 則不輸出 TRACE
+    trace_code = None  # 單股追蹤代號，None 則不輸出 TRACE
 ):
     """
     升級版六步驟選股與交易決策系統：

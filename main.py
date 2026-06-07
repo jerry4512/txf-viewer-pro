@@ -441,6 +441,18 @@ async def login(req: LoginRequest):
         await asyncio.sleep(3)
 
         is_logged_in = True
+
+        # 儲存登入憑證至 .env
+        if req.save_keys:
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+            set_key(env_path, "SHIOAJI_API_KEY", req.api_key)
+            set_key(env_path, "SHIOAJI_SECRET_KEY", req.secret_key)
+            set_key(env_path, "SHIOAJI_PERSON_ID", req.person_id)
+            set_key(env_path, "SHIOAJI_SIMULATION", str(req.is_simulation))
+            set_key(env_path, "SHIOAJI_CA_PATH", req.ca_path or "")
+            set_key(env_path, "SHIOAJI_CA_PASSWD", req.ca_passwd or "")
+            print(f"[{now_str}] [SAVE] 登入憑證已儲存至 .env")
+
         # 登入完成後立刻在背景補快取，不阻塞前端
         asyncio.create_task(_prefetch_kbars_background())
         print(f"[{now_str}] [READY] 系統完全就緒，連線就緒開始看盤！\n")
@@ -1025,7 +1037,7 @@ async def get_txf_amplitude(period: str = "day"):
     amp_small = (amp_avg + amp_min) / 2
 
     # 本日/本週/本月震幅：從快取取當前進行中 session 的高低
-    amp_today: float | None = None
+    amp_today = None  # float | None
     if period == "day":
         # h>=15→次日 架構下，夜盤時段（h>=15）的K棒歸屬「明日」group
         now_hour = now_tw.hour
