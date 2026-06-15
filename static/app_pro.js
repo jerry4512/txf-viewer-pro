@@ -3049,9 +3049,9 @@ if (loginBtn) {
             api_key: document.getElementById('api_key').value,
             secret_key: document.getElementById('secret_key').value,
             person_id: document.getElementById('person_id').value,
-            is_simulation: document.getElementById('is_simulation').checked,
-            ca_path: document.getElementById('ca_path').value,
-            ca_passwd: document.getElementById('ca_passwd').value,
+            is_simulation: false,
+            ca_path: '',
+            ca_passwd: '',
             save_keys: document.getElementById('save_keys').checked
         };
         try {
@@ -3227,9 +3227,6 @@ async function checkStatus() {
                 if (data.env.api_key) document.getElementById('api_key').value = data.env.api_key;
                 if (data.env.secret_key) document.getElementById('secret_key').value = data.env.secret_key;
                 if (data.env.person_id) document.getElementById('person_id').value = data.env.person_id;
-                if (data.env.ca_path) document.getElementById('ca_path').value = data.env.ca_path;
-                if (data.env.ca_passwd) document.getElementById('ca_passwd').value = data.env.ca_passwd;
-                if (data.env.is_simulation !== undefined) document.getElementById('is_simulation').checked = data.env.is_simulation;
             }
         }
     } catch (e) {

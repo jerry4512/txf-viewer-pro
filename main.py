@@ -3475,6 +3475,29 @@ async def _scheduled_sync_and_alert():
         "sent_count":       send_result["ok"],
     })
 
+async def _scheduled_amplitude_morning_report():
+    """每週一至五 08:00 自動發送昨日震幅統計 Telegram 日報"""
+    now_str = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    print(f"[{now_str}] [震幅排程] 開始執行早盤震幅日報")
+
+    targets = get_telegram_targets('amplitude')
+    if not targets:
+        print(f"[{now_str}] [震幅排程] 無震幅 TG 接收者，略過傳送")
+        return
+
+    try:
+        msg, yesterday_date = await _build_amplitude_report_msg()
+    except Exception as e:
+        print(f"[{now_str}] [震幅排程] 震幅資料建立失敗：{e}")
+        return
+
+    result = _send_tg_with_targets(msg, targets)
+    print(
+        f"[{now_str}] [震幅排程] 昨日={yesterday_date}, "
+        f"targets={len(targets)}, sent={result['ok']}, failed={result['fail']}"
+    )
+
+
 @app.get("/api/debug/contracts")
 async def api_debug_contracts():
     """列出 Shioaji 目前可存取的 TXF 合約清單，用於診斷歷史補取問題"""
@@ -3514,6 +3537,12 @@ async def api_scheduler_trigger():
     """手動立即觸發一次排程任務（測試用）"""
     asyncio.create_task(_scheduled_sync_and_alert())
     return {"status": "ok", "message": "排程任務已手動觸發，請稍候並查看 Telegram"}
+
+@app.post("/api/scheduler/trigger_amplitude")
+async def api_scheduler_trigger_amplitude():
+    """手動立即觸發震幅日報（測試用）"""
+    asyncio.create_task(_scheduled_amplitude_morning_report())
+    return {"status": "ok", "message": "震幅日報已手動觸發，請稍候並查看 Telegram"}
 
 @app.post("/api/screener/trace")
 async def api_screener_trace(payload: dict = {}):
@@ -3661,8 +3690,17 @@ async def startup_event():
         misfire_grace_time=3600,
         coalesce=True,
     )
+    scheduler.add_job(
+        _scheduled_amplitude_morning_report,
+        CronTrigger(day_of_week="mon-fri", hour=8, minute=0, timezone="Asia/Taipei"),
+        id="amplitude_morning_report",
+        name="每日08:00震幅統計Telegram日報",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     scheduler.start()
-    print("[Scheduler] 排程已啟動 — 每週一至週五 18:00 自動執行")
+    print("[Scheduler] 排程已啟動 — 每週一至週五 18:00 選股推送 / 08:00 震幅日報")
 
 @app.on_event("shutdown")
 async def shutdown_event():
