@@ -343,7 +343,6 @@ async function checkStatus() {
         if (data.env) {
             document.getElementById('api_key').value = data.env.api_key;
             document.getElementById('secret_key').value = data.env.secret_key;
-            document.getElementById('person_id').value = data.env.person_id;
         }
         if (data.logged_in) startApp(data.contract);
     } catch (e) { console.error(e); }
@@ -357,7 +356,6 @@ if (loginBtn) {
         const req = {
             api_key: document.getElementById('api_key').value,
             secret_key: document.getElementById('secret_key').value,
-            person_id: document.getElementById('person_id').value,
             is_simulation: false,
             ca_path: '',
             ca_passwd: '',

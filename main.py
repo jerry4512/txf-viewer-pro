@@ -111,7 +111,7 @@ manager = ConnectionManager()
 class LoginRequest(BaseModel):
     api_key: str
     secret_key: str
-    person_id: str
+    person_id: str = ""
     is_simulation: bool
     ca_path: str = ""
     ca_passwd: str = ""
