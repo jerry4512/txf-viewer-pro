@@ -461,6 +461,7 @@
             <button id="tab-ranking-btn"    class="stock-tab-btn" style="background: none; border: none; color: #ff9f43; font-weight: bold; font-size: 0.85rem; padding: 5px 15px; cursor: pointer; border-bottom: 2px solid #ff9f43; height: 100%; outline: none; transition: all 0.3s;">📊 法人排行</button>
             <button id="tab-industry-btn"   class="stock-tab-btn" style="background: none; border: none; color: #888; font-weight: bold; font-size: 0.85rem; padding: 5px 15px; cursor: pointer; border-bottom: 2px solid transparent; height: 100%; outline: none; transition: all 0.3s;">🏭 產業排行</button>
             <button id="tab-integrated-btn" class="stock-tab-btn" style="background: none; border: none; color: #888; font-weight: bold; font-size: 0.85rem; padding: 5px 15px; cursor: pointer; border-bottom: 2px solid transparent; height: 100%; outline: none; transition: all 0.3s;">🎯 整合選股</button>
+            <button id="tab-broker-btn" class="stock-tab-btn" style="background: none; border: none; color: #888; font-weight: bold; font-size: 0.85rem; padding: 5px 15px; cursor: pointer; border-bottom: 2px solid transparent; height: 100%; outline: none; transition: all 0.3s;">🏦 關鍵分點</button>
             <!-- 舊頁籤保留供除錯，暫時隱藏 -->
             <button id="tab-screener-btn"  class="stock-tab-btn" style="display:none;">🔍 策略選股</button>
             <button id="tab-tomorrow-btn"  class="stock-tab-btn" style="display:none;">🎯 明日策略選股</button>
@@ -1405,6 +1406,128 @@
                     </div>
 
                 </div><!-- /#stock-integrated-view -->
+                <!-- ============================================================
+                     Key broker analysis
+                     ============================================================ -->
+                <div id="stock-broker-view" style="display:none; flex-direction:column; flex:1; gap:14px; min-height:0; overflow-y:auto; padding-bottom:20px;">
+                    <div class="broker-toolbar">
+                        <div class="broker-search-wrap">
+                            <input id="broker-query-input" type="text" placeholder="輸入股票代號或名稱，例如 2330 / 台積電" autocomplete="off" />
+                            <button id="broker-search-btn" onclick="searchKeyBrokers()">查詢</button>
+                        </div>
+                        <div id="broker-search-hint">可用股票代號或名稱查詢；尚未匯入分點資料時會顯示無資料狀態。</div>
+                    </div>
+
+                    <div id="broker-loading" class="broker-loading" style="display:none;">
+                        <div class="broker-spinner"></div>
+                        <div>查詢關鍵分點中...</div>
+                    </div>
+
+                    <div id="broker-error" class="broker-warning-box" style="display:none;"></div>
+
+                    <div id="broker-result" style="display:none; flex-direction:column; gap:14px;">
+                        <div id="broker-stock-info" class="broker-stock-info"></div>
+                        <div id="broker-summary" class="broker-summary-card"></div>
+
+                        <div class="broker-section" id="broker-moneydj-section">
+                            <div class="broker-section-head">
+                                <div>
+                                    <div class="broker-section-title">MoneyDJ 區間分點資料</div>
+                                    <div class="broker-section-note">此資料為區間彙總，不能判斷逐日轉賣或隔日沖。</div>
+                                </div>
+                                <div class="broker-period-controls">
+                                    <select id="broker-moneydj-period">
+                                        <option value="1D">1D</option>
+                                        <option value="5D" selected>5D</option>
+                                        <option value="10D">10D</option>
+                                        <option value="20D">20D</option>
+                                    </select>
+                                    <button type="button" id="broker-moneydj-fetch-btn" onclick="fetchMoneydjBrokerPeriod()">更新</button>
+                                </div>
+                            </div>
+                            <div id="broker-moneydj-status" class="broker-warning-box muted">尚未抓取 MoneyDJ 區間資料。</div>
+                            <div id="broker-moneydj-chip-summary" class="broker-chip-summary" style="display:none;">
+                                <div class="broker-chip-status">
+                                    <span class="broker-summary-label">區間籌碼狀態</span>
+                                    <span id="broker-moneydj-chip-status" class="broker-status-badge neutral">--</span>
+                                </div>
+                                <div id="broker-moneydj-chip-reason" class="broker-summary-text"></div>
+                            </div>
+                            <div id="broker-moneydj-content" class="broker-grid-two" style="display:none;">
+                                <div>
+                                    <div class="broker-section-title small">買超分點排行</div>
+                                    <div class="broker-table-wrap">
+                                        <table class="broker-table compact">
+                                            <thead>
+                                                <tr><th>#</th><th>券商分點</th><th>買進</th><th>賣出</th><th>買超</th><th>佔成交量</th></tr>
+                                            </thead>
+                                            <tbody id="broker-moneydj-buy-tbody"></tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                                <div>
+                                    <div class="broker-section-title small">賣超分點排行</div>
+                                    <div class="broker-table-wrap">
+                                        <table class="broker-table compact">
+                                            <thead>
+                                                <tr><th>#</th><th>券商分點</th><th>買進</th><th>賣出</th><th>賣超</th><th>佔成交量</th></tr>
+                                            </thead>
+                                            <tbody id="broker-moneydj-sell-tbody"></tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="broker-section">
+                            <div class="broker-section-title">官方每日 CSV 逐日分點分析</div>
+                            <div class="broker-table-wrap">
+                                <table class="broker-table">
+                                    <thead>
+                                        <tr>
+                                            <th>分點</th>
+                                            <th>5D 淨買賣</th>
+                                            <th>10D 淨買賣</th>
+                                            <th>5D 買超天數</th>
+                                            <th>最新動作</th>
+                                            <th>類型</th>
+                                            <th>判斷</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="broker-key-tbody"></tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <div class="broker-grid-two">
+                            <div class="broker-section">
+                                <div class="broker-section-title">近 5 日集中買超</div>
+                                <div class="broker-table-wrap">
+                                    <table class="broker-table compact">
+                                        <thead>
+                                            <tr><th>#</th><th>分點</th><th>5D 淨買超</th><th>占量</th><th>判斷</th></tr>
+                                        </thead>
+                                        <tbody id="broker-top-buy-tbody"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                            <div class="broker-section">
+                                <div class="broker-section-title">近 5 日集中賣超</div>
+                                <div class="broker-table-wrap">
+                                    <table class="broker-table compact">
+                                        <thead>
+                                            <tr><th>#</th><th>分點</th><th>5D 淨賣超</th><th>占量</th><th>判斷</th></tr>
+                                        </thead>
+                                        <tbody id="broker-top-sell-tbody"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="broker-warnings" class="broker-warning-list"></div>
+                        <div id="broker-conclusion" class="broker-conclusion-box"></div>
+                    </div>
+                </div><!-- /#stock-broker-view -->
 
             </div>
         </div>
@@ -1817,3 +1940,4 @@
     <script src="app_pro.js?v=amp-fix2"></script>
 </body>
 </html>
+

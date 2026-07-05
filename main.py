@@ -18,6 +18,9 @@ from apscheduler.triggers.cron import CronTrigger
 import screener            # 引入我們的選股大腦
 import tomorrow_strategy  # 大盤狀態 × 明日策略選股
 import integrated_strategy  # 整合選股（主決策＋籌碼輔助）
+import broker_analysis  # key broker analysis tab
+import broker_fetcher  # official on-demand broker data fetcher
+import moneydj_fetcher  # MoneyDJ Fubon broker period summary fetcher
 from market_status import sync_taiex_daily_kbars, normalize_date, TAIEX_SYMBOL
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
@@ -2664,6 +2667,84 @@ def _md_escape(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+
+
+def _moneydj_tg_period_text(period: str) -> str:
+    p = str(period or "5D").upper().strip()
+    return {
+        "1D": "近1日",
+        "5D": "近5日",
+        "10D": "近10日",
+        "20D": "近20日",
+    }.get(p, p or "近5日")
+
+
+def _moneydj_tg_risk_text(risk: str) -> str:
+    key = str(risk or "").strip()
+    return {
+        "stale_data": "資料日期不一致",
+        "broker_sell_pressure": "分點賣壓 / 多空分歧",
+        "broker_accumulation": "分點偏多",
+        "broker_daytrade": "疑似隔日沖",
+        "broker_distributed": "買盤分散",
+    }.get(key, "無明顯風險")
+
+
+def _moneydj_tg_score_label(broker_bonus) -> str:
+    try:
+        bonus_val = float(broker_bonus or 0)
+    except Exception:
+        bonus_val = 0.0
+
+    if bonus_val > 0:
+        score_text = f"+{int(bonus_val) if bonus_val.is_integer() else bonus_val:g}"
+    elif bonus_val < 0:
+        score_text = f"{int(bonus_val) if bonus_val.is_integer() else bonus_val:g}"
+    else:
+        score_text = "0"
+
+    if bonus_val >= 6:
+        label = "🟢 強多"
+    elif bonus_val >= 2:
+        label = "🟢 偏多"
+    elif -1 <= bonus_val <= 1:
+        label = "⚪ 中性"
+    elif -3 <= bonus_val <= -2:
+        label = "🟠 偏空"
+    else:
+        label = "🔴 賣壓"
+    return f"{label}（{score_text}）"
+
+def _moneydj_tg_reason_text(stock: dict) -> str:
+    if not stock or stock.get("moneydj_date_valid") is not True:
+        return ""
+    key = str(stock.get("broker_risk") or "").strip()
+    if key == "stale_data":
+        return ""
+    reason = {
+        "broker_sell_pressure": "買賣雙方力量接近，偏多空分歧 / 換手",
+        "broker_accumulation": "買盤集中，籌碼偏多",
+        "broker_daytrade": "疑似短線隔日沖，避免追價",
+        "broker_distributed": "買盤分散，主力結構不明",
+    }.get(key, "無明顯分點風險")
+    return reason if len(reason) <= 36 else ""
+
+def _format_moneydj_tg_line(stock: dict) -> list[str]:
+    if not stock or stock.get("moneydj_date_valid") is not True:
+        return []
+    if str(stock.get("broker_risk") or "").strip() == "stale_data":
+        return []
+
+    score_label = _moneydj_tg_score_label(stock.get("broker_bonus"))
+    period_text = _moneydj_tg_period_text(stock.get("moneydj_period_label"))
+    risk_text = _moneydj_tg_risk_text(stock.get("broker_risk"))
+    lines = [f"\u5206\u9ede\u5224\u5b9a\uff1a{score_label}\uff5c{period_text}\uff5c{risk_text}"]
+
+    reason = _moneydj_tg_reason_text(stock)
+    if reason:
+        lines.append(f"\u539f\u56e0\uff1a{_md_escape(reason)}")
+    return lines
+
 def format_tg_integrated_message(
     data_date: str,
     market_regime: dict,
@@ -2794,6 +2875,8 @@ def format_tg_integrated_message(
             lines.append(f"\n{num} *{s['stock_id']} {sname}*｜{industry}")
             lines.append(f"現價 {close_p}｜距cost20 {'+' if dist>=0 else ''}{dist:.1f}%｜停損 {sl_price}（{sl_pct:.1f}%）")
             lines.append(f"MACD：{macd}｜風報比 {rr:.1f}｜法人：{inst_sum}")
+            for moneydj_line in _format_moneydj_tg_line(s):
+                lines.append(moneydj_line)
             dist_sign = "+" if dist >= 0 else ""
             _candle_risk = s.get("candle_risk") or {}
             _is_upper_shadow = _candle_risk.get("is_long_upper_shadow", False)
@@ -2834,6 +2917,8 @@ def format_tg_integrated_message(
             lines.append(f"\n{s['stock_id']} {sname}｜{industry}")
             lines.append(f"現價 {close_p}｜距cost20 {dist_sign}{dist:.1f}%｜停損 {sl_price}（{sl_pct:.1f}%）")
             lines.append(f"MACD：{macd}｜風報比 {rr:.1f}")
+            for moneydj_line in _format_moneydj_tg_line(s):
+                lines.append(moneydj_line)
             if downgrade_r:
                 lines.append(f"原因：{downgrade_r}")
         lines.append(SEP)
@@ -3124,35 +3209,60 @@ async def api_amplitude_send_report_to_target(target_id: int):
         raise HTTPException(status_code=502, detail=f"傳送失敗：{result['errors']}")
     return {"success": True, "data_date": yesterday_date}
 
+def _generate_integrated_tg_message(integrated_result: dict = None, data_date: str = None, is_test_mode: bool = False) -> dict:
+    """Build the integrated-strategy Telegram message through the single shared pipeline."""
+    if integrated_result is None:
+        if data_date:
+            integrated_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+        else:
+            integrated_result = integrated_strategy.run_integrated_strategy()
+
+    data_date_str = integrated_result.get("data_date", data_date or datetime.now().strftime("%Y-%m-%d"))
+    tg_list       = build_tg_pick_list(integrated_result)
+    hot_ind       = get_market_hot_industries(integrated_result)
+    resonance_ind = get_resonance_industries(integrated_result)
+    date_check    = validate_result_data_date(integrated_result)
+    msg = format_tg_integrated_message(
+        data_date_str,
+        integrated_result.get("market_regime", {}),
+        tg_list, hot_ind, resonance_ind,
+        is_test_mode=is_test_mode,
+    )
+    concentrated = get_tg_pick_concentrated_industries(tg_list["tg_picks"], tg_list["tg_watch"])
+    hot_source = hot_ind[0].get("source", "") if hot_ind else ""
+    return {
+        "message": msg,
+        "integrated_result": integrated_result,
+        "data_date": data_date_str,
+        "tg_list": tg_list,
+        "hot_ind": hot_ind,
+        "resonance_ind": resonance_ind,
+        "date_check": date_check,
+        "concentrated": concentrated,
+        "hot_source": hot_source,
+        "is_test_mode": is_test_mode,
+    }
+
 @app.post("/api/tg/test-send")
 async def api_tg_test_send_integrated():
-    """使用目前最新整合選股資料測試 TG 推送（不重新同步）"""
+    """TG test send: rerun integrated strategy and use the shared message builder."""
     global _last_integrated_result
-    if not _last_integrated_result:
-        raise HTTPException(status_code=400, detail="目前沒有整合選股資料，請先執行整合選股。")
     targets = get_telegram_targets('stock')
     if not targets:
         env_recipients = _get_tg_recipients()
         targets = [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in env_recipients]
     if not targets:
-        raise HTTPException(status_code=400, detail="尚未設定任何股票 Telegram 目標，請先新增目標 ID。")
-    data_date_str = _last_integrated_result.get("data_date", datetime.now().strftime("%Y-%m-%d"))
-    tg_list       = build_tg_pick_list(_last_integrated_result)
-    hot_ind       = get_market_hot_industries(_last_integrated_result)
-    resonance_ind = get_resonance_industries(_last_integrated_result)
-    date_check    = validate_result_data_date(_last_integrated_result)
-    is_test_mode  = True  # 手動測試傳送，固定標示為測試模式
-    msg = format_tg_integrated_message(
-        data_date_str,
-        _last_integrated_result.get("market_regime", {}),
-        tg_list, hot_ind, resonance_ind,
-        is_test_mode=is_test_mode,
-    )
-    result = _send_tg_with_targets(msg, targets)
+        raise HTTPException(status_code=400, detail="???????? Telegram ????????? ID?")
+
+    built = _generate_integrated_tg_message(is_test_mode=True)
+    _last_integrated_result = built["integrated_result"]
+    result = _send_tg_with_targets(built["message"], targets)
     if result["ok"] == 0:
-        raise HTTPException(status_code=502, detail=f"全部傳送失敗：{result['errors']}")
-    concentrated = get_tg_pick_concentrated_industries(tg_list["tg_picks"], tg_list["tg_watch"])
-    hot_source = hot_ind[0].get("source", "") if hot_ind else ""
+        raise HTTPException(status_code=502, detail=f"???????{result['errors']}")
+
+    data_date_str = built["data_date"]
+    tg_list = built["tg_list"]
+    date_check = built["date_check"]
     return {
         "status":                "ok",
         "data_date":             data_date_str,
@@ -3164,49 +3274,40 @@ async def api_tg_test_send_integrated():
         "market_regime":         date_check.get("market_regime", ""),
         "market_regime_success": date_check.get("market_regime_success", True),
         "date_valid":            date_check.get("valid", True),
-        "is_test_mode":          is_test_mode,
+        "is_test_mode":          built["is_test_mode"],
         "data_validation":       date_check.get("data_validation", {}),
-        "market_strength_groups_available": bool(hot_ind),
-        "market_strength_groups_source":    hot_source,
+        "market_strength_groups_available": bool(built["hot_ind"]),
+        "market_strength_groups_source":    built["hot_source"],
         "tg_pick_count":         len(tg_list["tg_picks"]),
         "tg_watch_count":        len(tg_list["tg_watch"]),
         "downgraded_count":      tg_list.get("downgrade_count", 0),
         "downgrade_reasons":     tg_list.get("downgraded", []),
-        "concentrated_industries": [c["industry"] for c in concentrated],
+        "concentrated_industries": [c["industry"] for c in built["concentrated"]],
         "sent":                  result["ok"],
         "failed":                result["fail"],
     }
 
 @app.post("/api/tg/test-send/{target_id}")
 async def api_tg_test_send_single(target_id: int):
-    """對單一目標測試 TG 推送"""
+    """Single-target TG test send: only target differs; message flow is shared."""
     global _last_integrated_result
-    if not _last_integrated_result:
-        raise HTTPException(status_code=400, detail="目前沒有整合選股資料，請先執行整合選股。")
     conn = _get_tg_db_conn()
     try:
         row = conn.execute("SELECT * FROM telegram_targets WHERE id=?", (target_id,)).fetchone()
     finally:
         conn.close()
     if not row:
-        raise HTTPException(status_code=404, detail="找不到此目標")
-    data_date_str = _last_integrated_result.get("data_date", datetime.now().strftime("%Y-%m-%d"))
-    tg_list       = build_tg_pick_list(_last_integrated_result)
-    hot_ind       = get_market_hot_industries(_last_integrated_result)
-    resonance_ind = get_resonance_industries(_last_integrated_result)
-    date_check    = validate_result_data_date(_last_integrated_result)
-    is_test_mode  = True  # 單目標測試傳送，固定標示為測試模式
-    msg = format_tg_integrated_message(
-        data_date_str,
-        _last_integrated_result.get("market_regime", {}),
-        tg_list, hot_ind, resonance_ind,
-        is_test_mode=is_test_mode,
-    )
-    result = _send_tg_with_targets(msg, [dict(row)])
+        raise HTTPException(status_code=404, detail="??????")
+
+    built = _generate_integrated_tg_message(is_test_mode=True)
+    _last_integrated_result = built["integrated_result"]
+    result = _send_tg_with_targets(built["message"], [dict(row)])
     if result["ok"] == 0:
-        raise HTTPException(status_code=502, detail=f"傳送失敗：{result['errors']}")
-    concentrated = get_tg_pick_concentrated_industries(tg_list["tg_picks"], tg_list["tg_watch"])
-    hot_source = hot_ind[0].get("source", "") if hot_ind else ""
+        raise HTTPException(status_code=502, detail=f"?????{result['errors']}")
+
+    data_date_str = built["data_date"]
+    tg_list = built["tg_list"]
+    date_check = built["date_check"]
     return {
         "status":                "ok",
         "data_date":             data_date_str,
@@ -3218,18 +3319,16 @@ async def api_tg_test_send_single(target_id: int):
         "market_regime":         date_check.get("market_regime", ""),
         "market_regime_success": date_check.get("market_regime_success", True),
         "date_valid":            date_check.get("valid", True),
-        "is_test_mode":          is_test_mode,
+        "is_test_mode":          built["is_test_mode"],
         "data_validation":       date_check.get("data_validation", {}),
-        "market_strength_groups_available": bool(hot_ind),
-        "market_strength_groups_source":    hot_source,
+        "market_strength_groups_available": bool(built["hot_ind"]),
+        "market_strength_groups_source":    built["hot_source"],
         "tg_pick_count":         len(tg_list["tg_picks"]),
         "tg_watch_count":        len(tg_list["tg_watch"]),
         "downgraded_count":      tg_list.get("downgrade_count", 0),
         "downgrade_reasons":     tg_list.get("downgraded", []),
-        "concentrated_industries": [c["industry"] for c in concentrated],
+        "concentrated_industries": [c["industry"] for c in built["concentrated"]],
     }
-
-# ── 排程：每週一到五 18:00 自動同步 + 篩選 + 傳送 Telegram ─────────────────
 
 scheduler = AsyncIOScheduler(timezone="Asia/Taipei")
 
@@ -3369,12 +3468,19 @@ async def _scheduled_sync_and_alert():
         print(f"[{now_str}] 今日非交易日，略過推送")
         return
 
-    # 1. 同步全部選股數據（法人 + 個股日K + 大盤 TAIEX）
+    # 1. Run the same screener + MoneyDJ pipeline used by the manual sync button.
     try:
-        sync_res = await sync_all_stock_screener_data(date_str)
+        pipeline = await _sync_screener_and_moneydj_pipeline(date_str)
+        sync_res = pipeline["sync_result"]
+        moneydj_sync = pipeline.get("moneydj_sync", {})
+        result = pipeline.get("integrated_result")
         print(f"[{now_str}] sync_all: critical_ok={sync_res['success']}, "
               f"market_latest={sync_res.get('market_data_date', '')}, "
               f"stock_latest={sync_res.get('stock_kbar_date', '')}")
+        print(f"[{now_str}] moneydj_sync: status={moneydj_sync.get('moneydj_sync_status')}, "
+              f"fetched={moneydj_sync.get('moneydj_fetched_count', 0)}, "
+              f"skipped={moneydj_sync.get('moneydj_skipped_count', 0)}, "
+              f"failed={moneydj_sync.get('moneydj_failed_count', 0)}")
     except Exception as e:
         err_msg = f"同步失敗：{e}"
         print(f"[{now_str}] {err_msg}")
@@ -3385,21 +3491,17 @@ async def _scheduled_sync_and_alert():
             _send_tg_with_targets(err_tg, targets)
         return
 
-    # 2. 執行整合選股（明確傳入 data_date，讓 market_regime 驗證日期一致性）
-    try:
-        result = integrated_strategy.run_integrated_strategy(data_date=date_str)
-        _last_integrated_result = result
-        buy_count = len(result.get("buy_candidates", []))
-        print(f"[{now_str}] integrated strategy success, buy_candidates={buy_count}")
-    except Exception as e:
-        err_msg = f"整合選股失敗：{e}"
+    if result is None:
+        err_msg = "整合選股未產生結果"
         print(f"[{now_str}] {err_msg}")
         _tg_push_status.update({"last_push_time": now_str, "last_push_status": "strategy_failed", "last_error": err_msg})
         targets = get_telegram_targets('stock') or [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
         if targets:
-            _send_tg_with_targets(f"⚠️ *{date_str} 排程篩選失敗*\n錯誤：{e}", targets)
+            _send_tg_with_targets(f"⚠️ *{date_str} 排程篩選失敗*\n錯誤：{err_msg}", targets)
         return
 
+    buy_count = len(result.get("buy_candidates", []))
+    print(f"[{now_str}] integrated strategy success, buy_candidates={buy_count}")
     # 2b. 資料日期驗證
     data_date  = result.get("data_date", date_str)
     date_check = validate_result_data_date(result)
@@ -3433,22 +3535,22 @@ async def _scheduled_sync_and_alert():
                                  "last_error": "; ".join(err_lines)})
         return
 
-    # 3. 建立 TG 精選名單與兩個產業區塊
-    tg_list       = build_tg_pick_list(result)
-    hot_ind       = get_market_hot_industries(result)
-    resonance_ind = get_resonance_industries(result)
-    hot_source = hot_ind[0].get("source", "") if hot_ind else ""
+    # 3. Build TG picks/industry blocks and compose the message through the shared builder.
+    built = _generate_integrated_tg_message(integrated_result=result, is_test_mode=False)
+    tg_list = built["tg_list"]
+    hot_ind = built["hot_ind"]
+    hot_source = built["hot_source"]
     print(
         f"[{now_str}] hot_industries={len(hot_ind)}, source={hot_source}, "
-        f"resonance_industries={len(resonance_ind)}"
+        f"resonance_industries={len(built['resonance_ind'])}"
     )
-    print(f"[TG 推送] mode=scheduled, data_date={data_date}, market_data_date={mkt_date}, "
+    print(f"[TG ??] mode=scheduled, data_date={data_date}, market_data_date={mkt_date}, "
           f"tg_blocked=false, tg_picks={len(tg_list['tg_picks'])}, tg_watch={len(tg_list['tg_watch'])}")
 
-    # 4. 組成 TG 訊息
-    msg = format_tg_integrated_message(data_date, result.get("market_regime", {}), tg_list, hot_ind, resonance_ind)
+    # 4. ?? TG ??
+    msg = built["message"]
 
-    # 5. 讀取目標並傳送（只送股票推送對象）
+    # 5. ?????????????????
     targets = get_telegram_targets('stock')
     if not targets:
         targets = [{"chat_id": r["chatId"], "name": r.get("name", "")} for r in _get_tg_recipients()]
@@ -3558,17 +3660,174 @@ async def api_screener_trace(payload: dict = {}):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"追蹤查詢失敗: {str(e)}")
 
+def _sync_moneydj_for_integrated_candidates(data_date: str, max_codes: int = 30, sleep_sec: float = 1.0, initial_result: dict = None) -> dict:
+    """Sync MoneyDJ 5D broker data for the high-value integrated candidate pool."""
+    conn = None
+    summary = {
+        "moneydj_sync_enabled": True,
+        "moneydj_sync_status": "skipped",
+        "moneydj_fetched_count": 0,
+        "moneydj_skipped_count": 0,
+        "moneydj_failed_count": 0,
+        "moneydj_data_date": data_date,
+        "moneydj_candidate_counts": {},
+        "moneydj_candidate_codes_count": 0,
+        "moneydj_valid_before": 0,
+        "moneydj_valid_after": 0,
+        "moneydj_errors": [],
+    }
+    if not data_date:
+        summary["moneydj_sync_status"] = "skipped_no_data_date"
+        summary["moneydj_errors"].append("missing data_date")
+        return summary
+
+    try:
+        if initial_result is None:
+            initial_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+        candidate_buckets = ["buy_candidates", "high_priority_watch", "wait_pullback"]
+        summary["moneydj_candidate_counts"] = {
+            bucket: len(initial_result.get(bucket, []) or []) for bucket in candidate_buckets
+        }
+
+        codes = []
+        for bucket in candidate_buckets:
+            for stock in initial_result.get(bucket, []) or []:
+                code = stock.get("stock_id") or stock.get("symbol") or stock.get("code")
+                if code:
+                    codes.append(str(code))
+        summary["moneydj_candidate_codes_count"] = len(codes)
+
+        for bucket in ("buy_candidates", "high_priority_watch", "wait_pullback", "other_watch", "excluded"):
+            summary["moneydj_valid_before"] += sum(
+                1 for stock in (initial_result.get(bucket, []) or [])
+                if stock.get("moneydj_date_valid") is True
+            )
+
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        sync_summary = moneydj_fetcher.sync_moneydj_periods_for_codes(
+            conn,
+            codes,
+            period_label="5D",
+            max_codes=max_codes,
+            sleep_sec=sleep_sec,
+            skip_existing=True,
+            data_date=data_date,
+        )
+
+        refreshed_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+        for bucket in ("buy_candidates", "high_priority_watch", "wait_pullback", "other_watch", "excluded"):
+            summary["moneydj_valid_after"] += sum(
+                1 for stock in (refreshed_result.get(bucket, []) or [])
+                if stock.get("moneydj_date_valid") is True
+            )
+
+        failed_count = int(sync_summary.get("failed_count") or 0)
+        fetched_count = int(sync_summary.get("fetched_count") or 0)
+        skipped_count = int(sync_summary.get("skipped_count") or 0)
+        summary.update({
+            "moneydj_sync_status": "success" if failed_count == 0 else "partial_failed",
+            "moneydj_fetched_count": fetched_count,
+            "moneydj_skipped_count": skipped_count,
+            "moneydj_failed_count": failed_count,
+            "moneydj_data_date": sync_summary.get("data_date") or data_date,
+            "moneydj_sync_summary": sync_summary,
+            "refreshed_integrated_result": refreshed_result,
+        })
+        if failed_count:
+            summary["moneydj_errors"] = sync_summary.get("failed_items", [])
+        return summary
+    except Exception as exc:
+        print(f"[sync_screener] MoneyDJ candidate sync failed: {exc}")
+        summary["moneydj_sync_status"] = "partial_failed"
+        summary["moneydj_failed_count"] = 1
+        summary["moneydj_errors"].append(str(exc))
+        return summary
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+async def _sync_screener_and_moneydj_pipeline(target_date: str = "") -> dict:
+    """Run core screener sync, candidate MoneyDJ sync, and return the refreshed integrated result."""
+    global _last_integrated_result
+    sync_result = await sync_all_stock_screener_data(target_date)
+    validation = sync_result.get("validation", {})
+    data_date = sync_result.get("data_date", target_date or datetime.now().strftime("%Y-%m-%d"))
+    moneydj_sync = {
+        "moneydj_sync_enabled": True,
+        "moneydj_sync_status": "skipped_data_not_ready",
+        "moneydj_fetched_count": 0,
+        "moneydj_skipped_count": 0,
+        "moneydj_failed_count": 0,
+        "moneydj_data_date": data_date,
+        "moneydj_errors": [],
+    }
+    integrated_result = None
+
+    if not sync_result.get("success"):
+        _last_integrated_result = None
+        return {
+            "sync_result": sync_result,
+            "validation": validation,
+            "integrated_result": integrated_result,
+            "moneydj_sync": moneydj_sync,
+            "data_date": data_date,
+        }
+
+    initial_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+    integrated_result = initial_result
+    _last_integrated_result = initial_result
+
+    try:
+        moneydj_sync = _sync_moneydj_for_integrated_candidates(
+            data_date,
+            max_codes=30,
+            sleep_sec=1.0,
+            initial_result=initial_result,
+        )
+        refreshed = moneydj_sync.pop("refreshed_integrated_result", None)
+        if refreshed is not None:
+            integrated_result = refreshed
+    except Exception as exc:
+        print(f"[sync_pipeline] MoneyDJ candidate sync failed: {exc}")
+        moneydj_sync = {
+            "moneydj_sync_enabled": True,
+            "moneydj_sync_status": "partial_failed",
+            "moneydj_fetched_count": 0,
+            "moneydj_skipped_count": 0,
+            "moneydj_failed_count": 1,
+            "moneydj_data_date": data_date,
+            "moneydj_errors": [str(exc)],
+        }
+
+    _last_integrated_result = integrated_result
+    return {
+        "sync_result": sync_result,
+        "validation": validation,
+        "integrated_result": integrated_result,
+        "moneydj_sync": moneydj_sync,
+        "data_date": data_date,
+    }
+
 @app.post("/api/screener/sync")
 async def api_sync_screener():
-    """觸發背景日 K、三大法人與大盤 TAIEX 數據同步"""
-    global _last_integrated_result
+    """Trigger the shared screener + MoneyDJ candidate sync pipeline."""
     try:
-        result = await sync_all_stock_screener_data()
-        validation = result.get("validation", {})
-        # 同步成功後清除舊的整合選股快取，確保 TG 測試傳送使用最新資料
-        if result["success"]:
-            _last_integrated_result = None
-            print("[同步選股數據] 已清除舊整合選股快取（_last_integrated_result = None）")
+        pipeline = await _sync_screener_and_moneydj_pipeline()
+        result = pipeline["sync_result"]
+        validation = pipeline.get("validation", {})
+        moneydj_sync = pipeline.get("moneydj_sync", {})
+
+        if result.get("success"):
+            print("[sync_screener] shared pipeline refreshed integrated strategy cache")
+        else:
+            print("[sync_screener] data validation not ready; skipped MoneyDJ sync and cleared integrated cache")
+
+        warnings = list(validation.get("warnings", []))
+        if moneydj_sync.get("moneydj_sync_status") in ("partial_failed", "failed"):
+            warnings.append("MoneyDJ candidate sync partially failed; core screener data sync completed")
+
         return {
             "status":                      "success" if result["success"] else "warning",
             "message":                     "選股數據同步完成！" if result["success"] else "同步完成但資料未完全對齊，請確認大盤資料",
@@ -3579,12 +3838,13 @@ async def api_sync_screener():
             "institution_data_date":       validation.get("institution_data_date", ""),
             "critical_ok":                 validation.get("critical_ok", False),
             "market_regime_success":       result["market_result"].get("success", False),
-            "warnings":                    validation.get("warnings", []),
+            "warnings":                    warnings,
             "errors":                      validation.get("errors", []),
             "data_validation":             validation,
             "market_close_source":         result.get("market_close_source", "Yahoo Finance"),
             "effective_data_date_reason":  result.get("effective_data_date_reason", ""),
             "used_twse_fallback":          result.get("used_twse_fallback", False),
+            **moneydj_sync,
         }
     except Exception as e:
         import traceback
@@ -3627,6 +3887,267 @@ def get_effective_screener_data_date() -> dict:
         print(f"[effective_data_date] 計算失敗: {_e}")
     return {"data_date": target_date, "reason": reason}
 
+
+
+def _broker_existing_recent_dates(conn, code: str, recent_dates: list[str]) -> set:
+    if not recent_dates:
+        return set()
+    broker_analysis.ensure_broker_tables(conn)
+    ph = ",".join("?" for _ in recent_dates)
+    rows = conn.execute(
+        f"SELECT DISTINCT date FROM broker_trading_daily WHERE code = ? AND date IN ({ph})",
+        [code, *recent_dates],
+    ).fetchall()
+    return {str(r[0]) for r in rows}
+
+
+
+@app.get("/api/broker/fetch-trace")
+async def api_broker_fetch_trace(code: str, days: int = 10):
+    """Development-only trace for official broker fetch attempts."""
+    conn = None
+    try:
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        broker_analysis.ensure_broker_tables(conn)
+        stock = broker_analysis.resolve_stock_query(conn, code)
+        if not stock:
+            return sanitize_for_json({
+                "status": "error",
+                "code": code,
+                "stock_name": "",
+                "market_type": "unknown",
+                "recent_trading_dates": [],
+                "attempts": [],
+                "final_status": "not_found",
+                "final_message": "找不到股票代號或名稱",
+            })
+        result = broker_fetcher.trace_broker_fetch_for_stock(conn, stock["code"], days=days, write=True)
+        result["status"] = "success"
+        return sanitize_for_json(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return sanitize_for_json({
+            "status": "success",
+            "code": code,
+            "stock_name": "",
+            "market_type": "unknown",
+            "recent_trading_dates": [],
+            "attempts": [],
+            "final_status": "failed",
+            "final_message": "fetch trace failed",
+            "error_message": str(e),
+        })
+    finally:
+        if conn is not None:
+            conn.close()
+
+@app.get("/api/broker/moneydj-trace")
+async def api_broker_moneydj_trace(code: str, period: str = "5D"):
+    """Debug-only MoneyDJ Fubon period broker fetch for one stock."""
+    try:
+        trace = moneydj_fetcher.trace_moneydj_fetch(code, period)
+        return sanitize_for_json({"status": "success", "trace": trace, **trace})
+    except Exception as e:
+        return sanitize_for_json({
+            "status": "failed",
+            "code": code,
+            "period_label": period,
+            "parse_status": "fetch_failed",
+            "error_message": str(e),
+        })
+
+@app.get("/api/broker/moneydj-fetch")
+async def api_broker_moneydj_fetch(code: str, period: str = "5D"):
+    """Fetch and store MoneyDJ Fubon period broker summary for one stock."""
+    conn = None
+    try:
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        result = moneydj_fetcher.fetch_and_store_moneydj_period(conn, code, period)
+        return sanitize_for_json({
+            "status": result.get("status"),
+            "message": result.get("message"),
+            "parsed_rows": result.get("parsed_rows", 0),
+            "inserted_rows": result.get("inserted_rows", 0),
+            "updated_rows": result.get("updated_rows", 0),
+            "trace": result.get("trace", {}),
+        })
+    except Exception as e:
+        return sanitize_for_json({
+            "status": "failed",
+            "message": str(e),
+            "parsed_rows": 0,
+            "inserted_rows": 0,
+            "updated_rows": 0,
+        })
+    finally:
+        if conn is not None:
+            conn.close()
+
+@app.get("/api/broker/period-summary")
+async def api_broker_period_summary(code: str, period: str = "5D"):
+    """Read stored MoneyDJ Fubon period broker summary for one stock."""
+    conn = None
+    try:
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        result = moneydj_fetcher.get_moneydj_period_summary(conn, code, period)
+        return sanitize_for_json(result)
+    except Exception as e:
+        return sanitize_for_json({
+            "status": "failed",
+            "code": code,
+            "period_label": period,
+            "message": str(e),
+            "rows": [],
+            "buy_rows": [],
+            "sell_rows": [],
+        })
+    finally:
+        if conn is not None:
+            conn.close()
+
+@app.get("/api/broker/key-points")
+async def api_broker_key_points(query: str, as_of_date: str = None):
+    """Key broker analysis for one stock code or stock name, with on-demand official fetch."""
+    conn = None
+    fetch_status = "not_needed"
+    fetch_message = "分點資料已存在，未自動抓取"
+    try:
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        broker_analysis.ensure_broker_tables(conn)
+
+        stock = broker_analysis.resolve_stock_query(conn, query)
+        if not stock:
+            result = {"status": "error", "message": "找不到股票代號或名稱", "query": query}
+            return sanitize_for_json(result)
+
+        code = stock["code"]
+        recent_dates = broker_fetcher.get_recent_trading_dates(conn, code, 10)
+        existing_dates = _broker_existing_recent_dates(conn, code, recent_dates)
+        enough_recent_data = bool(recent_dates) and len(existing_dates) >= len(recent_dates)
+
+        if not enough_recent_data:
+            try:
+                fetch_result = broker_fetcher.fetch_broker_data_for_stock(conn, code, days=10)
+                fetch_status = fetch_result.get("status", "failed")
+                fetch_message = fetch_result.get("message", "抓取失敗，請稍後再試或使用 CSV 匯入")
+            except Exception as fetch_err:
+                print(f"[broker_fetcher] fetch failed for {code}: {fetch_err}")
+                fetch_status = "failed"
+                fetch_message = "抓取失敗，請稍後再試或使用 CSV 匯入"
+
+        result = broker_analysis.analyze_key_brokers(conn, code, as_of_date=as_of_date)
+        if result.get("status") == "success":
+            result["fetch_status"] = fetch_status
+            result["fetch_message"] = fetch_message
+        return sanitize_for_json(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return sanitize_for_json({
+            "status": "success",
+            "query": query,
+            "stock": None,
+            "data_date": None,
+            "summary": {
+                "available": False,
+                "broker_status": "無資料",
+                "broker_score_5d": 0,
+                "broker_score_10d": 0,
+                "main_key_brokers": [],
+                "main_warning": "資料抓取失敗或暫無資料",
+                "conclusion": "資料抓取失敗或暫無資料，請稍後再試或使用 CSV 匯入。",
+            },
+            "key_brokers": [],
+            "top_buy_brokers_5d": [],
+            "top_sell_brokers_5d": [],
+            "warnings": [{"type": "fetch_failed", "level": "warning", "message": "資料抓取失敗或暫無資料"}],
+            "available": False,
+            "fetch_status": "failed",
+            "fetch_message": "抓取失敗，請稍後再試或使用 CSV 匯入",
+        })
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@app.post("/api/broker/moneydj-sync-candidates")
+async def api_broker_moneydj_sync_candidates(payload: dict = {}):
+    """Manually sync MoneyDJ 5D broker data for high-value integrated candidates."""
+    global _last_integrated_result
+    conn = None
+    try:
+        payload = payload or {}
+        try:
+            max_codes = int(payload.get("max_codes", 30))
+        except Exception:
+            max_codes = 30
+        max_codes = max(1, min(max_codes, 50))
+        try:
+            sleep_sec = float(payload.get("sleep_sec", 1.0))
+        except Exception:
+            sleep_sec = 1.0
+        sleep_sec = max(0.0, min(sleep_sec, 5.0))
+
+        _eff = get_effective_screener_data_date()
+        data_date = _eff["data_date"]
+        print(f"[api/broker/moneydj-sync-candidates] data_date={data_date}, reason={_eff['reason']}")
+
+        initial_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+        candidate_buckets = ["buy_candidates", "high_priority_watch", "wait_pullback"]
+        candidate_counts = {bucket: len(initial_result.get(bucket, []) or []) for bucket in candidate_buckets}
+
+        codes = []
+        for bucket in candidate_buckets:
+            for stock in initial_result.get(bucket, []) or []:
+                code = stock.get("stock_id") or stock.get("symbol") or stock.get("code")
+                if code:
+                    codes.append(str(code))
+
+        before_valid = 0
+        for bucket in ("buy_candidates", "high_priority_watch", "wait_pullback", "other_watch", "excluded"):
+            before_valid += sum(1 for stock in (initial_result.get(bucket, []) or []) if stock.get("moneydj_date_valid") is True)
+
+        conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        sync_summary = moneydj_fetcher.sync_moneydj_periods_for_codes(
+            conn,
+            codes,
+            period_label="5D",
+            max_codes=max_codes,
+            sleep_sec=sleep_sec,
+            skip_existing=True,
+            data_date=data_date,
+        )
+
+        refreshed_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+        _last_integrated_result = refreshed_result
+        refreshed_summary = refreshed_result.get("summary", {})
+        after_valid = 0
+        for bucket in ("buy_candidates", "high_priority_watch", "wait_pullback", "other_watch", "excluded"):
+            after_valid += sum(1 for stock in (refreshed_result.get(bucket, []) or []) if stock.get("moneydj_date_valid") is True)
+
+        return sanitize_for_json({
+            "ok": True,
+            "data_date": data_date,
+            "sync_summary": sync_summary,
+            "candidate_counts": candidate_counts,
+            "candidate_codes_count": len(codes),
+            "moneydj_valid_before": before_valid,
+            "moneydj_valid_after": after_valid,
+            "refreshed_summary": refreshed_summary,
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"MoneyDJ candidate sync failed: {str(e)}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 @app.get("/api/tomorrow_strategy")
 async def api_tomorrow_strategy():

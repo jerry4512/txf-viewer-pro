@@ -2168,7 +2168,7 @@ async function editIntegratedTgTarget(id, currentName, currentChatId) {
 async function testSingleIntegratedTgTarget(id) {
     _showTgToast('📨 傳送測試訊息中...');
     try {
-        const res  = await fetch(`/api/tg/targets/${id}/test`, { method: 'POST' });
+        const res  = await fetch(`/api/tg/test-send/${id}`, { method: 'POST' });
         const data = await res.json();
         if (res.ok) {
             _showTgToast('✅ 單一目標測試傳送成功！');
@@ -2509,6 +2509,7 @@ async function startApp(contractCode) {
     const tabIndustryBtn   = document.getElementById('tab-industry-btn');
     const tabTomorrowBtn   = document.getElementById('tab-tomorrow-btn');
     const tabIntegratedBtn = document.getElementById('tab-integrated-btn');
+    const tabBrokerBtn     = document.getElementById('tab-broker-btn');
 
     let activeStockTab = 'integrated'; // 預設股票模式時顯示「整合選股」
 
@@ -2518,6 +2519,7 @@ async function startApp(contractCode) {
         const industryView   = document.getElementById('stock-industry-view');
         const tomorrowView   = document.getElementById('stock-tomorrow-view');
         const integratedView = document.getElementById('stock-integrated-view');
+        const brokerView     = document.getElementById('stock-broker-view');
         const freelancerContainer = document.getElementById('freelancer-container');
         const ampStatsContainer   = document.getElementById('amplitude-statistics-container');
         const panesEl             = document.getElementById('panes-container');
@@ -2538,7 +2540,7 @@ async function startApp(contractCode) {
             if (placeholder) placeholder.style.display = 'flex';
 
             // 重設所有 tab 樣式
-            [tabRankingBtn, tabScreenerBtn, tabIndustryBtn, tabTomorrowBtn, tabIntegratedBtn].forEach(b => {
+            [tabRankingBtn, tabScreenerBtn, tabIndustryBtn, tabTomorrowBtn, tabIntegratedBtn, tabBrokerBtn].forEach(b => {
                 if (b) { b.style.color = '#888'; b.style.borderBottomColor = 'transparent'; }
             });
             // 隱藏所有面板
@@ -2547,6 +2549,7 @@ async function startApp(contractCode) {
             if (industryView)   industryView.style.display   = 'none';
             if (tomorrowView)   tomorrowView.style.display   = 'none';
             if (integratedView) integratedView.style.display = 'none';
+            if (brokerView) brokerView.style.display = 'none';
 
             // 啟用目前 tab
             if (activeStockTab === 'ranking') {
@@ -2567,6 +2570,9 @@ async function startApp(contractCode) {
                 loadIntegratedStrategy();
                 _loadIntegratedTgTargets();
                 _loadIntegratedTgPushStatus();
+            } else if (activeStockTab === 'broker') {
+                if (tabBrokerBtn) { tabBrokerBtn.style.color = '#26de81'; tabBrokerBtn.style.borderBottomColor = '#26de81'; }
+                if (brokerView) brokerView.style.display = 'flex';
             } else { // industry
                 if (tabIndustryBtn) { tabIndustryBtn.style.color = '#ff9f43'; tabIndustryBtn.style.borderBottomColor = '#ff9f43'; }
                 if (industryView) industryView.style.display = 'flex';
@@ -2645,6 +2651,8 @@ async function startApp(contractCode) {
     if (tabIndustryBtn)   { tabIndustryBtn.onclick   = () => { activeStockTab = 'industry';   applyMarket('stocks'); }; }
     if (tabTomorrowBtn)   { tabTomorrowBtn.onclick   = () => { activeStockTab = 'tomorrow';   applyMarket('stocks'); }; }
     if (tabIntegratedBtn) { tabIntegratedBtn.onclick = () => { activeStockTab = 'integrated'; applyMarket('stocks'); }; }
+    if (tabBrokerBtn)     { tabBrokerBtn.onclick     = () => { activeStockTab = 'broker';     applyMarket('stocks'); initBrokerTabSearch(); }; }
+    initBrokerTabSearch();
     
     // 0.1 綁定策略過濾調參器與滑桿
     const biasSlider = document.getElementById('screener-bias');
@@ -4010,6 +4018,80 @@ function _resonanceTag(v) {
 }
 
 // ── 整合選股：明日可買 ────────────────────────────────────────────────────────
+
+function _integratedEsc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+}
+function _moneydjPeriodText(period) {
+    const p = String(period || '5D').toUpperCase();
+    return ({'1D':'近1日','5D':'近5日','10D':'近10日','20D':'近20日'})[p] || p;
+}
+function _moneydjRiskText(risk) {
+    const key = String(risk || '').trim();
+    return ({
+        'stale_data': '資料日期不一致',
+        'broker_sell_pressure': '分點賣壓 / 多空分歧',
+        'broker_accumulation': '分點偏多',
+        'broker_daytrade': '疑似隔日沖',
+        'broker_distributed': '買盤分散'
+    })[key] || '無明顯風險';
+}
+
+function _moneydjCommentSummary(text, maxLen = 36) {
+    const raw = String(text || '').trim();
+    if (!raw) return '';
+    return raw.length > maxLen ? `${raw.slice(0, maxLen)}...` : raw;
+}
+
+function _renderMoneydjInfo(s) {
+    const valid = s && s.moneydj_date_valid === true;
+    const commentRaw = String(s?.broker_comment || '').trim();
+    const comment = _integratedEsc(commentRaw);
+    if (!valid) {
+        return `<div style="margin-top:4px; color:#777; font-size:0.68rem; line-height:1.35; white-space:normal; overflow:visible;">MoneyDJ資料未同步或日期不一致，不參與加分</div>`;
+    }
+
+    const bonus = Number(s.broker_bonus || 0);
+    const bonusText = bonus > 0 ? `+${bonus}` : `${bonus}`;
+    const periodText = _moneydjPeriodText(s.moneydj_period_label);
+    const periodDetailText = _integratedEsc(periodText);
+    const endDate = _integratedEsc(s.moneydj_end_date || '--');
+    const riskRaw = String(s.broker_risk || '').trim();
+    const risk = _integratedEsc(_moneydjRiskText(riskRaw));
+    const tags = Array.isArray(s.broker_tags) ? s.broker_tags.filter(Boolean) : [];
+    const tagText = tags.length ? tags.join('、') : '無';
+    const tagsEsc = _integratedEsc(tagText);
+    const summaryText = _integratedEsc(_moneydjCommentSummary(commentRaw));
+    const bonusColor = bonus > 0 ? '#26de81' : (bonus < 0 ? '#ff9f43' : '#888');
+    const bonusBg = bonus > 0 ? 'rgba(38,222,129,0.12)' : (bonus < 0 ? 'rgba(255,159,67,0.12)' : 'rgba(120,120,120,0.10)');
+    const bonusBorder = bonus > 0 ? 'rgba(38,222,129,0.45)' : (bonus < 0 ? 'rgba(255,159,67,0.45)' : 'rgba(120,120,120,0.35)');
+    const bonusLabel = bonus > 0 ? `分點加分 ${bonusText}` : (bonus < 0 ? `分點扣分 ${bonusText}` : `分點 ${bonusText}`);
+    const riskColor = riskRaw === 'stale_data' ? '#777' : (bonus < 0 ? '#ffb86c' : '#888');
+    const riskBg = riskRaw === 'stale_data' ? 'rgba(120,120,120,0.10)' : (bonus < 0 ? 'rgba(255,159,67,0.10)' : 'rgba(120,120,120,0.08)');
+    const riskBorder = riskRaw === 'stale_data' ? 'rgba(120,120,120,0.35)' : (bonus < 0 ? 'rgba(255,159,67,0.38)' : 'rgba(120,120,120,0.28)');
+    const tagHtml = tags.slice(0, 2).map(t => `<span style="display:inline-block; margin-left:4px; padding:1px 5px; border-radius:4px; border:1px solid ${riskBorder}; color:${riskColor}; background:${riskBg}; font-size:0.64rem; white-space:nowrap;">${_integratedEsc(t)}</span>`).join('');
+    const riskTag = riskRaw ? `<span style="display:inline-block; margin-left:4px; padding:1px 5px; border-radius:4px; border:1px solid ${riskBorder}; color:${riskColor}; background:${riskBg}; font-size:0.64rem; white-space:nowrap;">${risk}</span>` : '';
+    const commentSummary = summaryText ? `<div style="margin-top:2px; color:#777; white-space:normal; overflow:visible;">${summaryText}</div>` : '';
+
+    return `<details style="margin-top:4px; font-size:0.68rem; line-height:1.35; color:#777; max-width:280px; white-space:normal; overflow:visible;">
+        <summary style="cursor:pointer; list-style-position:inside; white-space:normal; overflow:visible;">
+            <span style="color:#888;">分點：</span><span style="color:${bonusColor}; font-weight:600;">${bonusText}</span><span style="color:#666;">｜${periodText}｜資料日 ${endDate}</span>
+            <span style="display:inline-block; margin-left:4px; padding:1px 5px; border-radius:4px; border:1px solid ${bonusBorder}; color:${bonusColor}; background:${bonusBg}; font-size:0.64rem; white-space:nowrap;">${bonusLabel}</span>${riskTag}${tagHtml}
+            ${commentSummary}
+            <span style="display:inline-block; margin-top:2px; color:#4facfe; font-size:0.64rem;">展開</span>
+        </summary>
+        <div style="margin-top:5px; padding:6px 7px; border:1px solid rgba(120,120,120,0.18); border-radius:6px; background:rgba(255,255,255,0.03); color:#aaa; white-space:normal; overflow:visible; word-break:break-word; overflow-wrap:anywhere;">
+            <div><span style="color:#777;">分點分數：</span><span style="color:${bonusColor}; font-weight:600;">${bonusText}</span></div>
+            <div><span style="color:#777;">分析區間：</span>${periodDetailText}</div>
+            <div><span style="color:#777;">資料日期：</span>${endDate}</div>
+            <div><span style="color:#777;">分點風險：</span>${risk}</div>
+            <div><span style="color:#777;">分點標籤：</span>${tagsEsc}</div>
+            <div style="margin-top:6px; color:#777;">完整分析：</div>
+            <div style="margin-top:2px; color:#ddd; white-space:normal; overflow:visible; word-break:break-word; overflow-wrap:anywhere;">${comment || 'MoneyDJ分點資料無明確說明。'}</div>
+        </div>
+    </details>`;
+}
+
 function _renderIntegratedBuyTable(candidates) {
     const tbody   = document.getElementById('integrated-buy-tbody');
     const section = document.getElementById('integrated-buy-section');
@@ -4039,7 +4121,7 @@ function _renderIntegratedBuyTable(candidates) {
             <td style="padding:5px 8px; text-align:center; color:#4facfe;">${s.industry_score != null ? s.industry_score.toFixed(0) : '—'}</td>
             <td style="padding:5px 8px; text-align:center;">${_resonanceTag(s.has_industry_resonance)}</td>
             <td style="padding:5px 8px; text-align:right; font-weight:bold; color:${scoreColor};">${s.final_score != null ? s.final_score : '—'}</td>
-            <td style="padding:5px 8px; font-size:0.72rem; color:#aaa; max-width:200px;">${s.action_suggestion || ''}</td>
+            <td style="padding:5px 8px; font-size:0.72rem; color:#aaa; max-width:200px;">${s.action_suggestion || ''}${_renderMoneydjInfo(s)}</td>
         </tr>`;
     }).join('');
     section.style.display = 'block';
@@ -4072,7 +4154,7 @@ function _renderIntegratedHighWatchTable(candidates) {
             <td style="padding:5px 8px; font-size:0.72rem; color:#aaa; max-width:120px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${s.institution_5d_status||''}">${s.institution_5d_status || '—'}</td>
             <td style="padding:5px 8px; font-size:0.72rem; color:#888; max-width:80px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${s.industry_status||''}">${s.industry_status || '—'}</td>
             <td style="padding:5px 8px; text-align:right; color:${scoreColor};">${s.final_score != null ? s.final_score : '—'}</td>
-            <td style="padding:5px 8px; font-size:0.72rem; color:#888; max-width:200px;">${s.entry_condition || s.action_suggestion || ''}</td>
+            <td style="padding:5px 8px; font-size:0.72rem; color:#888; max-width:200px;">${s.entry_condition || s.action_suggestion || ''}${_renderMoneydjInfo(s)}</td>
         </tr>`;
     }).join('');
     section.style.display = 'block';
@@ -4106,7 +4188,7 @@ function _renderIntegratedWaitPullbackTable(candidates) {
             <td style="padding:5px 8px; font-size:0.72rem; color:#888; max-width:80px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${s.industry_status||''}">${s.industry_status || '—'}</td>
             <td style="padding:5px 8px; text-align:center;">${_resonanceTag(s.has_industry_resonance)}</td>
             <td style="padding:5px 8px; text-align:right; color:#888;">${s.final_score != null ? s.final_score : '—'}</td>
-            <td style="padding:5px 8px; font-size:0.72rem; color:#888; max-width:200px;">${s.action_suggestion || ''}</td>
+            <td style="padding:5px 8px; font-size:0.72rem; color:#888; max-width:200px;">${s.action_suggestion || ''}${_renderMoneydjInfo(s)}</td>
         </tr>`;
     }).join('');
     section.style.display = 'block';
@@ -4135,7 +4217,7 @@ function _renderIntegratedOtherWatchTable(candidates) {
         <td style="padding:4px 6px; text-align:center;">${_macdTag(s.macd_status)}</td>
         <td style="padding:4px 6px; font-size:0.70rem; color:#666; max-width:100px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${s.institution_5d_status||''}">${s.institution_5d_status || '—'}</td>
         <td style="padding:4px 6px; text-align:right; color:#666;">${s.final_score != null ? s.final_score : '—'}</td>
-        <td style="padding:4px 6px; font-size:0.70rem; color:#555; max-width:180px;">${s.action_suggestion || ''}</td>
+        <td style="padding:4px 6px; font-size:0.70rem; color:#555; max-width:180px;">${s.action_suggestion || ''}${_renderMoneydjInfo(s)}</td>
     </tr>`).join('');
 }
 
@@ -4165,7 +4247,7 @@ function _renderIntegratedExcludedList(excluded, summary) {
             <td style="padding:3px 6px; text-align:center;">${_macdTag(s.macd_status)}</td>
             <td style="padding:3px 6px; text-align:center; color:#555;">${s.volume_status || '—'}</td>
             <td style="padding:3px 6px; text-align:right; color:#555;">${_fmtRR(s.risk_reward)}</td>
-            <td style="padding:3px 6px; font-size:0.70rem; color:#555; max-width:220px;">${reasons}</td>
+            <td style="padding:3px 6px; font-size:0.70rem; color:#555; max-width:220px;">${reasons}${_renderMoneydjInfo(s)}</td>
         </tr>`;
     }).join('');
 }
@@ -4530,4 +4612,348 @@ async function testAmplitudeTgTarget(id) {
     } catch(e) {
         if (status) { status.style.color = '#f55'; status.textContent = `❌ ${e.message}`; }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Key broker analysis tab
+// -----------------------------------------------------------------------------
+let _brokerCurrentCode = '';
+let _brokerHasMoneydjData = false;
+let _brokerOfficialKeyRows = [];
+
+function _brokerEscape(value) {
+    return String(value ?? '').replace(/[&<>'"]/g, ch => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+    }[ch]));
+}
+
+function _brokerFmtNum(value) {
+    const n = Number(value || 0);
+    return n.toLocaleString();
+}
+
+function _brokerPeriodLabel(days, target, completeLabel, partialLabel) {
+    const safeDays = Math.max(0, Number(days || 0));
+    if (safeDays >= target) return completeLabel;
+    return `${partialLabel}（${safeDays}/${target}D）`;
+}
+
+function _setBrokerHeader(tbodyId, index, text) {
+    const tbody = document.getElementById(tbodyId);
+    const headers = tbody?.closest('table')?.querySelectorAll('thead th');
+    if (headers && headers[index]) headers[index].textContent = text;
+}
+
+function updateBrokerPeriodLabels(data) {
+    const s = data.summary || {};
+    const days5 = Number(s.available_days_5d || 0);
+    const days10 = Number(s.available_days_10d || 0);
+    const suffix5 = days5 >= 5 ? '近 5 日' : `目前 ${days5}/5D`;
+
+    _setBrokerHeader('broker-key-tbody', 1, _brokerPeriodLabel(days5, 5, '5D 淨買賣', '區間淨買賣'));
+    _setBrokerHeader('broker-key-tbody', 2, _brokerPeriodLabel(days10, 10, '10D 淨買賣', '區間淨買賣'));
+    _setBrokerHeader('broker-key-tbody', 3, _brokerPeriodLabel(days5, 5, '5D 買超天數', '買超天數'));
+    _setBrokerHeader('broker-top-buy-tbody', 2, _brokerPeriodLabel(days5, 5, '5D 淨買超', '區間淨買超'));
+    _setBrokerHeader('broker-top-sell-tbody', 2, _brokerPeriodLabel(days5, 5, '5D 淨賣超', '區間淨賣超'));
+
+    const buyTitle = document.getElementById('broker-top-buy-tbody')?.closest('.broker-section')?.querySelector('.broker-section-title');
+    const sellTitle = document.getElementById('broker-top-sell-tbody')?.closest('.broker-section')?.querySelector('.broker-section-title');
+    if (buyTitle) buyTitle.textContent = `${suffix5}集中買超`;
+    if (sellTitle) sellTitle.textContent = `${suffix5}集中賣超`;
+}
+
+function _brokerStatusClass(status) {
+    if (['強勢累積', '偏多', '小幅偏多'].includes(status)) return 'positive';
+    if (['籌碼轉弱', '分點賣壓'].includes(status)) return 'negative';
+    if (status === '無資料') return 'empty';
+    return 'neutral';
+}
+
+function renderBrokerStockInfo(data) {
+    const el = document.getElementById('broker-stock-info');
+    if (!el) return;
+    const stock = data.stock || {};
+    el.innerHTML = `
+        <div class="broker-stock-main">
+            <span class="broker-stock-code">${_brokerEscape(stock.code || '--')}</span>
+            <span class="broker-stock-name">${_brokerEscape(stock.name || '')}</span>
+            <span class="broker-stock-category">${_brokerEscape(stock.category || '未分類')}</span>
+        </div>
+        <div class="broker-stock-date">資料日期：${_brokerEscape(data.data_date || '無分點資料')}</div>
+    `;
+}
+
+function renderBrokerSummary(data) {
+    const el = document.getElementById('broker-summary');
+    if (!el) return;
+    const s = data.summary || {};
+    const status = s.broker_status || '無資料';
+    const availableDays5d = Number(s.available_days_5d || 0);
+    const availableDays10d = Number(s.available_days_10d || 0);
+    const completenessWarning = s.data_completeness_warning || '';
+    el.innerHTML = `
+        <div class="broker-summary-item">
+            <div class="broker-summary-label">資料日期</div>
+            <div class="broker-summary-value">${_brokerEscape(data.data_date || '無資料')}</div>
+        </div>
+        <div class="broker-summary-item">
+            <div class="broker-summary-label">已匯入資料天數</div>
+            <div class="broker-summary-value">${_brokerEscape(availableDays5d)} / 5D、${_brokerEscape(availableDays10d)} / 10D</div>
+        </div>
+        <div class="broker-summary-item">
+            <div class="broker-summary-label">分點狀態</div>
+            <div class="broker-status-badge ${_brokerStatusClass(status)}">${_brokerEscape(status)}</div>
+        </div>
+        <div class="broker-summary-item">
+            <div class="broker-summary-label">5D 分數</div>
+            <div class="broker-summary-value">${_brokerEscape(s.broker_score_5d ?? 0)}</div>
+        </div>
+        <div class="broker-summary-item">
+            <div class="broker-summary-label">10D 分數</div>
+            <div class="broker-summary-value">${_brokerEscape(s.broker_score_10d ?? 0)}</div>
+        </div>
+        <div class="broker-summary-item wide">
+            <div class="broker-summary-label">主要分點</div>
+            <div class="broker-summary-text">${(s.main_key_brokers || []).map(_brokerEscape).join('、') || '尚無'}</div>
+        </div>
+        <div class="broker-summary-item wide">
+            <div class="broker-summary-label">主要警示</div>
+            <div class="broker-summary-text ${s.main_warning ? 'warn' : ''}">${_brokerEscape(s.main_warning || '無明顯警示')}</div>
+        </div>
+        <div class="broker-summary-item wide ${completenessWarning ? 'completeness-warning' : ''}">
+            <div class="broker-summary-label">資料完整度</div>
+            <div class="broker-summary-text ${completenessWarning ? 'warn' : ''}">${_brokerEscape(completenessWarning || '分點資料天數完整')}</div>
+        </div>
+        <div class="broker-summary-item wide">
+            <div class="broker-summary-label">自動抓取</div>
+            <div class="broker-summary-text ${['failed','unsupported','partial'].includes(data.fetch_status) ? 'warn' : ''}">${_brokerEscape(data.fetch_message || '未執行自動抓取')}</div>
+        </div>
+    `;
+}
+
+function _renderBrokerEmpty(tbody, colspan, text) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="${colspan}" class="broker-empty-cell">${_brokerEscape(text)}</td></tr>`;
+}
+
+function renderKeyBrokersTable(rows) {
+    const tbody = document.getElementById('broker-key-tbody');
+    if (!tbody) return;
+    _brokerOfficialKeyRows = rows || [];
+    if (!_brokerOfficialKeyRows.length) {
+        const message = _brokerHasMoneydjData
+            ? '目前可使用 MoneyDJ 區間彙總資料分析多日買賣超結構；尚未匯入官方每日 CSV，因此無法判斷逐日連買、轉賣或隔日沖。'
+            : '目前沒有官方每日 CSV 逐日分點資料；可先使用上方 MoneyDJ 區間分點資料查詢區間買賣超結構。';
+        return _renderBrokerEmpty(tbody, 7, message);
+    }
+    tbody.innerHTML = _brokerOfficialKeyRows.map(r => `
+        <tr>
+            <td>${_brokerEscape(r.display_name)}</td>
+            <td class="num ${Number(r.net_5d || 0) >= 0 ? 'pos' : 'neg'}">${_brokerFmtNum(r.net_5d)}</td>
+            <td class="num ${Number(r.net_10d || 0) >= 0 ? 'pos' : 'neg'}">${_brokerFmtNum(r.net_10d)}</td>
+            <td class="num">${_brokerEscape(r.buy_days_5d ?? 0)}</td>
+            <td>${_brokerEscape(r.latest_action)}</td>
+            <td>${_brokerEscape(r.broker_type)}</td>
+            <td>${_brokerEscape(r.judgement)}</td>
+        </tr>
+    `).join('');
+}
+
+function renderTopBuyBrokersTable(rows) {
+    const tbody = document.getElementById('broker-top-buy-tbody');
+    if (!tbody) return;
+    if (!rows || !rows.length) return _renderBrokerEmpty(tbody, 5, '目前沒有集中買超分點');
+    tbody.innerHTML = rows.map(r => `
+        <tr>
+            <td>${r.rank}</td>
+            <td>${_brokerEscape(r.display_name)}</td>
+            <td class="num pos">${_brokerFmtNum(r.net_5d)}</td>
+            <td class="num">${Number(r.volume_ratio_5d || 0).toFixed(2)}%</td>
+            <td>${_brokerEscape(r.judgement)}</td>
+        </tr>
+    `).join('');
+}
+
+function renderTopSellBrokersTable(rows) {
+    const tbody = document.getElementById('broker-top-sell-tbody');
+    if (!tbody) return;
+    if (!rows || !rows.length) return _renderBrokerEmpty(tbody, 5, '目前沒有集中賣超分點');
+    tbody.innerHTML = rows.map(r => `
+        <tr>
+            <td>${r.rank}</td>
+            <td>${_brokerEscape(r.display_name)}</td>
+            <td class="num neg">${_brokerFmtNum(r.net_5d)}</td>
+            <td class="num">${Number(r.volume_ratio_5d || 0).toFixed(2)}%</td>
+            <td>${_brokerEscape(r.judgement)}</td>
+        </tr>
+    `).join('');
+}
+
+function _renderMoneydjBrokerRows(tbody, rows, side) {
+    if (!tbody) return;
+    const list = (rows || []).slice(0, 10);
+    if (!list.length) {
+        return _renderBrokerEmpty(tbody, 6, '目前沒有 MoneyDJ 區間資料');
+    }
+    tbody.innerHTML = list.map((r, idx) => {
+        const net = Math.abs(Number(r.net_lots || 0));
+        return `
+            <tr>
+                <td>${idx + 1}</td>
+                <td>${_brokerEscape(r.broker_name)}</td>
+                <td class="num">${_brokerFmtNum(r.buy_lots)}</td>
+                <td class="num">${_brokerFmtNum(r.sell_lots)}</td>
+                <td class="num ${side === 'buy' ? 'pos' : 'neg'}">${_brokerFmtNum(net)}</td>
+                <td class="num">${Number(r.volume_ratio || 0).toFixed(2)}%</td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function _brokerMoneydjStatusClass(status) {
+    if (status === '區間買盤集中') return 'positive';
+    if (status === '區間賣壓集中') return 'negative';
+    if (status === '多空分歧 / 換手明顯') return 'empty';
+    return 'neutral';
+}
+
+function renderMoneydjChipSummary(summary) {
+    const wrap = document.getElementById('broker-moneydj-chip-summary');
+    const statusEl = document.getElementById('broker-moneydj-chip-status');
+    const reasonEl = document.getElementById('broker-moneydj-chip-reason');
+    if (!wrap || !statusEl || !reasonEl) return;
+    const status = summary?.period_chip_status || '區間中性';
+    statusEl.className = `broker-status-badge ${_brokerMoneydjStatusClass(status)}`;
+    statusEl.textContent = status;
+    reasonEl.textContent = summary?.period_chip_reason || '';
+    wrap.style.display = 'block';
+}
+
+function resetMoneydjBrokerPeriod(message) {
+    const statusEl = document.getElementById('broker-moneydj-status');
+    const contentEl = document.getElementById('broker-moneydj-content');
+    const chipEl = document.getElementById('broker-moneydj-chip-summary');
+    const buyTbody = document.getElementById('broker-moneydj-buy-tbody');
+    const sellTbody = document.getElementById('broker-moneydj-sell-tbody');
+    _brokerHasMoneydjData = false;
+    if (statusEl) {
+        statusEl.style.display = 'block';
+        statusEl.className = 'broker-warning-box muted';
+        statusEl.textContent = message || '尚未抓取 MoneyDJ 區間資料。';
+    }
+    if (contentEl) contentEl.style.display = 'none';
+    if (chipEl) chipEl.style.display = 'none';
+    if (buyTbody) buyTbody.innerHTML = '';
+    if (sellTbody) sellTbody.innerHTML = '';
+}
+
+async function fetchMoneydjBrokerPeriod() {
+    const code = (_brokerCurrentCode || document.getElementById('broker-query-input')?.value || '').trim();
+    const period = document.getElementById('broker-moneydj-period')?.value || '5D';
+    const statusEl = document.getElementById('broker-moneydj-status');
+    const contentEl = document.getElementById('broker-moneydj-content');
+    const btn = document.getElementById('broker-moneydj-fetch-btn');
+    if (!code) return resetMoneydjBrokerPeriod('請先查詢股票。');
+    if (statusEl) {
+        statusEl.style.display = 'block';
+        statusEl.className = 'broker-warning-box muted';
+        statusEl.textContent = `MoneyDJ ${period} 抓取中...`;
+    }
+    if (btn) btn.disabled = true;
+    try {
+        const res = await fetch(`/api/broker/moneydj-fetch?code=${encodeURIComponent(code)}&period=${encodeURIComponent(period)}`);
+        const data = await res.json();
+        if (!res.ok || data.status !== 'success') {
+            throw new Error(data.message || data.trace?.parse_status || `HTTP ${res.status}`);
+        }
+        const summaryRes = await fetch(`/api/broker/period-summary?code=${encodeURIComponent(code)}&period=${encodeURIComponent(period)}`);
+        const summary = await summaryRes.json();
+        if (!summaryRes.ok || summary.status !== 'success') {
+            throw new Error(summary.message || 'MoneyDJ 區間資料讀取失敗');
+        }
+        _renderMoneydjBrokerRows(document.getElementById('broker-moneydj-buy-tbody'), summary.buy_rows || [], 'buy');
+        _renderMoneydjBrokerRows(document.getElementById('broker-moneydj-sell-tbody'), summary.sell_rows || [], 'sell');
+        _brokerHasMoneydjData = Boolean((summary.buy_rows || []).length || (summary.sell_rows || []).length);
+        if (_brokerHasMoneydjData) renderKeyBrokersTable(_brokerOfficialKeyRows);
+        renderMoneydjChipSummary(summary);
+        if (contentEl) contentEl.style.display = 'grid';
+        if (statusEl) {
+            statusEl.className = 'broker-warning-box info';
+            statusEl.textContent = `${summary.period_label || period} ${summary.start_date || '--'} / ${summary.end_date || '--'}，單位：張。此資料為區間彙總，不能判斷逐日轉賣或隔日沖。`;
+        }
+    } catch (err) {
+        if (contentEl) contentEl.style.display = 'none';
+        if (statusEl) {
+            statusEl.className = 'broker-warning-box warning';
+            statusEl.textContent = `MoneyDJ 區間資料抓取失敗：${err.message || err}`;
+        }
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+function renderBrokerWarnings(warnings) {
+    const el = document.getElementById('broker-warnings');
+    if (!el) return;
+    const list = warnings || [];
+    if (!list.length) {
+        el.innerHTML = '<div class="broker-warning-box muted">目前沒有分點警示。</div>';
+        return;
+    }
+    el.innerHTML = list.map(w => `<div class="broker-warning-box ${_brokerEscape(w.level || 'info')}">${_brokerEscape(w.message || '')}</div>`).join('');
+}
+
+function renderBrokerConclusion(text) {
+    const el = document.getElementById('broker-conclusion');
+    if (el) el.textContent = text || '目前沒有結論。';
+}
+
+async function searchKeyBrokers() {
+    const input = document.getElementById('broker-query-input');
+    const loading = document.getElementById('broker-loading');
+    const errorEl = document.getElementById('broker-error');
+    const resultEl = document.getElementById('broker-result');
+    const query = (input?.value || '').trim();
+
+    if (!query) {
+        if (errorEl) { errorEl.style.display = 'block'; errorEl.textContent = '請先輸入股票代號或名稱。'; }
+        if (resultEl) resultEl.style.display = 'none';
+        return;
+    }
+
+    if (loading) loading.style.display = 'flex';
+    if (errorEl) { errorEl.style.display = 'none'; errorEl.textContent = ''; }
+    if (resultEl) resultEl.style.display = 'none';
+
+    try {
+        const res = await fetch(`/api/broker/key-points?query=${encodeURIComponent(query)}`);
+        const data = await res.json();
+        if (!res.ok || data.status === 'error') {
+            throw new Error(data.message || data.detail || `HTTP ${res.status}`);
+        }
+        _brokerCurrentCode = data.stock?.code || query;
+        renderBrokerStockInfo(data);
+        renderBrokerSummary(data);
+        updateBrokerPeriodLabels(data);
+        renderKeyBrokersTable(data.key_brokers || []);
+        renderTopBuyBrokersTable(data.top_buy_brokers_5d || []);
+        renderTopSellBrokersTable(data.top_sell_brokers_5d || []);
+        renderBrokerWarnings(data.warnings || []);
+        renderBrokerConclusion(data.summary?.conclusion || '');
+        resetMoneydjBrokerPeriod('MoneyDJ 5D 區間資料準備抓取...');
+        if (resultEl) resultEl.style.display = 'flex';
+        fetchMoneydjBrokerPeriod();
+    } catch (err) {
+        if (errorEl) { errorEl.style.display = 'block'; errorEl.textContent = err.message || '查詢失敗'; }
+    } finally {
+        if (loading) loading.style.display = 'none';
+    }
+}
+
+function initBrokerTabSearch() {
+    const input = document.getElementById('broker-query-input');
+    if (!input || input.dataset.bound === '1') return;
+    input.dataset.bound = '1';
+    input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') searchKeyBrokers();
+    });
 }

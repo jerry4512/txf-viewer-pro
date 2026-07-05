@@ -115,3 +115,188 @@ input[type="checkbox"] { cursor: pointer; }
     0% { transform: rotate(0deg); }
     100% { transform: rotate(360deg); }
 }
+
+/* Key broker analysis tab */
+.broker-toolbar {
+    background: #111;
+    border: 1px solid #222;
+    border-radius: 8px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.broker-search-wrap {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+.broker-search-wrap input {
+    flex: 1;
+    min-width: 0;
+    background: #0d1117;
+    border: 1px solid #333;
+    color: #fff;
+    padding: 9px 12px;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    outline: none;
+}
+.broker-search-wrap input:focus { border-color: #26de81; }
+.broker-search-wrap button {
+    width: auto;
+    background: rgba(38, 222, 129, 0.18);
+    border: 1px solid rgba(38, 222, 129, 0.45);
+    color: #26de81;
+    padding: 9px 18px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 700;
+    white-space: nowrap;
+}
+#broker-search-hint { color: #666; font-size: 0.76rem; }
+.broker-loading {
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    min-height: 120px;
+    color: #888;
+    background: #111;
+    border: 1px solid #222;
+    border-radius: 8px;
+}
+.broker-spinner {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    border: 3px solid rgba(38, 222, 129, 0.18);
+    border-top-color: #26de81;
+    animation: spin 1s linear infinite;
+}
+.broker-stock-info,
+.broker-summary-card,
+.broker-section,
+.broker-conclusion-box,
+.broker-warning-box {
+    background: #111;
+    border: 1px solid #222;
+    border-radius: 8px;
+}
+.broker-stock-info {
+    padding: 12px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.broker-stock-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.broker-stock-code { color: #26de81; font-size: 1rem; font-weight: 800; font-family: monospace; }
+.broker-stock-name { color: #fff; font-weight: 700; }
+.broker-stock-category,
+.broker-stock-date { color: #777; font-size: 0.78rem; }
+.broker-summary-card {
+    padding: 14px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(120px, 1fr));
+    gap: 10px;
+}
+.broker-summary-item {
+    background: rgba(255,255,255,0.025);
+    border: 1px solid #1d1d1d;
+    border-radius: 6px;
+    padding: 10px;
+    min-width: 0;
+}
+.broker-summary-item.wide { grid-column: span 3; }
+.broker-summary-label { color: #666; font-size: 0.72rem; margin-bottom: 5px; }
+.broker-summary-value { color: #fff; font-size: 1.05rem; font-weight: 800; }
+.broker-summary-text { color: #ccc; font-size: 0.82rem; line-height: 1.5; word-break: break-word; }
+.broker-summary-text.warn { color: #ff9f43; }
+.broker-summary-item.completeness-warning {
+    border-color: rgba(255,159,67,0.38);
+    background: rgba(255,159,67,0.08);
+}
+.broker-status-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 2px 9px;
+    border-radius: 14px;
+    font-size: 0.78rem;
+    font-weight: 800;
+}
+.broker-status-badge.positive { background: rgba(38,222,129,0.14); color: #26de81; border: 1px solid rgba(38,222,129,0.35); }
+.broker-status-badge.neutral { background: rgba(150,150,150,0.12); color: #aaa; border: 1px solid rgba(150,150,150,0.25); }
+.broker-status-badge.negative { background: rgba(255,82,82,0.12); color: #ff6b6b; border: 1px solid rgba(255,82,82,0.32); }
+.broker-status-badge.empty { background: rgba(79,172,254,0.10); color: #4facfe; border: 1px solid rgba(79,172,254,0.28); }
+.broker-chip-summary {
+    border: 1px solid #2a2a2a;
+    background: rgba(255,255,255,0.025);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+}
+.broker-chip-status { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 7px; }
+.broker-section { padding: 13px 14px; }
+.broker-section-title { color: #eee; font-size: 0.9rem; font-weight: 800; margin-bottom: 10px; }
+.broker-section-title.small { font-size: 0.82rem; margin-bottom: 8px; color: #ccc; }
+.broker-section-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
+.broker-section-note { color: #ff9f43; font-size: 0.76rem; line-height: 1.45; }
+.broker-period-controls { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.broker-period-controls select {
+    background: #111;
+    color: #eee;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 0.78rem;
+}
+.broker-period-controls button {
+    background: #1f8f5f;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-weight: 700;
+    cursor: pointer;
+}
+.broker-grid-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.broker-table-wrap { overflow-x: auto; }
+.broker-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; min-width: 720px; }
+.broker-table.compact { min-width: 520px; }
+.broker-table th {
+    color: #666;
+    font-size: 0.72rem;
+    padding: 7px 8px;
+    text-align: left;
+    border-bottom: 1px solid #222;
+    white-space: nowrap;
+}
+.broker-table td {
+    color: #bbb;
+    padding: 8px;
+    border-bottom: 1px solid #1a1a1a;
+    white-space: nowrap;
+}
+.broker-table .num { text-align: right; font-family: monospace; }
+.broker-table .pos { color: #ff6b6b; }
+.broker-table .neg { color: #26de81; }
+.broker-empty-cell { text-align: center !important; color: #555 !important; padding: 24px !important; }
+.broker-warning-list { display: flex; flex-direction: column; gap: 8px; }
+.broker-warning-box { padding: 11px 13px; color: #ff9f43; font-size: 0.82rem; line-height: 1.5; }
+.broker-warning-box.info,
+.broker-warning-box.muted { color: #888; }
+.broker-warning-box.warning { border-color: rgba(255,159,67,0.35); background: rgba(255,159,67,0.07); }
+.broker-conclusion-box { padding: 13px 14px; color: #ddd; line-height: 1.65; font-size: 0.86rem; border-left: 4px solid #26de81; }
+@media (max-width: 900px) {
+    .broker-grid-two { grid-template-columns: 1fr; }
+    .broker-summary-card { grid-template-columns: 1fr; }
+    .broker-summary-item.wide { grid-column: span 1; }
+    .broker-search-wrap { flex-direction: column; align-items: stretch; }
+    .broker-search-wrap button { width: 100%; }
+    .broker-section-head { flex-direction: column; }
+    .broker-period-controls { width: 100%; }
+    .broker-period-controls select,
+    .broker-period-controls button { flex: 1; }
+}

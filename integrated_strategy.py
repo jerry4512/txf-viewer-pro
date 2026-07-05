@@ -122,6 +122,130 @@ def _get_chip_data(codes: list) -> dict:
     return result
 
 
+
+def _empty_broker() -> dict:
+    return {
+        'broker_score': 0,
+        'broker_bonus': 0,
+        'broker_comment': 'MoneyDJ\u5206\u9ede\u8cc7\u6599\u4e0d\u8db3\uff0c\u66ab\u4e0d\u53c3\u8207\u52a0\u5206\u3002',
+        'broker_risk': '',
+        'broker_tags': [],
+        'moneydj_start_date': None,
+        'moneydj_end_date': None,
+        'moneydj_period_label': '5D',
+        'moneydj_date_valid': False,
+    }
+
+
+def _score_moneydj_summary(summary: dict, data_date: str) -> dict:
+    broker = _empty_broker()
+    if not summary or summary.get('status') != 'success':
+        return broker
+
+    start_date = summary.get('start_date')
+    end_date = summary.get('end_date')
+    period = summary.get('period_label') or '5D'
+    status_text = str(summary.get('period_chip_status') or '')
+    reason_text = str(summary.get('period_chip_reason') or '')
+    signal_text = f"{status_text} {reason_text}"
+    tags = []
+
+    broker.update({
+        'moneydj_start_date': start_date,
+        'moneydj_end_date': end_date,
+        'moneydj_period_label': period,
+        'broker_comment': reason_text or status_text or 'MoneyDJ\u5206\u9ede\u8cc7\u6599\u7121\u660e\u78ba\u8a0a\u865f\u3002',
+    })
+
+    if not end_date or str(end_date) != str(data_date):
+        broker.update({
+            'broker_score': 0,
+            'broker_bonus': 0,
+            'broker_risk': 'stale_data',
+            'broker_tags': ['MoneyDJ\u65e5\u671f\u4e0d\u4e00\u81f4'],
+            'moneydj_date_valid': False,
+            'broker_comment': f"MoneyDJ\u8cc7\u6599\u65e5\u671f{end_date or '\u7f3a\u5931'}\u8207\u9078\u80a1\u57fa\u6e96\u65e5{data_date}\u4e0d\u4e00\u81f4\uff0c\u4e0d\u53c3\u8207\u52a0\u5206\u3002",
+        })
+        return broker
+
+    bonus = 0
+    risk = ''
+    positive_hits = []
+    negative_hits = []
+
+    for kw in ('\u96c6\u4e2d', '\u504f\u591a', '\u9023\u8cb7'):
+        if kw in signal_text:
+            positive_hits.append(kw)
+    for kw in ('\u9694\u65e5\u6c96', '\u8ce3\u8d85', '\u8f49\u8ce3', '\u5206\u6563'):
+        if kw in signal_text:
+            negative_hits.append(kw)
+
+    if positive_hits:
+        tags.extend([f"MoneyDJ{kw}" for kw in positive_hits])
+        if '\u96c6\u4e2d' in positive_hits:
+            bonus += 4
+        if '\u504f\u591a' in positive_hits:
+            bonus += 3
+        if '\u9023\u8cb7' in positive_hits:
+            bonus += 3
+    if negative_hits:
+        tags.extend([f"MoneyDJ{kw}" for kw in negative_hits])
+        risk = 'broker_sell_pressure'
+        if '\u9694\u65e5\u6c96' in negative_hits:
+            bonus -= 5
+        if '\u8ce3\u8d85' in negative_hits:
+            bonus -= 4
+        if '\u8f49\u8ce3' in negative_hits:
+            bonus -= 4
+        if '\u5206\u6563' in negative_hits:
+            bonus -= 3
+
+    bonus = max(-5, min(8, bonus))
+    broker.update({
+        'broker_score': bonus,
+        'broker_bonus': bonus,
+        'broker_risk': risk,
+        'broker_tags': tags,
+        'moneydj_date_valid': True,
+    })
+    if not tags:
+        broker['broker_comment'] = broker['broker_comment'] or 'MoneyDJ\u5206\u9ede\u8cc7\u6599\u7121\u660e\u78ba\u8a0a\u865f\u3002'
+    return broker
+
+
+def _get_broker_data(codes: list, data_date: str) -> dict:
+    """Read existing MoneyDJ period summaries and convert them to broker helper fields."""
+    result = {str(code): _empty_broker() for code in (codes or [])}
+    if not codes:
+        return result
+
+    conn = None
+    try:
+        try:
+            import moneydj_fetcher
+        except Exception as import_err:
+            print(f"[IntegratedStrategy] WARNING: moneydj_fetcher import failed: {import_err}")
+            return result
+
+        conn = _get_conn()
+        for code in codes:
+            code_str = str(code)
+            try:
+                summary = moneydj_fetcher.get_moneydj_period_summary(conn, code_str, '5D')
+                result[code_str] = _score_moneydj_summary(summary, data_date)
+            except Exception as one_err:
+                print(f"[IntegratedStrategy] WARNING: MoneyDJ broker read failed for {code_str}: {one_err}")
+                result[code_str] = _empty_broker()
+    except Exception as e:
+        print(f"[IntegratedStrategy] WARNING: MoneyDJ broker data unavailable: {e}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return result
+
 def _empty_chip() -> dict:
     return {
         'foreign_5d': 0, 'trust_5d': 0, 'dealer_5d': 0,
@@ -225,7 +349,7 @@ def _compute_industry_rankings(stocks: list) -> None:
 
 def _calculate_final_score(stock: dict) -> dict:
     """
-    final_score = base_score + chip_bonus + industry_bonus + liquidity_bonus - risk_penalty
+    final_score = base_score + chip_bonus + industry_bonus + liquidity_bonus + broker_bonus - risk_penalty
     """
     base_score_raw = stock.get('base_score_raw', 0)
     base_score     = round(base_score_raw * 0.65)   # 65% 權重，上限約 65
@@ -285,7 +409,12 @@ def _calculate_final_score(stock: dict) -> dict:
     if rr is not None and rr < 1.5:                  risk_penalty += 6
     if rr is not None and rr < 1.0:                  risk_penalty += 14
 
-    final_score = base_score + chip_bonus + ind_bonus + liq_bonus - risk_penalty
+    broker_bonus = stock.get('broker_bonus', 0) or 0
+    if not stock.get('moneydj_date_valid', False):
+        broker_bonus = 0
+    broker_bonus = max(-5, min(8, broker_bonus))
+
+    final_score = base_score + chip_bonus + ind_bonus + liq_bonus + broker_bonus - risk_penalty
     final_score = max(0, min(100, final_score))
 
     return {
@@ -293,6 +422,7 @@ def _calculate_final_score(stock: dict) -> dict:
         'chip_bonus':      chip_bonus,
         'industry_bonus':  ind_bonus,
         'liquidity_bonus': liq_bonus,
+        'broker_bonus':    broker_bonus,
         'risk_penalty':    risk_penalty,
         'final_score':     final_score,
     }
@@ -470,6 +600,7 @@ def run_integrated_strategy(data_date: str = None) -> dict:
 
     # ── Step 2：取得籌碼資料 ─────────────────────────────────────────────
     chip_data = _get_chip_data(all_codes)
+    broker_data = _get_broker_data(all_codes, data_date)
 
     # ── Step 3：合併個股資料 ─────────────────────────────────────────────
     enriched: list = []
@@ -477,6 +608,7 @@ def run_integrated_strategy(data_date: str = None) -> dict:
     for s in ts_active:
         code = s['symbol']
         chip = chip_data.get(code, _empty_chip())
+        broker = broker_data.get(code, _empty_broker())
         tier = _chip_tier(chip)
 
         close      = s.get('close', 0)
@@ -538,6 +670,15 @@ def run_integrated_strategy(data_date: str = None) -> dict:
             'trust_consecutive':    chip.get('trust_consecutive',   0),
             'chip_tier':            tier,
             'institution_5d_status': _chip_status_label(chip),
+            'broker_score':         broker.get('broker_score', 0),
+            'broker_bonus':         broker.get('broker_bonus', 0),
+            'broker_comment':       broker.get('broker_comment', ''),
+            'broker_risk':          broker.get('broker_risk', ''),
+            'broker_tags':          broker.get('broker_tags', []),
+            'moneydj_start_date':   broker.get('moneydj_start_date'),
+            'moneydj_end_date':     broker.get('moneydj_end_date'),
+            'moneydj_period_label': broker.get('moneydj_period_label', '5D'),
+            'moneydj_date_valid':   broker.get('moneydj_date_valid', False),
             # 初始化（後續填入）
             'chip_bonus_raw':  0,
             'industry_score':  0,
@@ -606,6 +747,11 @@ def run_integrated_strategy(data_date: str = None) -> dict:
             'institution_5d_total': 0, 'chip_tier': '',
             'institution_5d_status': '',
             'industry_score': 0, 'industry_status': '', 'has_industry_resonance': False,
+            'broker_score': 0, 'broker_bonus': 0,
+            'broker_comment': 'MoneyDJ\u7121\u53ef\u7528\u8cc7\u6599\uff0c\u4e0d\u53c3\u8207\u5206\u9ede\u52a0\u5206',
+            'broker_risk': '', 'broker_tags': [],
+            'moneydj_start_date': None, 'moneydj_end_date': None,
+            'moneydj_period_label': '5D', 'moneydj_date_valid': False,
             'base_score': 0, 'chip_bonus': 0, 'industry_bonus': 0,
             'liquidity_bonus': 0, 'risk_penalty': 0, 'final_score': 0,
         }

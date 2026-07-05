@@ -22,3 +22,15 @@ venv/
 
 # Windows
 Thumbs.db
+
+# Claude Code local settings/worktrees
+.claude/
+
+# Temp outputs & DB backup
+_tmp_result.json
+_report_buy.md
+_report_watch.md
+*.rar
+
+# Fetched broker data cache
+data/
