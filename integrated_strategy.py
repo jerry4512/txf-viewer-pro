@@ -158,13 +158,14 @@ def _score_moneydj_summary(summary: dict, data_date: str) -> dict:
     })
 
     if not end_date or str(end_date) != str(data_date):
+        display_end_date = end_date or '\u7f3a\u5931'
         broker.update({
             'broker_score': 0,
             'broker_bonus': 0,
             'broker_risk': 'stale_data',
             'broker_tags': ['MoneyDJ\u65e5\u671f\u4e0d\u4e00\u81f4'],
             'moneydj_date_valid': False,
-            'broker_comment': f"MoneyDJ\u8cc7\u6599\u65e5\u671f{end_date or '\u7f3a\u5931'}\u8207\u9078\u80a1\u57fa\u6e96\u65e5{data_date}\u4e0d\u4e00\u81f4\uff0c\u4e0d\u53c3\u8207\u52a0\u5206\u3002",
+            'broker_comment': f"MoneyDJ\u8cc7\u6599\u65e5\u671f{display_end_date}\u8207\u9078\u80a1\u57fa\u6e96\u65e5{data_date}\u4e0d\u4e00\u81f4\uff0c\u4e0d\u53c3\u8207\u52a0\u5206\u3002",
         })
         return broker
 

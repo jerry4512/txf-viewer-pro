@@ -1,5 +1,6 @@
 let viewMode = 1; // 1: 單圖, 2: 雙圖, 3: 三圖
 let panes = [];
+let freelancerChartPane = null;
 let globalRefPrice = 0;
 let activeStockTab = 'chart'; // 'chart' or 'screener'
 
@@ -1268,6 +1269,429 @@ class TradingPane {
             }, 200);
         }
     }
+}
+
+class FreelancerKChart {
+    constructor() {
+        this.currentPeriod = document.getElementById('fl-chart-period')?.value || '5min';
+        this.chart = null;
+        this.candleSeries = null;
+        this.kbarsCache = [];
+        this.isLoading = false;
+        this.symbol = 'TXFR1';
+        this.drawTool = 'cursor';
+        this.drawings = [];
+        this.pendingDrawPoint = null;
+        this.previewDrawing = null;
+        this.drawingOverlay = null;
+    }
+
+    init(symbol = 'TXFR1') {
+        this.symbol = symbol || this.symbol;
+        const mainEl = document.getElementById('fl-chart-main');
+        if (!mainEl || !window.LightweightCharts) return;
+
+        if (this.chart) {
+            this.resize();
+            return;
+        }
+
+        const chartOptions = {
+            layout: {
+                textColor: '#d6dce8',
+                background: { type: 'solid', color: '#11141e' },
+                fontSize: 13
+            },
+            grid: {
+                vertLines: { color: '#2b3040', style: LightweightCharts.LineStyle.Dotted },
+                horzLines: { color: '#2b3040', style: LightweightCharts.LineStyle.Dotted }
+            },
+            crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+            rightPriceScale: {
+                borderColor: '#c9ced8',
+                scaleMargins: { top: 0.08, bottom: 0.08 }
+            },
+            timeScale: {
+                borderColor: '#c9ced8',
+                timeVisible: true,
+                secondsVisible: false,
+                tickMarkFormatter: (time) => {
+                    if (this.currentPeriod === 'D') {
+                        const d = new Date((time + 28800) * 1000);
+                        const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+                        const day = String(d.getUTCDate()).padStart(2, '0');
+                        return `${m}/${day}`;
+                    }
+                    const d = new Date((time + 28800) * 1000);
+                    const hh = String(d.getUTCHours()).padStart(2, '0');
+                    const mm = String(d.getUTCMinutes()).padStart(2, '0');
+                    return `${hh}:${mm}`;
+                }
+            },
+            localization: {
+                timeFormatter: (ts) => {
+                    const d = new Date((ts + 28800) * 1000);
+                    const y = d.getUTCFullYear();
+                    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+                    const day = String(d.getUTCDate()).padStart(2, '0');
+                    const hh = String(d.getUTCHours()).padStart(2, '0');
+                    const mm = String(d.getUTCMinutes()).padStart(2, '0');
+                    return `${y}/${m}/${day} ${hh}:${mm}`;
+                }
+            }
+        };
+
+        this.chart = LightweightCharts.createChart(mainEl, chartOptions);
+        this.candleSeries = this.chart.addCandlestickSeries({
+            upColor: '#ef554a',
+            downColor: '#26a69a',
+            borderUpColor: '#ef554a',
+            borderDownColor: '#26a69a',
+            wickUpColor: '#dfe5ef',
+            wickDownColor: '#dfe5ef',
+            priceFormat: { type: 'price', precision: 0, minMove: 1 }
+        });
+
+        this.chart.subscribeCrosshairMove((param) => {
+            const bar = param?.seriesData?.get(this.candleSeries);
+            this.updateLegend(bar || this.kbarsCache[this.kbarsCache.length - 1]);
+        });
+        this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.renderDrawings());
+
+        const periodEl = document.getElementById('fl-chart-period');
+        if (periodEl) {
+            periodEl.addEventListener('change', (e) => {
+                this.currentPeriod = e.target.value;
+                localStorage.setItem('fl-chart-period', this.currentPeriod);
+                this.reload();
+            });
+
+            const savedPeriod = localStorage.getItem('fl-chart-period');
+            if (savedPeriod) {
+                this.currentPeriod = savedPeriod;
+                periodEl.value = savedPeriod;
+            }
+        }
+
+        this.resize();
+        this.setupDrawingTools();
+        this.reload();
+    }
+
+    periodSeconds() {
+        if (this.currentPeriod === 'D') return 86400;
+        return (parseInt(this.currentPeriod, 10) || 1) * 60;
+    }
+
+    async reload() {
+        if (!this.candleSeries) return;
+        this.kbarsCache = [];
+        this.candleSeries.setData([]);
+        this.updateLegend(null);
+
+        const days = this.currentPeriod === 'D' ? 180 : 30;
+        const end = new Date().toLocaleDateString('en-CA');
+        const startDate = new Date(Date.now() - days * 86400000);
+        const start = startDate.toLocaleDateString('en-CA');
+        await this.fetchData(start, end);
+    }
+
+    async fetchData(start, end) {
+        this.isLoading = true;
+        const loadingEl = document.getElementById('fl-chart-loading');
+        if (loadingEl) loadingEl.style.display = 'flex';
+
+        try {
+            const res = await fetch(`/api/kbars?start=${start}&end=${end}&period=1min`);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            this.kbarsCache = this.aggregateBars(data || []);
+            this.candleSeries.setData(this.kbarsCache);
+            this.updateLegend(this.kbarsCache[this.kbarsCache.length - 1]);
+            this.resize();
+            if (this.kbarsCache.length > 0) {
+                this.chart.timeScale().setVisibleLogicalRange({
+                    from: Math.max(0, this.kbarsCache.length - 120),
+                    to: this.kbarsCache.length + 8
+                });
+            }
+        } catch (err) {
+            console.error('[FreelancerKChart] 載入 K 線失敗:', err);
+            const legendEl = document.getElementById('fl-chart-legend');
+            if (legendEl) legendEl.innerHTML = '<span style="color:#ff6b6b">K 線載入失敗</span>';
+        } finally {
+            if (loadingEl) loadingEl.style.display = 'none';
+            this.isLoading = false;
+        }
+    }
+
+    aggregateBars(data) {
+        const pSec = this.periodSeconds();
+        const result = [];
+        let currentBar = null;
+
+        data.forEach(k => {
+            const t = Number(k.time);
+            const bucketT = Math.floor((t - 1) / pSec) * pSec;
+            if (!currentBar || bucketT !== currentBar.time) {
+                if (currentBar) result.push(currentBar);
+                currentBar = {
+                    time: bucketT,
+                    open: k.open,
+                    high: k.high,
+                    low: k.low,
+                    close: k.close
+                };
+            } else {
+                currentBar.high = Math.max(currentBar.high, k.high);
+                currentBar.low = Math.min(currentBar.low, k.low);
+                currentBar.close = k.close;
+            }
+        });
+        if (currentBar) result.push(currentBar);
+        return result.sort((a, b) => a.time - b.time);
+    }
+
+    onTick(price, time) {
+        if (!this.candleSeries || !price || this.isLoading) return;
+        const pSec = this.periodSeconds();
+        const t = time || Math.floor(Date.now() / 1000);
+        const bucketT = Math.floor(t / pSec) * pSec;
+
+        if (this.kbarsCache.length === 0) {
+            const firstBar = { time: bucketT, open: price, high: price, low: price, close: price };
+            this.kbarsCache.push(firstBar);
+            this.candleSeries.setData(this.kbarsCache);
+            this.updateLegend(firstBar);
+            return;
+        }
+
+        const last = this.kbarsCache[this.kbarsCache.length - 1];
+        if (bucketT > last.time) {
+            const newBar = { time: bucketT, open: price, high: price, low: price, close: price };
+            this.kbarsCache.push(newBar);
+            this.candleSeries.update(newBar);
+            this.updateLegend(newBar);
+            this.chart.timeScale().scrollToRealTime();
+            return;
+        }
+
+        last.close = price;
+        last.high = Math.max(last.high, price);
+        last.low = Math.min(last.low, price);
+        this.candleSeries.update(last);
+        this.updateLegend(last);
+    }
+
+    updateLegend(bar) {
+        const legendEl = document.getElementById('fl-chart-legend');
+        if (!legendEl) return;
+        if (!bar) {
+            legendEl.innerHTML = '<span style="color:#8c94a3">台指期 · TFE</span>';
+            return;
+        }
+
+        const diff = bar.close - bar.open;
+        const pct = bar.open ? (diff / bar.open) * 100 : 0;
+        const color = diff >= 0 ? '#00ff55' : '#ff5b5b';
+        const sign = diff >= 0 ? '+' : '';
+        const periodLabelMap = { '1min': '1', '5min': '5', '15min': '15', '30min': '30', '60min': '60', 'D': '日' };
+        const periodLabel = periodLabelMap[this.currentPeriod] || this.currentPeriod;
+        legendEl.innerHTML = `
+            <span style="font-size:1.05rem;color:#f0f3f8;">台指期 · ${periodLabel} · TFE</span>
+            <span style="display:inline-block;margin-left:18px;">開=<span style="color:${color}">${bar.open}</span></span>
+            <span>高=<span style="color:${color}">${bar.high}</span></span>
+            <span>低=<span style="color:${color}">${bar.low}</span></span>
+            <span>收=<span style="color:${color}">${bar.close}</span></span>
+            <span style="color:${color}">${sign}${diff.toFixed(0)} (${sign}${pct.toFixed(2)}%)</span>
+        `;
+    }
+
+    setupDrawingTools() {
+        this.drawingOverlay = document.getElementById('fl-drawing-overlay');
+        const toolbar = document.getElementById('fl-draw-toolbar');
+        if (!this.drawingOverlay || !toolbar) return;
+
+        toolbar.addEventListener('click', (event) => {
+            const btn = event.target.closest('.fl-draw-btn');
+            if (!btn) return;
+            const tool = btn.dataset.tool;
+            if (tool === 'disabled') return;
+            if (tool === 'clear') {
+                this.drawings = [];
+                this.pendingDrawPoint = null;
+                this.previewDrawing = null;
+                this.renderDrawings();
+                return;
+            }
+            this.setDrawTool(tool || 'cursor');
+        });
+
+        this.drawingOverlay.addEventListener('click', (event) => this.handleDrawClick(event));
+        this.drawingOverlay.addEventListener('mousemove', (event) => this.handleDrawMove(event));
+        this.drawingOverlay.addEventListener('mouseleave', () => {
+            this.previewDrawing = null;
+            this.renderDrawings();
+        });
+        this.setDrawTool(this.drawTool);
+    }
+
+    setDrawTool(tool) {
+        this.drawTool = tool;
+        this.pendingDrawPoint = null;
+        this.previewDrawing = null;
+        document.querySelectorAll('.fl-draw-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.tool === tool);
+        });
+        if (this.drawingOverlay) {
+            this.drawingOverlay.classList.toggle('active', tool !== 'cursor');
+        }
+        this.renderDrawings();
+    }
+
+    getDrawPoint(event) {
+        if (!this.chart || !this.candleSeries || !this.drawingOverlay) return null;
+        const rect = this.drawingOverlay.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        const time = this.chart.timeScale().coordinateToTime(x);
+        const price = this.candleSeries.coordinateToPrice(y);
+        if (time === null || time === undefined || price === null || price === undefined) return null;
+        return { time, price };
+    }
+
+    handleDrawClick(event) {
+        if (this.drawTool === 'cursor') return;
+        event.preventDefault();
+        event.stopPropagation();
+
+        const point = this.getDrawPoint(event);
+        if (!point) return;
+
+        if (this.drawTool === 'horizontal') {
+            this.drawings.push({ type: 'horizontal', price: point.price });
+            this.renderDrawings();
+            return;
+        }
+
+        if (this.drawTool === 'vertical') {
+            this.drawings.push({ type: 'vertical', time: point.time });
+            this.renderDrawings();
+            return;
+        }
+
+        if (!this.pendingDrawPoint) {
+            this.pendingDrawPoint = point;
+            return;
+        }
+
+        this.drawings.push({
+            type: this.drawTool,
+            start: this.pendingDrawPoint,
+            end: point
+        });
+        this.pendingDrawPoint = null;
+        this.previewDrawing = null;
+        this.renderDrawings();
+    }
+
+    handleDrawMove(event) {
+        if (!this.pendingDrawPoint || (this.drawTool !== 'trendline' && this.drawTool !== 'rect')) return;
+        const point = this.getDrawPoint(event);
+        if (!point) return;
+        this.previewDrawing = {
+            type: this.drawTool,
+            start: this.pendingDrawPoint,
+            end: point,
+            preview: true
+        };
+        this.renderDrawings();
+    }
+
+    pointToCoordinate(point) {
+        const x = this.chart.timeScale().timeToCoordinate(point.time);
+        const y = this.candleSeries.priceToCoordinate(point.price);
+        if (x === null || y === null) return null;
+        return { x, y };
+    }
+
+    renderDrawings() {
+        if (!this.drawingOverlay || !this.chart || !this.candleSeries) return;
+        const width = this.drawingOverlay.clientWidth;
+        const height = this.drawingOverlay.clientHeight;
+        this.drawingOverlay.setAttribute('viewBox', `0 0 ${width} ${height}`);
+        this.drawingOverlay.innerHTML = '';
+
+        [...this.drawings, this.previewDrawing].filter(Boolean).forEach(shape => {
+            if (shape.type === 'horizontal') {
+                const y = this.candleSeries.priceToCoordinate(shape.price);
+                if (y !== null) this.addSvgLine(0, y, width, y, shape.preview);
+                return;
+            }
+
+            if (shape.type === 'vertical') {
+                const x = this.chart.timeScale().timeToCoordinate(shape.time);
+                if (x !== null) this.addSvgLine(x, 0, x, height, shape.preview);
+                return;
+            }
+
+            const start = this.pointToCoordinate(shape.start);
+            const end = this.pointToCoordinate(shape.end);
+            if (!start || !end) return;
+
+            if (shape.type === 'rect') {
+                this.addSvgRect(start, end, shape.preview);
+            } else {
+                this.addSvgLine(start.x, start.y, end.x, end.y, shape.preview);
+            }
+        });
+    }
+
+    addSvgLine(x1, y1, x2, y2, preview = false) {
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute('x1', x1);
+        line.setAttribute('y1', y1);
+        line.setAttribute('x2', x2);
+        line.setAttribute('y2', y2);
+        line.setAttribute('stroke', preview ? '#9bbcff' : '#4facfe');
+        line.setAttribute('stroke-width', '2');
+        line.setAttribute('stroke-dasharray', preview ? '6 5' : '');
+        this.drawingOverlay.appendChild(line);
+    }
+
+    addSvgRect(start, end, preview = false) {
+        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        rect.setAttribute('x', Math.min(start.x, end.x));
+        rect.setAttribute('y', Math.min(start.y, end.y));
+        rect.setAttribute('width', Math.abs(end.x - start.x));
+        rect.setAttribute('height', Math.abs(end.y - start.y));
+        rect.setAttribute('fill', preview ? 'rgba(79,172,254,0.08)' : 'rgba(79,172,254,0.12)');
+        rect.setAttribute('stroke', preview ? '#9bbcff' : '#4facfe');
+        rect.setAttribute('stroke-width', '2');
+        rect.setAttribute('stroke-dasharray', preview ? '6 5' : '');
+        this.drawingOverlay.appendChild(rect);
+    }
+
+    resize() {
+        const mainEl = document.getElementById('fl-chart-main');
+        if (!mainEl || !this.chart) return;
+        const width = mainEl.clientWidth;
+        const height = mainEl.clientHeight;
+        if (width > 0 && height > 0) {
+            this.chart.resize(width, height);
+            this.renderDrawings();
+        }
+    }
+}
+
+function ensureFreelancerChart(symbol = 'TXFR1') {
+    if (!freelancerChartPane) {
+        freelancerChartPane = new FreelancerKChart();
+        freelancerChartPane.init(symbol);
+        return;
+    }
+    freelancerChartPane.symbol = symbol || freelancerChartPane.symbol;
+    freelancerChartPane.resize();
 }
 
 async function loadInstitutionalRankings() {
@@ -2582,6 +3006,7 @@ async function startApp(contractCode) {
             appContainer.classList.add('market-freelancer');
             if (freelancerContainer) freelancerContainer.style.display = 'flex';
             // stock tabs/placeholder 由 CSS market-freelancer class 隱藏
+            setTimeout(() => ensureFreelancerChart(contractCode || 'TXFR1'), 0);
             flStartAmplitudeRefresh();
         } else if (market === 'amplitude-statistics') {
             // ── 震幅統計：動態注入 <style> 來隱藏 panes-container ──
@@ -2834,9 +3259,12 @@ async function startApp(contractCode) {
                     
                     // 關鍵修復：切換合約時，更新所有圖表實體的 symbol！
                     panes.forEach(p => p.symbol = code);
-                    
+                    if (freelancerChartPane) freelancerChartPane.symbol = code;
+
                     // 執行重新載入
-                    await Promise.all(panes.map(p => p.reload()));
+                    const reloads = panes.map(p => p.reload());
+                    if (freelancerChartPane) reloads.push(freelancerChartPane.reload());
+                    await Promise.all(reloads);
                     
                     // 更新全域快照
                     const sRes = await fetch('/api/snapshot');
@@ -3160,15 +3588,24 @@ function connectWebSocket() {
     };
 
     ws.onmessage = (event) => {
-        // 🎯 非期貨模式安全哨兵：股票或自由人模式下，不接收或解析期貨即時 Tick 行情，維持靜默
-        const mSelector = document.getElementById('market-type-selector');
-        if (mSelector && mSelector.value !== 'futures') return;
-
         const msg = JSON.parse(event.data);
         if (msg.type === 'cache_updated') {
             loadCacheInfo();
             return;
         }
+
+        // 🎯 自由人模式只把 Tick 餵給自由人 K 線主圖，不更新期貨看盤頁的報價 UI
+        const mSelector = document.getElementById('market-type-selector');
+        if (mSelector && mSelector.value === 'freelancer') {
+            if (msg.type === 'tick' && freelancerChartPane) {
+                freelancerChartPane.onTick(msg.data.price, msg.data.time);
+            }
+            return;
+        }
+
+        // 🎯 非期貨模式安全哨兵：股票模式下，不接收或解析期貨即時 Tick 行情，維持靜默
+        if (mSelector && mSelector.value !== 'futures') return;
+
         if (msg.type === 'tick') {
             const t = msg.data.time, price = msg.data.price;
             
@@ -3246,6 +3683,7 @@ window.addEventListener('resize', () => {
         if (panes && panes.length > 0) {
             panes.forEach(p => p.resize());
         }
+        if (freelancerChartPane) freelancerChartPane.resize();
     }, 100);
 });
 
@@ -3256,6 +3694,7 @@ document.addEventListener('visibilitychange', () => {
         if (panes && panes.length > 0) {
             panes.forEach(p => p.reload());
         }
+        if (freelancerChartPane) freelancerChartPane.reload();
     }
 });
 

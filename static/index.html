@@ -170,6 +170,134 @@
             border-radius: 6px;
             min-height: 0;
         }
+        .fl-chart-toolbar {
+            height: 38px;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 0 12px;
+            background: #141722;
+            border-bottom: 1px solid #262b38;
+            color: #c9d1dd;
+            font-size: 0.82rem;
+        }
+        .fl-chart-symbol {
+            min-width: 72px;
+            font-size: 1rem;
+            font-weight: 700;
+            color: #e2e6ee;
+        }
+        .fl-chart-period {
+            background: #1d2230;
+            color: #d6dde8;
+            border: 1px solid #333a4a;
+            border-radius: 4px;
+            padding: 4px 8px;
+            outline: none;
+            font-weight: 600;
+        }
+        .fl-chart-wrap {
+            position: relative;
+            flex: 1;
+            min-height: 0;
+            background: #11141e;
+        }
+        .fl-chart-main {
+            width: calc(100% - 48px);
+            height: 100%;
+            margin-left: 48px;
+        }
+        .fl-draw-toolbar {
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 48px;
+            z-index: 18;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+            padding-top: 14px;
+            background: #111723;
+            border-right: 1px solid #293142;
+        }
+        .fl-draw-btn {
+            width: 34px;
+            height: 34px;
+            border: 1px solid transparent;
+            border-radius: 7px;
+            background: transparent;
+            color: #8c94a6;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+        }
+        .fl-draw-btn svg {
+            width: 25px;
+            height: 25px;
+            stroke: currentColor;
+            stroke-width: 1.7;
+            fill: none;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+        .fl-draw-btn:hover,
+        .fl-draw-btn.active {
+            background: #182131;
+            border-color: #3e82da;
+            color: #d7dee9;
+            box-shadow: inset 0 0 0 1px rgba(62,130,218,0.18);
+        }
+        .fl-draw-btn[data-tool="disabled"] {
+            cursor: default;
+            opacity: 0.82;
+        }
+        .fl-draw-btn[data-tool="disabled"]:hover {
+            background: transparent;
+            border-color: transparent;
+            color: #8c94a6;
+            box-shadow: none;
+        }
+        .fl-drawing-overlay {
+            position: absolute;
+            left: 48px;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            z-index: 15;
+            pointer-events: none;
+        }
+        .fl-drawing-overlay.active {
+            cursor: crosshair;
+            pointer-events: auto;
+        }
+        .fl-chart-legend {
+            position: absolute;
+            top: 12px;
+            left: 64px;
+            z-index: 10;
+            pointer-events: none;
+            color: #dce3ee;
+            font-size: 0.92rem;
+            font-weight: 600;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+            white-space: nowrap;
+        }
+        .fl-chart-loading {
+            position: absolute;
+            inset: 0;
+            z-index: 20;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(17,20,30,0.72);
+            color: #9aa5b5;
+            font-size: 0.86rem;
+        }
 
         /* 自由人左側面板 */
         #fl-left-panel {
@@ -1716,8 +1844,44 @@
 
             <!-- [區塊 C1] K 線主圖 -->
             <div id="fl-chart" class="fl-block" style="flex:1;">
-                <div class="fl-block-header">📈 fl-chart｜K線主圖</div>
-                <div class="fl-block-body">K 線圖區塊（TradingView Lightweight Charts）</div>
+                <div class="fl-chart-toolbar">
+                    <div class="fl-chart-symbol">TX-1</div>
+                    <select id="fl-chart-period" class="fl-chart-period">
+                        <option value="1min">1分</option>
+                        <option value="5min" selected>5分</option>
+                        <option value="15min">15分</option>
+                        <option value="30min">30分</option>
+                        <option value="60min">1時</option>
+                        <option value="D">日線</option>
+                    </select>
+                    <div style="color:#858c9a;">台指期 · TFE</div>
+                </div>
+                <div class="fl-chart-wrap">
+                    <div id="fl-draw-toolbar" class="fl-draw-toolbar" aria-label="繪圖工具列">
+                        <button class="fl-draw-btn active" data-tool="cursor" title="游標">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v6M12 15v6M3 12h6M15 12h6"/><path d="M12 10.5v3M10.5 12h3"/></svg>
+                        </button>
+                        <button class="fl-draw-btn" data-tool="trendline" title="趨勢線">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 18L18 5"/><circle cx="5" cy="18" r="2.2"/><circle cx="18" cy="5" r="2.2"/></svg>
+                        </button>
+                        <button class="fl-draw-btn" data-tool="horizontal" title="水平線">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16"/></svg>
+                        </button>
+                        <button class="fl-draw-btn" data-tool="rect" title="矩形框">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="6" width="14" height="12"/><circle cx="5" cy="6" r="1.2"/><circle cx="19" cy="18" r="1.2"/></svg>
+                        </button>
+                        <button class="fl-draw-btn" data-tool="disabled" title="文字">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h12M12 5v14"/><path d="M9 19h6"/></svg>
+                        </button>
+                        <button class="fl-draw-btn" data-tool="clear" title="清除繪圖">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 15l8-8a3 3 0 0 1 4.2 0l1.8 1.8a3 3 0 0 1 0 4.2l-6 6H7l-3-3z"/><path d="M10 9l6 6"/><path d="M14 19h6"/></svg>
+                        </button>
+                    </div>
+                    <div id="fl-chart-legend" class="fl-chart-legend">載入中...</div>
+                    <div id="fl-chart-main" class="fl-chart-main"></div>
+                    <svg id="fl-drawing-overlay" class="fl-drawing-overlay"></svg>
+                    <div id="fl-chart-loading" class="fl-chart-loading">載入 K 線中...</div>
+                </div>
             </div>
 
             <!-- [區塊 C2] 成交 / 委託明細表 -->
@@ -1937,7 +2101,7 @@
     <div id="drawer-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998;" onclick="closeStockDrawer()"></div>
 
     <!-- 載入主程式 (加入版本號避免快取問題) -->
-    <script src="app_pro.js?v=amp-fix2"></script>
+    <script src="app_pro.js?v=freelancer-drawing-icons5"></script>
 </body>
 </html>
 
