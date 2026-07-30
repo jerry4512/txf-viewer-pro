@@ -1351,12 +1351,23 @@ const FREELANCER_FUTURES = Object.freeze({
 const FREELANCER_HISTORY_FLOOR = '2025-01-01';
 const FREELANCER_HISTORY_CHUNK_DAYS = 30;
 const FREELANCER_HISTORY_EDGE_THRESHOLD = 15;
+const FREELANCER_COST_LINE = Object.freeze({
+    color: '#ff9800',
+    lineWidth: 2,
+    showResetMarks: false
+});
 
 class FreelancerKChart {
     constructor() {
         this.currentPeriod = document.getElementById('fl-chart-period')?.value || '5min';
         this.chart = null;
         this.candleSeries = null;
+        this.dayCostSeries = null;
+        this.nightCostSeries = null;
+        this.costLineByTime = new Map();
+        this.costLineState = this.emptyCostLineState();
+        this.costLineSegments = [];
+        this.costResetMarkers = [];
         this.kbarsCache = [];
         this.isLoading = false;
         this.isSwitchingContract = false;
@@ -1443,6 +1454,20 @@ class FreelancerKChart {
             wickDownColor: '#dfe5ef',
             priceFormat: { type: 'price', precision: 0, minMove: 1 }
         });
+        const costLineOptions = {
+            // 原生序列只負責讓成本值參與自動縮放；實際橘線以分段 SVG
+            // 繪製，才能完全對應 Pine plot.style_linebr，不跨時段連線。
+            color: 'rgba(0,0,0,0)',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Solid,
+            lineType: LightweightCharts.LineType.Simple,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+            priceFormat: { type: 'price', precision: 1, minMove: 0.5 }
+        };
+        this.dayCostSeries = this.chart.addLineSeries(costLineOptions);
+        this.nightCostSeries = this.chart.addLineSeries(costLineOptions);
         this.startCountdownTimer();
 
         this.chart.subscribeCrosshairMove((param) => {
@@ -1603,6 +1628,208 @@ class FreelancerKChart {
     periodSeconds() {
         if (this.currentPeriod === 'D') return 86400;
         return (parseInt(this.currentPeriod, 10) || 1) * 60;
+    }
+
+    emptyCostLineState() {
+        return {
+            sessionType: 0,
+            sessionHigh: null,
+            sessionLow: null,
+            lastBarTime: null,
+            value: null
+        };
+    }
+
+    costLineResetType(time) {
+        if (this.currentPeriod === 'D') return 0;
+        const wall = new Date((Number(time) + 28800) * 1000);
+        const hour = wall.getUTCHours();
+        const minute = wall.getUTCMinutes();
+        if (hour === 8 && minute === 45) return 1;
+        if (hour === 15 && minute === 0) return 2;
+        return 0;
+    }
+
+    consumeCostLineBar(bar) {
+        const time = Number(bar?.time);
+        const high = Number(bar?.high);
+        const low = Number(bar?.low);
+        if (
+            this.currentPeriod === 'D'
+            || !Number.isFinite(time)
+            || !Number.isFinite(high)
+            || !Number.isFinite(low)
+        ) {
+            return { sessionType: 0, value: null, resetType: 0 };
+        }
+
+        const resetType = this.costLineResetType(time);
+        if (resetType !== 0) {
+            this.costLineState.sessionType = resetType;
+            this.costLineState.sessionHigh = high;
+            this.costLineState.sessionLow = low;
+        } else if (this.costLineState.sessionType !== 0) {
+            this.costLineState.sessionHigh = Math.max(
+                this.costLineState.sessionHigh,
+                high
+            );
+            this.costLineState.sessionLow = Math.min(
+                this.costLineState.sessionLow,
+                low
+            );
+        }
+
+        this.costLineState.lastBarTime = time;
+        if (this.costLineState.sessionType === 0) {
+            this.costLineState.value = null;
+            this.costLineByTime.delete(time);
+        } else {
+            this.costLineState.value = (
+                this.costLineState.sessionHigh + this.costLineState.sessionLow
+            ) / 2;
+            this.costLineByTime.set(time, this.costLineState.value);
+        }
+        return {
+            sessionType: this.costLineState.sessionType,
+            value: this.costLineState.value,
+            resetType
+        };
+    }
+
+    costResetMarker(time, resetType) {
+        if (!FREELANCER_COST_LINE.showResetMarks || resetType === 0) return null;
+        const isDay = resetType === 1;
+        return {
+            time,
+            position: 'belowBar',
+            color: isDay ? 'rgba(76,175,80,0.8)' : 'rgba(33,150,243,0.8)',
+            shape: 'arrowUp',
+            text: isDay ? '08:45 重置' : '15:00 重置'
+        };
+    }
+
+    clearCostLine() {
+        this.costLineState = this.emptyCostLineState();
+        this.costLineByTime.clear();
+        this.costLineSegments = [];
+        this.costResetMarkers = [];
+        if (this.dayCostSeries) this.dayCostSeries.setData([]);
+        if (this.nightCostSeries) this.nightCostSeries.setData([]);
+        if (this.candleSeries && FREELANCER_COST_LINE.showResetMarks) {
+            this.candleSeries.setMarkers([]);
+        }
+        this.renderDrawings();
+    }
+
+    rebuildCostLine() {
+        this.costLineState = this.emptyCostLineState();
+        this.costLineByTime.clear();
+        this.costLineSegments = [];
+        this.costResetMarkers = [];
+        const dayData = [];
+        const nightData = [];
+        let activeSegment = null;
+
+        if (this.currentPeriod !== 'D') {
+            this.kbarsCache.forEach((bar) => {
+                const point = this.consumeCostLineBar(bar);
+                if (point.resetType !== 0) {
+                    activeSegment = {
+                        sessionType: point.resetType,
+                        startTime: bar.time,
+                        points: []
+                    };
+                    this.costLineSegments.push(activeSegment);
+                }
+                if (
+                    activeSegment
+                    && activeSegment.sessionType === point.sessionType
+                    && Number.isFinite(point.value)
+                ) {
+                    activeSegment.points.push({
+                        time: bar.time,
+                        value: point.value
+                    });
+                }
+
+                if (point.sessionType === 1 && Number.isFinite(point.value)) {
+                    dayData.push({ time: bar.time, value: point.value });
+                    nightData.push({ time: bar.time });
+                } else if (point.sessionType === 2 && Number.isFinite(point.value)) {
+                    dayData.push({ time: bar.time });
+                    nightData.push({ time: bar.time, value: point.value });
+                } else {
+                    dayData.push({ time: bar.time });
+                    nightData.push({ time: bar.time });
+                }
+
+                const marker = this.costResetMarker(bar.time, point.resetType);
+                if (marker) this.costResetMarkers.push(marker);
+            });
+        }
+
+        if (this.dayCostSeries) this.dayCostSeries.setData(dayData);
+        if (this.nightCostSeries) this.nightCostSeries.setData(nightData);
+        if (this.candleSeries && FREELANCER_COST_LINE.showResetMarks) {
+            this.candleSeries.setMarkers(this.costResetMarkers);
+        }
+        this.renderDrawings();
+    }
+
+    updateCostLineForBar(bar) {
+        if (!bar || this.currentPeriod === 'D') return;
+        if (
+            this.costLineState.lastBarTime !== null
+            && Number(bar.time) < this.costLineState.lastBarTime
+        ) {
+            this.rebuildCostLine();
+            return;
+        }
+
+        const point = this.consumeCostLineBar(bar);
+        const dayPoint = point.sessionType === 1 && Number.isFinite(point.value)
+            ? { time: bar.time, value: point.value }
+            : { time: bar.time };
+        const nightPoint = point.sessionType === 2 && Number.isFinite(point.value)
+            ? { time: bar.time, value: point.value }
+            : { time: bar.time };
+        if (this.dayCostSeries) this.dayCostSeries.update(dayPoint);
+        if (this.nightCostSeries) this.nightCostSeries.update(nightPoint);
+
+        if (point.sessionType !== 0 && Number.isFinite(point.value)) {
+            let activeSegment = this.costLineSegments[this.costLineSegments.length - 1];
+            if (
+                !activeSegment
+                || activeSegment.sessionType !== point.sessionType
+                || (
+                    point.resetType !== 0
+                    && Number(activeSegment.startTime) !== Number(bar.time)
+                )
+            ) {
+                activeSegment = {
+                    sessionType: point.sessionType,
+                    startTime: bar.time,
+                    points: []
+                };
+                this.costLineSegments.push(activeSegment);
+            }
+            const lastPoint = activeSegment.points[activeSegment.points.length - 1];
+            if (lastPoint && Number(lastPoint.time) === Number(bar.time)) {
+                lastPoint.value = point.value;
+            } else {
+                activeSegment.points.push({ time: bar.time, value: point.value });
+            }
+        }
+
+        const marker = this.costResetMarker(bar.time, point.resetType);
+        if (
+            marker
+            && !this.costResetMarkers.some(item => item.time === marker.time)
+        ) {
+            this.costResetMarkers.push(marker);
+            this.candleSeries.setMarkers(this.costResetMarkers);
+        }
+        this.renderDrawings();
     }
 
     startCountdownTimer() {
@@ -1838,6 +2065,7 @@ class FreelancerKChart {
             this.loadedStartDate = rangeStart;
             this.hasMoreHistory = rangeStart > FREELANCER_HISTORY_FLOOR;
             this.candleSeries.setData(this.kbarsCache);
+            this.rebuildCostLine();
             if (visibleRange && addedCount > 0) {
                 this.chart.timeScale().setVisibleLogicalRange({
                     from: visibleRange.from + addedCount,
@@ -1887,6 +2115,7 @@ class FreelancerKChart {
         this.kbarsCache = [];
         this.lastRealtimeTickAt = 0;
         this.candleSeries.setData([]);
+        this.clearCostLine();
         this.updateLegend(null);
 
         // 後端以 1 分 K 補資料，單次維持在 Shioaji 的安全區間內。
@@ -1917,6 +2146,7 @@ class FreelancerKChart {
                 end
             );
             this.candleSeries.setData(this.kbarsCache);
+            this.rebuildCostLine();
             this.updateLegend(this.kbarsCache[this.kbarsCache.length - 1]);
             this.resize();
             if (this.kbarsCache.length > 0) {
@@ -1985,6 +2215,7 @@ class FreelancerKChart {
             const firstBar = { time: bucketT, open: price, high: price, low: price, close: price };
             this.kbarsCache.push(firstBar);
             this.candleSeries.setData(this.kbarsCache);
+            this.updateCostLineForBar(firstBar);
             this.updateLegend(firstBar);
             this.updateCountdown();
             return;
@@ -2000,6 +2231,7 @@ class FreelancerKChart {
             const newBar = { time: bucketT, open: price, high: price, low: price, close: price };
             this.kbarsCache.push(newBar);
             this.candleSeries.update(newBar);
+            this.updateCostLineForBar(newBar);
             this.updateLegend(newBar);
             this.updateCountdown();
             // 使用者正在看左側歷史時，不因新的一分鐘／五分鐘棒而跳回最右側。
@@ -2012,6 +2244,7 @@ class FreelancerKChart {
         last.high = Math.max(last.high, price);
         last.low = Math.min(last.low, price);
         this.candleSeries.update(last);
+        this.updateCostLineForBar(last);
         this.updateLegend(last);
         this.updateCountdown();
     }
@@ -2038,6 +2271,10 @@ class FreelancerKChart {
             'D': '日線'
         };
         const periodLabel = periodLabelMap[this.currentPeriod] || this.currentPeriod;
+        const costValue = this.costLineByTime.get(Number(bar.time));
+        const costLabel = Number.isFinite(costValue)
+            ? `<span style="color:${FREELANCER_COST_LINE.color}">成本=${Number.isInteger(costValue) ? costValue.toFixed(0) : costValue.toFixed(1)}</span>`
+            : '';
         legendEl.innerHTML = `
             <span style="font-size:1.05rem;color:#f0f3f8;">${instrument.name} · 全 · ${periodLabel}</span>
             <span style="display:inline-block;margin-left:18px;">開=<span style="color:${color}">${bar.open}</span></span>
@@ -2045,6 +2282,7 @@ class FreelancerKChart {
             <span>低=<span style="color:${color}">${bar.low}</span></span>
             <span>收=<span style="color:${color}">${bar.close}</span></span>
             <span style="color:${color}">${sign}${diff.toFixed(0)} (${sign}${pct.toFixed(2)}%)</span>
+            ${costLabel}
         `;
     }
 
@@ -2162,6 +2400,7 @@ class FreelancerKChart {
         const height = this.drawingOverlay.clientHeight;
         this.drawingOverlay.setAttribute('viewBox', `0 0 ${width} ${height}`);
         this.drawingOverlay.innerHTML = '';
+        this.renderCostLineSegments();
 
         [...this.drawings, this.previewDrawing].filter(Boolean).forEach(shape => {
             if (shape.type === 'horizontal') {
@@ -2186,6 +2425,74 @@ class FreelancerKChart {
                 this.addSvgLine(start.x, start.y, end.x, end.y, shape.preview);
             }
         });
+    }
+
+    renderCostLineSegments() {
+        if (
+            this.currentPeriod === 'D'
+            || !this.drawingOverlay
+            || this.costLineSegments.length === 0
+            || this.kbarsCache.length === 0
+        ) return;
+
+        const visibleRange = this.chart.timeScale().getVisibleLogicalRange();
+        let minTime = -Infinity;
+        let maxTime = Infinity;
+        if (visibleRange) {
+            const fromIndex = Math.max(
+                0,
+                Math.floor(visibleRange.from) - 2
+            );
+            const toIndex = Math.min(
+                this.kbarsCache.length - 1,
+                Math.ceil(visibleRange.to) + 2
+            );
+            minTime = Number(this.kbarsCache[fromIndex]?.time ?? -Infinity);
+            maxTime = Number(this.kbarsCache[toIndex]?.time ?? Infinity);
+        }
+
+        this.costLineSegments.forEach((segment) => {
+            const points = segment.points;
+            if (
+                points.length < 2
+                || Number(points[points.length - 1].time) < minTime
+                || Number(points[0].time) > maxTime
+            ) return;
+
+            let startIndex = points.findIndex(point => Number(point.time) >= minTime);
+            if (startIndex < 0) return;
+            startIndex = Math.max(0, startIndex - 1);
+            const coordinates = [];
+            for (let index = startIndex; index < points.length; index += 1) {
+                const point = points[index];
+                const x = this.chart.timeScale().timeToCoordinate(point.time);
+                const y = this.candleSeries.priceToCoordinate(point.value);
+                if (x !== null && y !== null && Number.isFinite(x) && Number.isFinite(y)) {
+                    coordinates.push({ x, y });
+                }
+                if (Number(point.time) > maxTime) break;
+            }
+            if (coordinates.length >= 2) this.addSvgCostPolyline(coordinates);
+        });
+    }
+
+    addSvgCostPolyline(points) {
+        const polyline = document.createElementNS(
+            'http://www.w3.org/2000/svg',
+            'polyline'
+        );
+        polyline.setAttribute(
+            'points',
+            points.map(point => `${point.x},${point.y}`).join(' ')
+        );
+        polyline.setAttribute('fill', 'none');
+        polyline.setAttribute('stroke', FREELANCER_COST_LINE.color);
+        polyline.setAttribute('stroke-width', FREELANCER_COST_LINE.lineWidth);
+        polyline.setAttribute('stroke-linecap', 'round');
+        polyline.setAttribute('stroke-linejoin', 'round');
+        polyline.setAttribute('vector-effect', 'non-scaling-stroke');
+        polyline.setAttribute('data-indicator', 'freelancer-cost-line');
+        this.drawingOverlay.appendChild(polyline);
     }
 
     addSvgLine(x1, y1, x2, y2, preview = false) {
