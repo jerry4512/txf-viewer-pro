@@ -171,31 +171,180 @@
             min-height: 0;
         }
         .fl-chart-toolbar {
-            height: 38px;
+            min-height: 50px;
+            box-sizing: border-box;
             flex-shrink: 0;
             display: flex;
             align-items: center;
-            gap: 12px;
-            padding: 0 12px;
-            background: #141722;
-            border-bottom: 1px solid #262b38;
+            gap: 10px;
+            padding: 7px 12px;
+            background:
+                linear-gradient(180deg, rgba(28, 33, 46, 0.98), rgba(18, 22, 32, 0.98));
+            border-bottom: 1px solid #2b3242;
             color: #c9d1dd;
             font-size: 0.82rem;
+            box-shadow: inset 0 -1px 0 rgba(255,255,255,0.018);
+        }
+        .fl-chart-instrument {
+            height: 34px;
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 0 10px;
+            border: 1px solid #30394b;
+            border-radius: 9px;
+            background: rgba(9, 13, 21, 0.72);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.035);
+            flex-shrink: 0;
         }
         .fl-chart-symbol {
-            min-width: 72px;
-            font-size: 1rem;
-            font-weight: 700;
-            color: #e2e6ee;
+            min-width: 34px;
+            font-size: 0.94rem;
+            line-height: 1;
+            letter-spacing: 0.04em;
+            font-weight: 800;
+            color: #f1f5fb;
+        }
+        .fl-chart-contract-kind {
+            color: #778196;
+            font-size: 0.66rem;
+            letter-spacing: 0.08em;
+            white-space: nowrap;
+        }
+        .fl-product-switch {
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            padding: 3px;
+            border: 1px solid #30384a;
+            border-radius: 10px;
+            background: rgba(8, 11, 18, 0.72);
+            flex-shrink: 0;
+        }
+        .fl-product-btn {
+            position: relative;
+            height: 28px;
+            min-width: 58px;
+            padding: 0 10px;
+            border: 1px solid transparent;
+            border-radius: 7px;
+            background: transparent;
+            color: #8791a4;
+            font-family: inherit;
+            font-size: 0.73rem;
+            font-weight: 650;
+            cursor: pointer;
+            transition:
+                color 0.16s ease,
+                background 0.16s ease,
+                border-color 0.16s ease,
+                box-shadow 0.16s ease;
+            white-space: nowrap;
+        }
+        .fl-product-btn:hover:not(:disabled) {
+            color: #dfe7f3;
+            background: rgba(255,255,255,0.045);
+        }
+        .fl-product-btn.active {
+            color: #eef7ff;
+            background: linear-gradient(180deg, rgba(61, 128, 205, 0.32), rgba(42, 93, 155, 0.24));
+            border-color: rgba(83, 161, 255, 0.48);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.08),
+                0 0 0 1px rgba(26, 99, 180, 0.08);
+        }
+        .fl-product-btn.active::before {
+            content: "";
+            position: absolute;
+            left: 50%;
+            bottom: -4px;
+            width: 16px;
+            height: 2px;
+            border-radius: 2px;
+            background: #55a8ff;
+            box-shadow: 0 0 7px rgba(85,168,255,0.72);
+            transform: translateX(-50%);
+        }
+        .fl-product-btn:disabled {
+            cursor: wait;
+            opacity: 0.62;
+        }
+        .fl-chart-toolbar-spacer {
+            flex: 1;
+            min-width: 6px;
+        }
+        .fl-chart-period-control {
+            height: 34px;
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 0 4px 0 10px;
+            border: 1px solid #30394b;
+            border-radius: 9px;
+            background: rgba(9, 13, 21, 0.7);
+            color: #707b8f;
+            font-size: 0.65rem;
+            letter-spacing: 0.08em;
+            white-space: nowrap;
+            flex-shrink: 0;
         }
         .fl-chart-period {
-            background: #1d2230;
-            color: #d6dde8;
-            border: 1px solid #333a4a;
-            border-radius: 4px;
-            padding: 4px 8px;
+            height: 26px;
+            min-width: 66px;
+            background: #202738;
+            color: #e5ebf4;
+            border: 1px solid #374158;
+            border-radius: 6px;
+            padding: 0 24px 0 8px;
             outline: none;
-            font-weight: 600;
+            font-family: inherit;
+            font-size: 0.73rem;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .fl-chart-period:hover,
+        .fl-chart-period:focus {
+            border-color: #4d77a8;
+        }
+        .fl-chart-market-label {
+            height: 34px;
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 0 10px;
+            border: 1px solid #2b3445;
+            border-radius: 9px;
+            background: rgba(9, 13, 21, 0.54);
+            color: #818b9e;
+            font-size: 0.69rem;
+            font-weight: 650;
+            white-space: nowrap;
+            flex-shrink: 0;
+            transition: color 0.16s ease, border-color 0.16s ease;
+        }
+        .fl-chart-market-label.switching {
+            color: #ffd166;
+            border-color: rgba(255, 209, 102, 0.38);
+        }
+        .fl-chart-market-label.error {
+            color: #ff7777;
+            border-color: rgba(255, 91, 91, 0.42);
+        }
+        .fl-market-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #32d583;
+            box-shadow: 0 0 8px rgba(50,213,131,0.62);
+            flex-shrink: 0;
+        }
+        .fl-chart-market-label.switching .fl-market-dot {
+            background: #ffd166;
+            box-shadow: 0 0 8px rgba(255,209,102,0.62);
+        }
+        .fl-chart-market-label.error .fl-market-dot {
+            background: #ff5b5b;
+            box-shadow: 0 0 8px rgba(255,91,91,0.62);
         }
         .fl-chart-wrap {
             position: relative;
@@ -287,6 +436,27 @@
             text-shadow: 0 1px 2px rgba(0,0,0,0.8);
             white-space: nowrap;
         }
+        .fl-chart-countdown {
+            position: absolute;
+            z-index: 16;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            box-sizing: border-box;
+            height: 24px;
+            padding: 0 4px;
+            border-top: 1px solid rgba(255,255,255,0.9);
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, Ubuntu, sans-serif;
+            font-size: 13px;
+            font-weight: 500;
+            line-height: 1;
+            font-variant-numeric: tabular-nums;
+            pointer-events: none;
+        }
+        .fl-chart-countdown.visible {
+            display: flex;
+        }
         .fl-chart-loading {
             position: absolute;
             inset: 0;
@@ -297,6 +467,186 @@
             background: rgba(17,20,30,0.72);
             color: #9aa5b5;
             font-size: 0.86rem;
+        }
+        .fl-chart-history-status {
+            position: absolute;
+            left: 64px;
+            bottom: 34px;
+            z-index: 17;
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            max-width: calc(100% - 150px);
+            padding: 6px 10px;
+            border: 1px solid #35445a;
+            border-radius: 8px;
+            background: rgba(10, 15, 24, 0.92);
+            color: #91a0b5;
+            font-size: 0.7rem;
+            font-weight: 650;
+            box-shadow: 0 5px 18px rgba(0,0,0,0.28);
+            backdrop-filter: blur(6px);
+            pointer-events: none;
+            opacity: 0;
+            transform: translateY(4px);
+            transition: opacity 0.18s ease, transform 0.18s ease;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .fl-chart-history-status.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        .fl-chart-history-status::before {
+            content: "";
+            width: 6px;
+            height: 6px;
+            flex-shrink: 0;
+            border-radius: 50%;
+            background: #7692b8;
+            box-shadow: 0 0 7px rgba(118,146,184,0.52);
+        }
+        .fl-chart-history-status.loading {
+            color: #9cc9ff;
+            border-color: rgba(85,168,255,0.38);
+        }
+        .fl-chart-history-status.loading::before {
+            background: #55a8ff;
+            box-shadow: 0 0 8px rgba(85,168,255,0.72);
+            animation: loading-fadePulse 1s ease-in-out infinite;
+        }
+        .fl-chart-history-status.complete {
+            color: #8edfb8;
+            border-color: rgba(50,213,131,0.34);
+        }
+        .fl-chart-history-status.complete::before {
+            background: #32d583;
+            box-shadow: 0 0 8px rgba(50,213,131,0.62);
+        }
+        .fl-chart-history-status.warning {
+            color: #ffd68a;
+            border-color: rgba(255,209,102,0.36);
+        }
+        .fl-chart-history-status.warning::before {
+            background: #ffd166;
+            box-shadow: 0 0 8px rgba(255,209,102,0.58);
+        }
+        .fl-chart-history-status.error {
+            color: #ff8c8c;
+            border-color: rgba(255,91,91,0.4);
+        }
+        .fl-chart-history-status.error::before {
+            background: #ff5b5b;
+            box-shadow: 0 0 8px rgba(255,91,91,0.58);
+        }
+        .fl-weighted-stocks {
+            flex: 0 0 282px;
+            min-height: 220px;
+        }
+        .fl-weighted-grid {
+            flex: 1;
+            min-height: 0;
+            display: grid;
+            grid-template-columns: repeat(4, minmax(150px, 1fr));
+            gap: 6px;
+            padding: 6px;
+            background: #0d0f14;
+        }
+        .fl-weighted-card {
+            min-width: 0;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+            background: #050505;
+            border: 1px solid #262626;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .fl-weighted-card-head {
+            height: 28px;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 0 8px;
+            background: #141414;
+            border-bottom: 1px solid #242424;
+            font-size: 0.76rem;
+            color: #d8dde6;
+            font-weight: 700;
+        }
+        .fl-weighted-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .fl-weighted-value {
+            flex-shrink: 0;
+            font-family: monospace;
+            font-size: 0.74rem;
+            color: #8d96a6;
+        }
+        .fl-weighted-chart {
+            flex: 1;
+            min-height: 0;
+            position: relative;
+        }
+        @media (max-width: 1280px) {
+            .fl-weighted-stocks {
+                flex-basis: 360px;
+            }
+            .fl-weighted-grid {
+                grid-template-columns: repeat(2, minmax(180px, 1fr));
+            }
+        }
+        @media (max-width: 900px) {
+            #freelancer-container {
+                flex-direction: column !important;
+                overflow-y: auto !important;
+            }
+            #fl-left-panel,
+            #fl-right-panel {
+                width: 100% !important;
+                max-width: none !important;
+            }
+            .fl-weighted-stocks {
+                flex-basis: 520px;
+            }
+            .fl-weighted-grid {
+                grid-template-columns: 1fr;
+            }
+            .fl-chart-toolbar {
+                flex-wrap: wrap;
+            }
+            .fl-chart-toolbar-spacer {
+                display: none;
+            }
+            .fl-chart-market-label {
+                margin-left: auto;
+            }
+        }
+        @media (max-width: 620px) {
+            .fl-chart-toolbar {
+                gap: 6px;
+                padding: 7px 8px;
+            }
+            .fl-chart-instrument {
+                display: none;
+            }
+            .fl-product-switch {
+                flex: 1;
+            }
+            .fl-product-btn {
+                flex: 1;
+                min-width: 0;
+                padding: 0 7px;
+            }
+            .fl-chart-period-control > span,
+            .fl-chart-market-label {
+                display: none;
+            }
         }
 
         /* 自由人左側面板 */
@@ -322,6 +672,9 @@
             justify-content: space-between;
             align-items: center;
             padding: 4px 12px;
+        }
+        .fl-amp-row.today {
+            background: #5b4116 !important;
         }
         .fl-txf-tab-btn {
             flex: 1;
@@ -1810,27 +2163,27 @@
                 <div style="background:#0d0a14; font-size:0.78rem;">
                     <div class="fl-amp-row" style="border-bottom:1px solid #160f22;">
                         <span style="color:#888;">最大震幅</span>
-                        <span id="fl-amp-max" style="color:#ff6b6b; font-family:monospace; font-weight:500;">--</span>
+                        <span id="fl-amp-max" style="color:#fff; font-family:monospace; font-weight:500;">--</span>
                     </div>
                     <div class="fl-amp-row" style="border-bottom:1px solid #160f22;">
                         <span style="color:#888;">大大震幅</span>
-                        <span id="fl-amp-large" style="color:#ff9f43; font-family:monospace; font-weight:500;">--</span>
+                        <span id="fl-amp-large" style="color:#fff; font-family:monospace; font-weight:500;">--</span>
                     </div>
                     <div class="fl-amp-row" style="border-bottom:1px solid #160f22;">
-                        <span style="color:#888;">平均震幅</span>
-                        <span id="fl-amp-avg" style="color:#ddd; font-family:monospace; font-weight:500;">--</span>
+                        <span style="color:#888;">平均振幅（含本日）</span>
+                        <span id="fl-amp-avg" style="color:#fff; font-family:monospace; font-weight:500;">--</span>
                     </div>
                     <div class="fl-amp-row" style="border-bottom:1px solid #160f22;">
                         <span style="color:#888;">小小震幅</span>
-                        <span id="fl-amp-small" style="color:#4facfe; font-family:monospace; font-weight:500;">--</span>
+                        <span id="fl-amp-small" style="color:#fff; font-family:monospace; font-weight:500;">--</span>
                     </div>
                     <div class="fl-amp-row" style="border-bottom:1px solid #160f22;">
                         <span style="color:#888;">最小震幅</span>
-                        <span id="fl-amp-min" style="color:#26de81; font-family:monospace; font-weight:500;">--</span>
+                        <span id="fl-amp-min" style="color:#fff; font-family:monospace; font-weight:500;">--</span>
                     </div>
-                    <div class="fl-amp-row" style="background:#1a1520;">
-                        <span class="fl-amp-today-label" style="color:#ccc; font-weight:bold;">本日震幅</span>
-                        <span id="fl-amp-today" style="color:#ffd233; font-family:monospace; font-weight:bold;">--</span>
+                    <div class="fl-amp-row today">
+                        <span class="fl-amp-today-label" style="color:#ccc; font-weight:bold;">本日震幅（即時）</span>
+                        <span id="fl-amp-today" style="color:#fff; font-family:monospace; font-weight:bold;">--</span>
                     </div>
                 </div>
             </div><!-- /fl-amplitude-section -->
@@ -1845,16 +2198,31 @@
             <!-- [區塊 C1] K 線主圖 -->
             <div id="fl-chart" class="fl-block" style="flex:1;">
                 <div class="fl-chart-toolbar">
-                    <div class="fl-chart-symbol">TX-1</div>
-                    <select id="fl-chart-period" class="fl-chart-period">
-                        <option value="1min">1分</option>
-                        <option value="5min" selected>5分</option>
-                        <option value="15min">15分</option>
-                        <option value="30min">30分</option>
-                        <option value="60min">1時</option>
-                        <option value="D">日線</option>
-                    </select>
-                    <div style="color:#858c9a;">台指期 · TFE</div>
+                    <div class="fl-chart-instrument" aria-label="目前商品">
+                        <span id="fl-chart-symbol" class="fl-chart-symbol">TXF</span>
+                        <span class="fl-chart-contract-kind">近月</span>
+                    </div>
+                    <div id="fl-chart-products" class="fl-product-switch" role="group" aria-label="切換期貨商品">
+                        <button type="button" class="fl-product-btn active" data-symbol="TXFR1" aria-pressed="true">台指期</button>
+                        <button type="button" class="fl-product-btn" data-symbol="MXFR1" aria-pressed="false">小台</button>
+                        <button type="button" class="fl-product-btn" data-symbol="TMFR1" aria-pressed="false">微型台指</button>
+                    </div>
+                    <div class="fl-chart-toolbar-spacer"></div>
+                    <label class="fl-chart-period-control">
+                        <span>週期</span>
+                        <select id="fl-chart-period" class="fl-chart-period" aria-label="K 線週期">
+                            <option value="1min">1 分</option>
+                            <option value="5min" selected>5 分</option>
+                            <option value="15min">15 分</option>
+                            <option value="30min">30 分</option>
+                            <option value="60min">1 小時</option>
+                            <option value="D">日線</option>
+                        </select>
+                    </label>
+                    <div id="fl-chart-market-label" class="fl-chart-market-label" aria-live="polite">
+                        <span class="fl-market-dot" aria-hidden="true"></span>
+                        <span id="fl-chart-market-text">期交所即時</span>
+                    </div>
                 </div>
                 <div class="fl-chart-wrap">
                     <div id="fl-draw-toolbar" class="fl-draw-toolbar" aria-label="繪圖工具列">
@@ -1879,21 +2247,46 @@
                     </div>
                     <div id="fl-chart-legend" class="fl-chart-legend">載入中...</div>
                     <div id="fl-chart-main" class="fl-chart-main"></div>
+                    <div id="fl-chart-countdown" class="fl-chart-countdown" aria-label="本根 K 棒倒數"></div>
                     <svg id="fl-drawing-overlay" class="fl-drawing-overlay"></svg>
+                    <div id="fl-chart-history-status" class="fl-chart-history-status" aria-live="polite"></div>
                     <div id="fl-chart-loading" class="fl-chart-loading">載入 K 線中...</div>
                 </div>
             </div>
 
-            <!-- [區塊 C2] 成交 / 委託明細表 -->
-            <div id="fl-trade-list" class="fl-block" style="flex:0 0 200px;">
-                <div class="fl-block-header">📄 fl-trade-list｜成交委託明細</div>
-                <div class="fl-block-body">成交 / 委託明細表區塊</div>
-            </div>
-
-            <!-- [區塊 C3] 技術指標列（底部，例如 MACD / 籌碼） -->
-            <div id="fl-indicator-bar" class="fl-block" style="flex:0 0 75px;">
-                <div class="fl-block-header">📊 fl-indicator-bar｜技術指標列</div>
-                <div class="fl-block-body">技術指標列區塊（MACD / 籌碼等）</div>
+            <!-- [區塊 C2] 四大權值股：日內走勢 + 均價線 -->
+            <div id="fl-weighted-stocks" class="fl-block fl-weighted-stocks">
+                <div class="fl-block-header">四大權值股</div>
+                <div class="fl-weighted-grid">
+                    <div class="fl-weighted-card" data-code="2330">
+                        <div class="fl-weighted-card-head">
+                            <span class="fl-weighted-name">台積電</span>
+                            <span id="fl-weighted-value-2330" class="fl-weighted-value">--</span>
+                        </div>
+                        <div id="fl-weighted-chart-2330" class="fl-weighted-chart"></div>
+                    </div>
+                    <div class="fl-weighted-card" data-code="2454">
+                        <div class="fl-weighted-card-head">
+                            <span class="fl-weighted-name">聯發科</span>
+                            <span id="fl-weighted-value-2454" class="fl-weighted-value">--</span>
+                        </div>
+                        <div id="fl-weighted-chart-2454" class="fl-weighted-chart"></div>
+                    </div>
+                    <div class="fl-weighted-card" data-code="2317">
+                        <div class="fl-weighted-card-head">
+                            <span class="fl-weighted-name">鴻海</span>
+                            <span id="fl-weighted-value-2317" class="fl-weighted-value">--</span>
+                        </div>
+                        <div id="fl-weighted-chart-2317" class="fl-weighted-chart"></div>
+                    </div>
+                    <div class="fl-weighted-card" data-code="2308">
+                        <div class="fl-weighted-card-head">
+                            <span class="fl-weighted-name">台達電</span>
+                            <span id="fl-weighted-value-2308" class="fl-weighted-value">--</span>
+                        </div>
+                        <div id="fl-weighted-chart-2308" class="fl-weighted-chart"></div>
+                    </div>
+                </div>
             </div>
 
         </div><!-- /#fl-center-panel -->
@@ -2101,7 +2494,7 @@
     <div id="drawer-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998;" onclick="closeStockDrawer()"></div>
 
     <!-- 載入主程式 (加入版本號避免快取問題) -->
-    <script src="app_pro.js?v=freelancer-drawing-icons5"></script>
+    <script src="app_pro.js?v=kbar-countdown-style-v16"></script>
 </body>
 </html>
 

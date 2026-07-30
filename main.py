@@ -2,8 +2,10 @@ import os
 import json
 import html as _html_mod
 import asyncio
+import calendar
 import sqlite3
 import threading
+import time
 import urllib.request
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -73,6 +75,8 @@ is_logged_in = False
 contract = None
 main_loop = None
 _kbars_lock = asyncio.Lock()  # Shioaji kbars 不支援並發，全局序列化
+_kbars_retry_after: dict[tuple[str, str], float] = {}
+_kbars_retry_lock = threading.Lock()
 _HISTORY_START = datetime(2025, 1, 1)  # 歷史補取目標起點
 
 # 即時 bar 累積（每 1 min flush 進 SQLite，讓歷史圖不需重啟就有今日資料）
@@ -80,14 +84,643 @@ _rt_bar: dict = {}
 _rt_bar_lock = threading.Lock()
 _rt_contract_code: str = None  # 已解析的月份合約代碼，例如 TXFE6
 
+_quote_state_lock = threading.Lock()
+_last_tick_monotonic = 0.0
+_last_tick_received_at = 0
+_last_tick_exchange_time = 0
+_last_tick_code = None
+_quote_tick_count = 0
+_quote_tick_count_since_log = 0
+_quote_log_monotonic = 0.0
+_quote_subscription_status = "idle"
+_quote_event_detail = ""
+
+_WEIGHTED_STOCK_DEFS = (
+    ("2330", "台積電"),
+    ("2454", "聯發科"),
+    ("2317", "鴻海"),
+    ("2308", "台達電"),
+)
+_WEIGHTED_STOCK_CODES = {code for code, _ in _WEIGHTED_STOCK_DEFS}
+_weighted_stock_state_lock = threading.Lock()
+_weighted_stock_contracts = {}
+_weighted_stock_stream_state = {}
+_contract_info_lock = threading.Lock()
+_contract_info_cache = {}
+
 last_snapshot_cache = {
     "open": 0,
     "high": 0,
     "low": 0,
     "close": 0,
     "volume": 0,
-    "reference": 0
+    "total_volume": 0,
+    "reference": 0,
+    "time": None,
+    "code": None,
+    "source": "none",
 }
+
+
+def _quote_scalar(value):
+    """Normalize Shioaji v1 scalars and legacy one-element list payloads."""
+    while isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        value = value[-1]
+    return value
+
+
+def _quote_field(quote, *names, default=None):
+    if isinstance(quote, dict):
+        lower_map = {str(k).lower(): v for k, v in quote.items()}
+        for name in names:
+            if name in quote:
+                return _quote_scalar(quote[name])
+            lowered = name.lower()
+            if lowered in lower_map:
+                return _quote_scalar(lower_map[lowered])
+        return default
+    for name in names:
+        if hasattr(quote, name):
+            return _quote_scalar(getattr(quote, name))
+    return default
+
+
+def _quote_timestamp(quote) -> int:
+    """Return the exchange event time as real UTC epoch seconds."""
+    value = _quote_field(quote, "datetime", "ts")
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric > 1e17:       # nanoseconds
+            numeric /= 1e9
+        elif numeric > 1e14:     # microseconds
+            numeric /= 1e6
+        elif numeric > 1e11:     # milliseconds
+            numeric /= 1e3
+        if numeric > 0:
+            return int(numeric)
+    if isinstance(value, str) and ("-" in value or "T" in value):
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            pass
+    return int(time.time())
+
+
+def _new_weighted_stock_state(code: str, name: str) -> dict:
+    return {
+        "code": code,
+        "name": name,
+        "contract": None,
+        "tick_subscription": "idle",
+        "kbar_subscription": "idle",
+        "last_tick_received_at": 0,
+        "last_tick_exchange_time": 0,
+        "last_kbar_received_at": 0,
+        "last_kbar_exchange_time": 0,
+        "tick_count": 0,
+        "kbar_count": 0,
+        "last": 0.0,
+        "avg": 0.0,
+        "open": 0.0,
+        "reference": 0.0,
+        "error": None,
+    }
+
+
+def _reset_weighted_stock_stream_state():
+    global _weighted_stock_contracts, _weighted_stock_stream_state
+    with _weighted_stock_state_lock:
+        _weighted_stock_contracts = {}
+        _weighted_stock_stream_state = {
+            code: _new_weighted_stock_state(code, name)
+            for code, name in _WEIGHTED_STOCK_DEFS
+        }
+
+
+_reset_weighted_stock_stream_state()
+
+
+def _weighted_stock_health_data() -> dict:
+    now = int(time.time())
+    with _weighted_stock_state_lock:
+        stocks = []
+        for code, name in _WEIGHTED_STOCK_DEFS:
+            state = dict(
+                _weighted_stock_stream_state.get(code)
+                or _new_weighted_stock_state(code, name)
+            )
+            tick_at = safe_int(state.get("last_tick_received_at"), 0)
+            kbar_at = safe_int(state.get("last_kbar_received_at"), 0)
+            state["last_tick_age"] = now - tick_at if tick_at else None
+            state["last_kbar_age"] = now - kbar_at if kbar_at else None
+            stocks.append(state)
+    return {
+        "logged_in": is_logged_in,
+        "shioaji_version": getattr(sj, "__version__", "unknown"),
+        "kbar_callback_available": hasattr(api, "set_on_kbar_callback"),
+        "stocks": stocks,
+    }
+
+
+def _stream_callback_broadcast(message_type: str, payload: dict):
+    if not main_loop:
+        return
+    asyncio.run_coroutine_threadsafe(
+        manager.broadcast(json.dumps({"type": message_type, "data": payload})),
+        main_loop,
+    )
+
+
+def _weighted_kbar_timestamp(kbar) -> int:
+    """Convert Shioaji's Taiwan wall-clock KBar date/time to real UTC epoch."""
+    date_value = _quote_field(kbar, "date", "Date")
+    time_value = _quote_field(kbar, "time", "Time")
+    if date_value is not None and time_value is not None:
+        date_text = (
+            date_value.strftime("%Y-%m-%d")
+            if hasattr(date_value, "strftime")
+            else str(date_value)
+        )
+        time_text = (
+            time_value.strftime("%H:%M:%S.%f")
+            if hasattr(time_value, "strftime")
+            else str(time_value)
+        )
+        try:
+            local_dt = datetime.fromisoformat(
+                f"{date_text.replace('/', '-')}T{time_text}"
+            )
+            return int(calendar.timegm(local_dt.timetuple()) - 28800)
+        except (TypeError, ValueError):
+            pass
+    return _quote_timestamp(kbar)
+
+
+def _handle_weighted_stock_tick(quote):
+    code = str(_quote_field(quote, "code", "Code") or "")
+    if code not in _WEIGHTED_STOCK_CODES:
+        return
+    price = safe_float(_quote_field(quote, "close", "Close", "price", "Price"), 0)
+    if price <= 0:
+        return
+
+    event_time = _quote_timestamp(quote)
+    received_at = int(time.time())
+    tick_volume = max(0, safe_int(_quote_field(quote, "volume", "Volume"), 0))
+    total_volume = max(
+        0, safe_int(_quote_field(quote, "total_volume", "TotalVolume"), 0)
+    )
+    avg_price = safe_float(_quote_field(quote, "avg_price", "AvgPrice"), 0)
+    open_price = safe_float(_quote_field(quote, "open", "Open"), 0)
+    reference = safe_float(
+        _quote_field(quote, "reference", "Reference", "yesterday_price"), 0
+    )
+
+    with _weighted_stock_state_lock:
+        state = _weighted_stock_stream_state.setdefault(
+            code,
+            _new_weighted_stock_state(
+                code, dict(_WEIGHTED_STOCK_DEFS).get(code, code)
+            ),
+        )
+        if reference <= 0:
+            reference = safe_float(state.get("reference"), 0)
+        if open_price <= 0:
+            open_price = safe_float(state.get("open"), 0) or price
+        if avg_price <= 0:
+            avg_price = safe_float(state.get("avg"), 0) or price
+        state.update({
+            "tick_subscription": "live",
+            "last_tick_received_at": received_at,
+            "last_tick_exchange_time": event_time,
+            "tick_count": safe_int(state.get("tick_count"), 0) + 1,
+            "last": price,
+            "avg": avg_price,
+            "open": open_price,
+            "reference": reference,
+            "error": None,
+        })
+
+    change = price - reference if reference else 0
+    _stream_callback_broadcast("weighted_stock_tick", {
+        "code": code,
+        "time": event_time,
+        "price": price,
+        "avg": avg_price,
+        "open": open_price,
+        "reference": reference,
+        "change": change,
+        "change_pct": (change / reference * 100) if reference else 0,
+        "tick_volume": tick_volume,
+        "total_volume": total_volume,
+        "source": "shioaji_tick",
+    })
+
+
+def weighted_stock_kbar_callback(*args):
+    """Receive Shioaji 1.7.1 server-side realtime one-minute stock KBars."""
+    try:
+        if not args:
+            return
+        kbar = args[-1]
+        code = str(_quote_field(kbar, "code", "Code") or "")
+        if code not in _WEIGHTED_STOCK_CODES:
+            return
+
+        close_price = safe_float(_quote_field(kbar, "close", "Close"), 0)
+        if close_price <= 0:
+            return
+        event_time = _weighted_kbar_timestamp(kbar)
+        received_at = int(time.time())
+        open_price = safe_float(_quote_field(kbar, "open", "Open"), close_price)
+        volume = max(0, safe_int(_quote_field(kbar, "volume", "Volume"), 0))
+        amount = max(0.0, safe_float(_quote_field(kbar, "amount", "Amount"), 0))
+
+        with _weighted_stock_state_lock:
+            state = _weighted_stock_stream_state.setdefault(
+                code,
+                _new_weighted_stock_state(
+                    code, dict(_WEIGHTED_STOCK_DEFS).get(code, code)
+                ),
+            )
+            reference = safe_float(state.get("reference"), 0)
+            avg_price = safe_float(state.get("avg"), 0) or close_price
+            state.update({
+                "kbar_subscription": "live",
+                "last_kbar_received_at": received_at,
+                "last_kbar_exchange_time": event_time,
+                "kbar_count": safe_int(state.get("kbar_count"), 0) + 1,
+                "last": close_price,
+                "open": safe_float(state.get("open"), 0) or open_price,
+                "error": None,
+            })
+
+        change = close_price - reference if reference else 0
+        _stream_callback_broadcast("weighted_stock_kbar", {
+            "code": code,
+            "time": event_time,
+            "open": open_price,
+            "high": safe_float(_quote_field(kbar, "high", "High"), close_price),
+            "low": safe_float(_quote_field(kbar, "low", "Low"), close_price),
+            "close": close_price,
+            "avg": avg_price,
+            "volume": volume,
+            "amount": amount,
+            "tick_count": max(
+                0, safe_int(_quote_field(kbar, "tick_count", "TickCount"), 0)
+            ),
+            "reference": reference,
+            "change": change,
+            "change_pct": (change / reference * 100) if reference else 0,
+            "source": "shioaji_kbar",
+        })
+    except Exception as exc:
+        print(f"[WEIGHTED_KBAR] 即時 K 棒處理異常: {exc}")
+
+
+def _contract_reference(contract_obj=None) -> float:
+    contract_obj = contract_obj or contract
+    if not contract_obj:
+        return 0.0
+    direct_reference = safe_float(getattr(contract_obj, "reference", 0.0), 0.0)
+    if direct_reference > 0:
+        return direct_reference
+    code = str(getattr(contract_obj, "code", "") or "")
+    with _contract_info_lock:
+        info = _contract_info_cache.get(code)
+    return safe_float(getattr(info, "reference", 0.0), 0.0) if info else 0.0
+
+
+def _resolve_market_contract(api_instance, code: str):
+    """Resolve through Shioaji 1.7's maintained lowercase contract API."""
+    if not api_instance or not code:
+        return None
+    code = str(code).strip().upper()
+    contracts_api = getattr(api_instance, "contracts", None)
+    if contracts_api and hasattr(contracts_api, "get"):
+        try:
+            resolved = contracts_api.get(code)
+            if resolved:
+                try:
+                    info = contracts_api.info(resolved)
+                    with _contract_info_lock:
+                        _contract_info_cache[code] = info
+                except Exception:
+                    pass
+                return resolved
+        except Exception:
+            pass
+
+    # Only for older SDK compatibility. Shioaji 1.7 keeps this API working but
+    # no longer maintains it.
+    try:
+        if code.isdigit():
+            return api_instance.Contracts.Stocks[code]
+        root = code[:3]
+        futures_root = getattr(api_instance.Contracts.Futures, root, None)
+        if futures_root:
+            return futures_root[code]
+    except Exception:
+        pass
+    return None
+
+
+def _reset_quote_state(contract_obj=None):
+    global _last_tick_monotonic, _last_tick_received_at, _last_tick_exchange_time
+    global _last_tick_code, _quote_tick_count, _quote_tick_count_since_log
+    global _quote_log_monotonic, _quote_subscription_status, _quote_event_detail
+
+    code = getattr(contract_obj, "code", None) if contract_obj else None
+    reference = _contract_reference(contract_obj)
+    with _quote_state_lock:
+        _last_tick_monotonic = 0.0
+        _last_tick_received_at = 0
+        _last_tick_exchange_time = 0
+        _last_tick_code = None
+        _quote_tick_count = 0
+        _quote_tick_count_since_log = 0
+        _quote_log_monotonic = 0.0
+        _quote_subscription_status = "subscribing" if contract_obj else "idle"
+        _quote_event_detail = ""
+        last_snapshot_cache.clear()
+        last_snapshot_cache.update({
+            "open": 0,
+            "high": 0,
+            "low": 0,
+            "close": 0,
+            "volume": 0,
+            "total_volume": 0,
+            "reference": reference,
+            "time": None,
+            "code": code,
+            "source": "none",
+        })
+
+
+def _selected_quote_codes() -> set:
+    if not contract:
+        return set()
+    values = {
+        getattr(contract, "code", None),
+        getattr(contract, "target_code", None),
+        getattr(contract, "symbol", None),
+    }
+    return {str(v) for v in values if v}
+
+
+def _quote_matches_selected_contract(quote) -> bool:
+    tick_code = _quote_field(quote, "code", "Code")
+    if not tick_code or not contract:
+        return True
+    tick_code = str(tick_code)
+    selected_codes = _selected_quote_codes()
+    if tick_code in selected_codes:
+        return True
+    selected_code = str(getattr(contract, "code", ""))
+    # TXFR1/MXFR1/TMFR1 callbacks use the resolved monthly target code.
+    if selected_code.endswith(("R1", "R2")):
+        return tick_code.startswith(selected_code[:-2])
+    return False
+
+
+def _update_snapshot_cache(quote, price: float, event_time: int, source: str) -> dict:
+    """Update the UI snapshot from authoritative streaming/snapshot fields."""
+    tick_volume = max(0, safe_int(_quote_field(quote, "volume", "Volume"), 0))
+    total_volume_value = _quote_field(quote, "total_volume", "VolSum")
+    total_volume = max(0, safe_int(total_volume_value, 0))
+
+    open_value = safe_float(_quote_field(quote, "open", "Open"), 0.0)
+    high_value = safe_float(_quote_field(quote, "high", "High"), 0.0)
+    low_value = safe_float(_quote_field(quote, "low", "Low"), 0.0)
+    change_value = _quote_field(quote, "price_chg", "change_price")
+    reference = _contract_reference()
+    if reference <= 0 and change_value is not None:
+        reference = price - safe_float(change_value, 0.0)
+
+    code = _quote_field(quote, "code", "Code") or getattr(contract, "code", None)
+    with _quote_state_lock:
+        previous = last_snapshot_cache
+        previous_open = safe_float(previous.get("open"), 0.0)
+        previous_high = safe_float(previous.get("high"), 0.0)
+        previous_low = safe_float(previous.get("low"), 0.0)
+        previous_total = safe_int(previous.get("total_volume"), 0)
+        previous_reference = safe_float(previous.get("reference"), 0.0)
+
+        last_snapshot_cache.update({
+            "open": open_value if open_value > 0 else (previous_open or price),
+            "high": high_value if high_value > 0 else max(previous_high, price),
+            "low": low_value if low_value > 0 else (min(previous_low, price) if previous_low > 0 else price),
+            "close": price,
+            "volume": tick_volume,
+            "total_volume": total_volume if total_volume_value is not None else previous_total,
+            "reference": reference if reference > 0 else previous_reference,
+            "time": event_time,
+            "code": str(code) if code else None,
+            "source": source,
+        })
+        return dict(last_snapshot_cache)
+
+
+def _is_expected_quote_session(now=None) -> bool:
+    """Best-effort Taiwan session check used only for the health label."""
+    now = now or datetime.now()
+    minute = now.hour * 60 + now.minute
+    weekday = now.weekday()  # Monday=0
+    selected_code = str(getattr(contract, "code", ""))
+    is_future = selected_code.startswith(("TXF", "MXF", "TMF"))
+    if is_future:
+        day_session = weekday <= 4 and 8 * 60 + 45 <= minute <= 13 * 60 + 45
+        night_start = weekday <= 4 and minute >= 15 * 60
+        night_end = 1 <= weekday <= 5 and minute < 5 * 60
+        return day_session or night_start or night_end
+    return weekday <= 4 and 9 * 60 <= minute <= 13 * 60 + 30
+
+
+def _quote_health_data() -> dict:
+    with _quote_state_lock:
+        last_monotonic = _last_tick_monotonic
+        subscription = _quote_subscription_status
+        detail = _quote_event_detail
+        tick_count = _quote_tick_count
+        received_at = _last_tick_received_at
+        exchange_time = _last_tick_exchange_time
+        tick_code = _last_tick_code
+
+    age = max(0.0, time.monotonic() - last_monotonic) if last_monotonic else None
+    expected = bool(is_logged_in and contract and _is_expected_quote_session())
+    if not is_logged_in:
+        status = "disconnected"
+    elif subscription in {"error", "disconnected"}:
+        status = subscription
+    elif age is not None and age <= 15:
+        status = "live"
+    elif expected and age is not None:
+        status = "stale"
+    elif expected:
+        status = "waiting"
+    else:
+        status = "idle"
+    return {
+        "status": status,
+        "subscription": subscription,
+        "detail": detail,
+        "market_expected": expected,
+        "last_tick_age": round(age, 1) if age is not None else None,
+        "last_tick_received_at": received_at or None,
+        "last_tick_exchange_time": exchange_time or None,
+        "tick_count": tick_count,
+        "tick_code": tick_code,
+        "selected_code": getattr(contract, "code", None) if contract else None,
+        "target_code": getattr(contract, "target_code", None) if contract else None,
+        "kbar_source": (
+            "historical_api_plus_tick_aggregation"
+            if str(getattr(contract, "security_type", "")) in {"FUT", "SecurityType.Futures"}
+            else "historical_api"
+        ),
+    }
+
+
+def global_quote_event_callback(resp_code: int, event_code: int, info: str, event: str):
+    global _quote_subscription_status, _quote_event_detail
+    if event_code == 16:
+        status = "subscribed"
+    elif event_code in {0, 13}:
+        status = "connected"
+    elif event_code in {1, 2, 3, 4, 5}:
+        status = "error"
+    else:
+        status = _quote_subscription_status
+    detail = f"{event or ''} {info or ''}".strip()[:240]
+    with _quote_state_lock:
+        _quote_subscription_status = status
+        _quote_event_detail = detail
+    print(f"[QUOTE_EVENT] response={resp_code} event={event_code} status={status} {detail}")
+    if main_loop:
+        asyncio.run_coroutine_threadsafe(
+            manager.broadcast(json.dumps({"type": "quote_status", "data": _quote_health_data()})),
+            main_loop,
+        )
+
+
+def global_quote_session_down_callback():
+    global _quote_subscription_status, _quote_event_detail
+    with _quote_state_lock:
+        _quote_subscription_status = "disconnected"
+        _quote_event_detail = "Shioaji quote session down"
+    print("[QUOTE_EVENT] Shioaji 報價連線中斷")
+    if main_loop:
+        asyncio.run_coroutine_threadsafe(
+            manager.broadcast(json.dumps({"type": "quote_status", "data": _quote_health_data()})),
+            main_loop,
+        )
+
+
+def _register_quote_callbacks(api_instance):
+    """Register Shioaji 1.7 direct callbacks, with legacy fallback."""
+    callback_api = (
+        api_instance
+        if hasattr(api_instance, "set_on_tick_fop_v1_callback")
+        else api_instance.quote
+    )
+    callback_api.set_on_tick_fop_v1_callback(global_quote_callback)
+    callback_api.set_on_tick_stk_v1_callback(global_quote_callback)
+    if not hasattr(callback_api, "set_on_kbar_callback"):
+        raise RuntimeError("Shioaji 版本不支援即時 K 棒，請安裝 1.7.1")
+    callback_api.set_on_kbar_callback(weighted_stock_kbar_callback)
+
+    event_api = (
+        api_instance
+        if hasattr(api_instance, "set_event_callback")
+        else api_instance.quote
+    )
+    event_api.set_event_callback(global_quote_event_callback)
+    if hasattr(event_api, "set_session_down_callback"):
+        event_api.set_session_down_callback(global_quote_session_down_callback)
+
+
+def _subscribe_contract(api_instance, contract_obj, quote_type, version=None):
+    subscribe = getattr(api_instance, "subscribe", None)
+    if not callable(subscribe):
+        subscribe = api_instance.quote.subscribe
+    if version is None:
+        return subscribe(contract_obj, quote_type=quote_type)
+    return subscribe(contract_obj, quote_type=quote_type, version=version)
+
+
+def _unsubscribe_contract(api_instance, contract_obj, quote_type, version=None):
+    unsubscribe = getattr(api_instance, "unsubscribe", None)
+    if not callable(unsubscribe):
+        unsubscribe = api_instance.quote.unsubscribe
+    if version is None:
+        return unsubscribe(contract_obj, quote_type=quote_type)
+    return unsubscribe(contract_obj, quote_type=quote_type, version=version)
+
+
+def _subscribe_weighted_stock_streams(unsubscribe_first=False) -> dict:
+    """Subscribe four stocks to both server-side KBar and v1 Tick streams."""
+    if not hasattr(sj.QuoteType, "KBar"):
+        raise RuntimeError("目前 Shioaji 未提供 QuoteType.KBar")
+
+    subscribed = []
+    errors = {}
+    tick_version = getattr(sj.QuoteVersion, "v1", None)
+    for code, name in _WEIGHTED_STOCK_DEFS:
+        stock_contract = _resolve_stock_contract(api, code)
+        if not stock_contract:
+            errors[code] = "找不到股票合約"
+            with _weighted_stock_state_lock:
+                _weighted_stock_stream_state[code]["error"] = errors[code]
+            continue
+
+        _weighted_stock_contracts[code] = stock_contract
+        reference = _contract_reference(stock_contract)
+        with _weighted_stock_state_lock:
+            _weighted_stock_stream_state[code].update({
+                "contract": getattr(stock_contract, "code", code),
+                "reference": reference,
+                "tick_subscription": "subscribing",
+                "kbar_subscription": "subscribing",
+                "error": None,
+            })
+
+        try:
+            if unsubscribe_first:
+                for quote_type, version in (
+                    (sj.QuoteType.Tick, tick_version),
+                    (sj.QuoteType.KBar, None),
+                ):
+                    try:
+                        _unsubscribe_contract(
+                            api, stock_contract, quote_type, version=version
+                        )
+                    except Exception:
+                        pass
+
+            _subscribe_contract(api, stock_contract, sj.QuoteType.KBar)
+            _subscribe_contract(
+                api, stock_contract, sj.QuoteType.Tick, version=tick_version
+            )
+            with _weighted_stock_state_lock:
+                _weighted_stock_stream_state[code].update({
+                    "tick_subscription": "subscribed",
+                    "kbar_subscription": "subscribed",
+                })
+            subscribed.append(code)
+            print(f"[WEIGHTED_STREAM] {code} {name} KBar + Tick 訂閱請求已送出")
+        except Exception as exc:
+            errors[code] = f"{type(exc).__name__}: {exc}"
+            with _weighted_stock_state_lock:
+                _weighted_stock_stream_state[code].update({
+                    "tick_subscription": "error",
+                    "kbar_subscription": "error",
+                    "error": str(exc)[:240],
+                })
+            print(f"[WEIGHTED_STREAM] {code} 訂閱失敗: {type(exc).__name__}")
+    return {"subscribed": subscribed, "errors": errors}
 
 # 儲存活躍的 WebSocket 連線
 class ConnectionManager:
@@ -103,11 +736,14 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, message: str):
+        disconnected = []
         for connection in self.active_connections:
             try:
                 await connection.send_text(message)
             except:
-                pass
+                disconnected.append(connection)
+        for connection in disconnected:
+            self.disconnect(connection)
 
 manager = ConnectionManager()
 
@@ -120,37 +756,19 @@ class LoginRequest(BaseModel):
     ca_passwd: str = ""
     save_keys: bool = True
 
-# 背景報價抓取協定 (當 WebSocket 失敗時的備案)
+# 報價健康監控：不輪詢 snapshots，避免把查詢型 API 當成即時源
 async def quote_fallback_loop():
-    global api, contract, is_logged_in, main_loop, last_snapshot_cache
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Quote fallback loop started")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Quote health monitor started")
     while True:
         try:
-            if is_logged_in and api and contract:
-                # 取得最新快照 (snapshots 額度很高，每秒一次很安全)
-                snaps = api.snapshots([contract])
-                if snaps and len(snaps) > 0:
-                    snap = snaps[0]
-                    price = snap.close
-                    # 更新快照快取
-                    last_snapshot_cache.update({
-                        "open": safe_float(snap.open) if snap.open else last_snapshot_cache.get("open", 0.0),
-                        "high": safe_float(snap.high) if snap.high else last_snapshot_cache.get("high", 0.0),
-                        "low": safe_float(snap.low) if snap.low else last_snapshot_cache.get("low", 0.0),
-                        "close": safe_float(snap.close) if snap.close else last_snapshot_cache.get("close", 0.0),
-                        "volume": safe_int(snap.volume) if snap.volume else last_snapshot_cache.get("volume", 0),
-                        "reference": safe_float(getattr(contract, 'reference', 0.0))
-                    })
-                    msg = json.dumps({
-                        "type": "tick",
-                        "data": { "time": int(datetime.now().timestamp()), "price": float(price) }
-                    })
-                    # 透過 WebSocket 推送到前端
-                    if main_loop:
-                        await manager.broadcast(msg)
-            
-            await asyncio.sleep(0.5) # 提升至每秒同步兩次 (在 50次/5秒 限制內非常安全)
+            if is_logged_in and main_loop:
+                await manager.broadcast(json.dumps({
+                    "type": "quote_status",
+                    "data": _quote_health_data(),
+                }))
+            await asyncio.sleep(5.0)
         except Exception as e:
+            print(f"[QUOTE_MONITOR] 健康狀態廣播失敗: {e}")
             await asyncio.sleep(5.0)
 
 async def _prefetch_kbars_background():
@@ -163,12 +781,8 @@ async def _prefetch_kbars_background():
     now_tw = datetime.utcnow() + timedelta(hours=8)
     today = datetime(now_tw.year, now_tw.month, now_tw.day)
 
-    # 夜盤至隔天 05:00 才算完整，以此作為快取截止（Shioaji UTC 編碼）
-    if now_tw.hour >= 5:
-        cacheable_before = datetime(now_tw.year, now_tw.month, now_tw.day, 5, 0, 0)
-    else:
-        prev_tw = now_tw - timedelta(days=1)
-        cacheable_before = datetime(prev_tw.year, prev_tw.month, prev_tw.day, 5, 0, 0)
+    # SQLite 以 Shioaji 原始「台灣牆鐘時間」儲存；今天 00:00 前的日曆日已完整。
+    cacheable_before = datetime(now_tw.year, now_tw.month, now_tw.day)
 
     print(f"[PREFETCH] ▶ 背景補快取啟動 {now_tw.strftime('%H:%M')} UTC+8 — 目標補至 {_HISTORY_START.strftime('%Y-%m-%d')}")
 
@@ -212,7 +826,9 @@ async def _prefetch_kbars_background():
                 async with _kbars_lock:
                     kbars = await loop.run_in_executor(
                         None,
-                        lambda c=kbars_contract, s=s_str, e=e_str: api.kbars(c, start=s, end=e, timeout=30000)
+                        lambda c=kbars_contract, s=s_str, e=e_str: api.kbars(
+                            contract=c, start=s, end=e, timeout=30000
+                        )
                     )
                 if kbars and kbars.ts and len(kbars.ts) > 0:
                     df_new = pd.DataFrame(dict(kbars))
@@ -220,8 +836,7 @@ async def _prefetch_kbars_background():
                     cnt = len(saved) if saved else 0
                     print(f"[PREFETCH] {code} {s_str}~{e_str} → {len(df_new)} 筆，存 {cnt} 天")
                 else:
-                    print(f"[PREFETCH] {code} {s_str}~{e_str} 無資料，標記已確認")
-                    _mark_date_range_checked(code, batch_start, current_end)
+                    print(f"[PREFETCH] {code} {s_str}~{e_str} 無資料，不標記完成（可能是流量限制）")
             except Exception as e:
                 err_msg = str(e)
                 is_quota = any(k in err_msg.lower() for k in ("quota", "limit", "usage", "exceed", "流量", "請求次數"))
@@ -261,7 +876,9 @@ async def _prefetch_kbars_background():
                     async with _kbars_lock:
                         kbars = await loop.run_in_executor(
                             None,
-                            lambda c=base_contract, s=s_str, e=e_str: api.kbars(c, start=s, end=e, timeout=30000)
+                            lambda c=base_contract, s=s_str, e=e_str: api.kbars(
+                                contract=c, start=s, end=e, timeout=30000
+                            )
                         )
                     if kbars and kbars.ts and len(kbars.ts) > 0:
                         df_new = pd.DataFrame(dict(kbars))
@@ -269,8 +886,7 @@ async def _prefetch_kbars_background():
                         cnt = len(saved) if saved else 0
                         print(f"[PREFETCH] TXFR1 {s_str}~{e_str} → {len(df_new)} 筆，存 {cnt} 天")
                     else:
-                        print(f"[PREFETCH] TXFR1 {s_str}~{e_str} 無資料，標記已確認")
-                        _mark_date_range_checked("TXFR1", batch_start, p2_end)
+                        print(f"[PREFETCH] TXFR1 {s_str}~{e_str} 無資料，不標記完成（可能是流量限制）")
                 except Exception as ep2:
                     err_msg = str(ep2)
                     if any(k in err_msg.lower() for k in ("quota", "limit", "usage", "exceed", "流量", "請求次數")):
@@ -294,84 +910,140 @@ async def startup_event():
 
 # 全域報價回呼函式
 def global_quote_callback(*args):
-    global main_loop, last_snapshot_cache
+    global _last_tick_monotonic, _last_tick_received_at, _last_tick_exchange_time
+    global _last_tick_code, _quote_tick_count, _quote_tick_count_since_log
+    global _quote_log_monotonic, _quote_subscription_status
     try:
+        if not args:
+            return
         # 自動判斷參數格式 (相容舊版 topic/quote 與新版 exchange/data)
         quote = args[1] if len(args) > 1 else args[0]
-        
-        # 兼容 dict 與新版 Tick Object
-        if isinstance(quote, dict):
-            price = quote.get('Close') or quote.get('close') or quote.get('Price') or quote.get('price')
-        else:
-            price = getattr(quote, 'close', None) or getattr(quote, 'Close', None)
-            
-        if price and main_loop:
-            # 即時動態更新快照快取 (防範 snapshots 在夜盤出錯時的降級備份)
-            p_val = float(price)
-            last_snapshot_cache["close"] = p_val
-            if last_snapshot_cache["open"] == 0:
-                last_snapshot_cache["open"] = p_val
-            last_snapshot_cache["high"] = max(last_snapshot_cache["high"], p_val)
-            last_snapshot_cache["low"] = min(last_snapshot_cache["low"], p_val) if last_snapshot_cache["low"] > 0 else p_val
 
-            # ── 即時 1-min bar 累積 ──────────────────────────────────────
-            vol_tick = safe_int(
-                quote.get('volume', 0) if isinstance(quote, dict)
-                else getattr(quote, 'volume', 0)
-            )
-            now_unix = int(datetime.now().timestamp())
-            bucket_ns = (now_unix // 60) * 60 * 1_000_000_000
-            with _rt_bar_lock:
-                rt_code = _rt_contract_code
-                if rt_code:
-                    if _rt_bar.get('bucket_ns') != bucket_ns:
-                        prev = dict(_rt_bar)
-                        _rt_bar.clear()
-                        _rt_bar.update({'bucket_ns': bucket_ns, 'code': rt_code,
-                                        'o': p_val, 'h': p_val, 'l': p_val, 'c': p_val, 'vol': vol_tick})
-                        if prev.get('bucket_ns') and prev.get('code') == rt_code:
-                            _save_rt_bar_to_db(rt_code, prev['bucket_ns'],
-                                               prev['o'], prev['h'], prev['l'], prev['c'], prev['vol'])
-                            bar_t = datetime.fromtimestamp(prev['bucket_ns'] / 1e9).strftime('%H:%M')
-                            print(f"[RT_CACHE] 存入 {rt_code} {bar_t}")
+        simtrade = _quote_field(quote, "simtrade", default=False)
+        if simtrade is True or str(simtrade).lower() in {"1", "true"}:
+            return
+
+        tick_code = str(_quote_field(quote, "code", "Code") or "")
+        if tick_code in _WEIGHTED_STOCK_CODES:
+            _handle_weighted_stock_tick(quote)
+            # 四大權值股的額外訂閱不可污染目前選取的期貨報價。
+            if not _quote_matches_selected_contract(quote):
+                return
+        elif not _quote_matches_selected_contract(quote):
+            return
+
+        price = _quote_field(quote, "close", "Close", "price", "Price")
+        p_val = safe_float(price, 0.0)
+        if p_val <= 0:
+            return
+
+        event_time = _quote_timestamp(quote)
+        vol_tick = max(0, safe_int(_quote_field(quote, "volume", "Volume"), 0))
+        tick_code = tick_code or getattr(contract, "code", None)
+        monotonic_now = time.monotonic()
+
+        with _quote_state_lock:
+            _last_tick_monotonic = monotonic_now
+            _last_tick_received_at = int(time.time())
+            _last_tick_exchange_time = event_time
+            _last_tick_code = str(tick_code) if tick_code else None
+            _quote_tick_count += 1
+            _quote_tick_count_since_log += 1
+            _quote_subscription_status = "subscribed"
+
+        snapshot_payload = _update_snapshot_cache(quote, p_val, event_time, "stream")
+
+        # ── 即時 1-min bar 累積 ──────────────────────────────────────────
+        bucket_ns = (event_time // 60) * 60 * 1_000_000_000
+        with _rt_bar_lock:
+            rt_code = _rt_contract_code
+            if rt_code:
+                if _rt_bar.get('bucket_ns') != bucket_ns:
+                    prev = dict(_rt_bar)
+                    _rt_bar.clear()
+                    _rt_bar.update({'bucket_ns': bucket_ns, 'code': rt_code,
+                                    'o': p_val, 'h': p_val, 'l': p_val, 'c': p_val, 'vol': vol_tick})
+                    if prev.get('bucket_ns') and prev.get('code') == rt_code:
+                        _save_rt_bar_to_db(rt_code, prev['bucket_ns'],
+                                           prev['o'], prev['h'], prev['l'], prev['c'], prev['vol'])
+                        bar_t = datetime.fromtimestamp(prev['bucket_ns'] / 1e9).strftime('%H:%M')
+                        print(f"[RT_CACHE] 存入 {rt_code} {bar_t}")
+                        if main_loop:
                             asyncio.run_coroutine_threadsafe(
                                 manager.broadcast(json.dumps({"type": "cache_updated"})), main_loop
                             )
-                    else:
-                        _rt_bar['h'] = max(_rt_bar.get('h', p_val), p_val)
-                        _rt_bar['l'] = min(_rt_bar.get('l', p_val), p_val)
-                        _rt_bar['c'] = p_val
-                        _rt_bar['vol'] = _rt_bar.get('vol', 0) + vol_tick
-            # ─────────────────────────────────────────────────────────────
+                else:
+                    _rt_bar['h'] = max(_rt_bar.get('h', p_val), p_val)
+                    _rt_bar['l'] = min(_rt_bar.get('l', p_val), p_val)
+                    _rt_bar['c'] = p_val
+                    _rt_bar['vol'] = _rt_bar.get('vol', 0) + vol_tick
+        # ─────────────────────────────────────────────────────────────────
 
-            msg = json.dumps({
-                "type": "tick",
-                "data": { "time": int(datetime.now().timestamp()), "price": p_val }
-            })
-            # 在黑視窗印出，作為最終診斷依據
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] >>> 收到報價: {p_val}")
-            asyncio.run_coroutine_threadsafe(manager.broadcast(msg), main_loop)
+        if main_loop:
+            tick_payload = {
+                **snapshot_payload,
+                "price": p_val,
+                "time": event_time,
+                "tick_volume": vol_tick,
+                "ticks": 1,
+            }
+            asyncio.run_coroutine_threadsafe(
+                manager.broadcast(json.dumps({"type": "tick", "data": tick_payload})),
+                main_loop,
+            )
+
+        # 高頻 Tick 不逐筆 print，避免 stdout I/O 阻塞 Shioaji callback。
+        if monotonic_now - _quote_log_monotonic >= 5:
+            with _quote_state_lock:
+                ticks_in_window = _quote_tick_count_since_log
+                _quote_tick_count_since_log = 0
+                _quote_log_monotonic = monotonic_now
+            print(
+                f"[QUOTE] live code={tick_code} price={p_val:g} "
+                f"volume={vol_tick} ticks/5s={ticks_in_window}"
+            )
     except Exception as e:
         print(f"!!! 報價處理異常: {e}")
 
 @app.post("/api/resubscribe")
 async def resubscribe():
-    global api, contract, is_logged_in
+    global api, contract, is_logged_in, _quote_subscription_status, _quote_event_detail
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 收到手動重新訂閱請求...")
     try:
         if not is_logged_in or api is None:
             return {"status": "error", "message": "伺服器未登入或已斷線，請重新啟動連線"}
         if not contract:
             return {"status": "error", "message": "合約資訊遺失，請嘗試重新登入"}
-        
-        # 重新強制設定回呼 (雙重保險)
-        api.quote.on_quote = global_quote_callback
-        api.quote.unsubscribe(contract)
-        time.sleep(0.5) # 給予一點緩衝時間
-        api.quote.subscribe(contract, quote_type=sj.constant.QuoteType.Tick)
-        
+
+        _register_quote_callbacks(api)
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: _unsubscribe_contract(api, contract, sj.QuoteType.Tick),
+            )
+        except Exception as unsubscribe_error:
+            print(f"[QUOTE] 解除舊訂閱警告（仍會繼續訂閱）: {unsubscribe_error}")
+        await asyncio.sleep(0.5)
+        with _quote_state_lock:
+            _quote_subscription_status = "subscribing"
+            _quote_event_detail = "manual resubscribe"
+        await loop.run_in_executor(
+            None,
+            lambda: _subscribe_contract(
+                api, contract, sj.QuoteType.Tick, version=sj.QuoteVersion.v1
+            ),
+        )
+        weighted_result = await loop.run_in_executor(
+            None, lambda: _subscribe_weighted_stock_streams(unsubscribe_first=True)
+        )
+
         print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 已強行重新訂閱 {contract.code}")
-        return {"status": "success"}
+        return {
+            "status": "success",
+            "quote": _quote_health_data(),
+            "weighted_stocks": weighted_result,
+        }
     except Exception as e:
         print(f"!!! 重新訂閱失敗: {e}")
         return {"status": "error", "message": f"API 異常: {str(e)}"}
@@ -389,61 +1061,84 @@ async def shutdown_event():
 @app.post("/api/login")
 async def login(req: LoginRequest):
     global api, is_logged_in, contract, main_loop
+    global _quote_subscription_status, _quote_event_detail
+    global _rt_contract_code, _rt_bar
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"\n[{now_str}] [SECURE] 收到系統登入請求 [帳號模式: {'模擬交易 (Simulation)' if req.is_simulation else '實盤交易 (Real)'}]")
     print(f"[{now_str}] [DIR] CA 憑證路徑: {req.ca_path or '未提供'}")
     try:
         main_loop = asyncio.get_running_loop()
-        
+        is_logged_in = False
+
         # 釋放舊連線
         if api:
-            try: 
+            try:
                 print(f"[{now_str}] [RESET] 正在登出舊有 Shioaji 工作階段連線...")
                 api.logout()
             except: pass
                 
         api = sj.Shioaji(simulation=req.is_simulation)
+        with _contract_info_lock:
+            _contract_info_cache.clear()
         
         print(f"[{now_str}] [WAIT] 正在登入永豐金證券伺服器...")
         api.login(api_key=req.api_key, secret_key=req.secret_key)
         print(f"[{now_str}] [SUCCESS] 永豐金證券 API 登入成功！")
-        
-        # 綁定回呼 (全面兼容新舊版及期貨股票 V1 介面)
-        try:
-            @api.on_tick_fop_v1()
-            def fop_tick_cb(exchange, tick):
-                global_quote_callback(exchange, tick)
-                
-            @api.on_tick_stk_v1()
-            def stk_tick_cb(exchange, tick):
-                global_quote_callback(exchange, tick)
-            print(f"[{now_str}] [WS] Tick FOP/STK V1 即時回呼綁定完成。")
-        except Exception as ex:
-            print(f"[{now_str}] [WARN] 即時回呼綁定警告: {ex}")
-            
-        api.quote.on_quote = global_quote_callback
+
+        # 使用 Shioaji v1 正式 setter；不可覆寫 api.quote.on_quote 方法。
+        _register_quote_callbacks(api)
+        print(f"[{now_str}] [WS] Tick FOP/STK V1、KBar 與連線事件回呼綁定完成。")
         
         if not req.is_simulation and req.ca_path and req.ca_passwd:
             print(f"[{now_str}] [KEY] 正在啟用 CA 憑證授權...")
             api.activate_ca(ca_path=req.ca_path, ca_passwd=req.ca_passwd, person_id=req.person_id)
             print(f"[{now_str}] [SUCCESS] CA 憑證授權成功！")
-            
-        contract = api.Contracts.Futures.TXF.TXFR1
-        print(f"[{now_str}] [CONTRACT] 預設訂閱合約: {contract.code} (平盤參考價: {getattr(contract, 'reference', '未知')})")
+
+        contract = _resolve_market_contract(api, "TXFR1")
+        if not contract:
+            raise RuntimeError("Shioaji 1.7 無法解析 TXFR1 合約")
+        _reset_quote_state(contract)
+        with _rt_bar_lock:
+            _rt_bar.clear()
+        _rt_contract_code = contract.code
+        print(
+            f"[{now_str}] [CONTRACT] 預設訂閱合約: {contract.code} "
+            f"(平盤參考價: {_contract_reference(contract) or '未知'})"
+        )
         
         # 嘗試訂閱 WebSocket 報價
         try:
             print(f"[{now_str}] [WS] 正在向永豐金 WebSocket 伺服器訂閱 {contract.code} 即時報價...")
-            api.quote.subscribe(contract, quote_type=sj.constant.QuoteType.Tick)
-            print(f"[{now_str}] [SUCCESS] {contract.code} WebSocket 報價訂閱成功！")
+            _subscribe_contract(
+                api, contract, sj.QuoteType.Tick, version=sj.QuoteVersion.v1
+            )
+            print(f"[{now_str}] [WS] {contract.code} 訂閱請求已送出，等待 Shioaji Event 16 確認。")
         except Exception as eSub:
-            print(f"[{now_str}] [ERROR] WebSocket 訂閱受限 ({eSub})，將啟用背景同步模式。")
+            with _quote_state_lock:
+                _quote_subscription_status = "error"
+                _quote_event_detail = str(eSub)[:240]
+            print(f"[{now_str}] [ERROR] WebSocket 訂閱失敗 ({eSub})，可使用重新訂閱按鈕重試。")
 
         # 等待 Shioaji SDK 完成內部初始化，避免後續 kbars/snapshot 呼叫拿到空值
         print(f"[{now_str}] [WAIT] 等待 SDK 穩定中（3秒）...")
         await asyncio.sleep(3)
 
         is_logged_in = True
+        _reset_weighted_stock_stream_state()
+        loop = asyncio.get_running_loop()
+        weighted_result = await loop.run_in_executor(
+            None, _subscribe_weighted_stock_streams
+        )
+        if weighted_result["errors"]:
+            print(
+                f"[{now_str}] [WEIGHTED_STREAM] 部分訂閱失敗: "
+                f"{sorted(weighted_result['errors'])}"
+            )
+        else:
+            print(
+                f"[{now_str}] [WEIGHTED_STREAM] 四大權值股 KBar + Tick "
+                f"已全部送出訂閱。"
+            )
 
         # 儲存登入憑證至 .env
         if req.save_keys:
@@ -456,10 +1151,19 @@ async def login(req: LoginRequest):
             set_key(env_path, "SHIOAJI_CA_PASSWD", req.ca_passwd or "")
             print(f"[{now_str}] [SAVE] 登入憑證已儲存至 .env")
 
-        # 登入完成後立刻在背景補快取，不阻塞前端
-        asyncio.create_task(_prefetch_kbars_background())
+        # 大量歷史 1 分 K 會快速耗盡 Shioaji 每日流量；預設不在登入時全量回補。
+        # 如需離峰補資料，可在 .env 明確設為 True。
+        if os.getenv("PREFETCH_KBARS_ON_LOGIN", "False").lower() == "true":
+            asyncio.create_task(_prefetch_kbars_background())
+            print(f"[{now_str}] [PREFETCH] 已依設定啟動歷史 K 棒背景回補。")
+        else:
+            print(f"[{now_str}] [PREFETCH] 登入全量回補已停用（避免耗盡 Shioaji 每日流量）。")
         print(f"[{now_str}] [READY] 系統完全就緒，連線就緒開始看盤！\n")
-        return {"status": "success", "contract": contract.code}
+        return {
+            "status": "success",
+            "contract": contract.code,
+            "weighted_stocks": weighted_result,
+        }
     except Exception as e:
         is_logged_in = False
         print(f"[{now_str}] [ERROR] 登入失敗！異常訊息: {e}\n")
@@ -473,45 +1177,56 @@ async def select_contract(req: dict):
         print(f"[{now_str}] [WARN] 收到切換合約請求，但目前為「未登入」狀態！")
         return {"status": "error", "message": "請先登入連線"}
     
-    code = req.get("code", "TXFR1")
+    code = str(req.get("code", "TXFR1")).strip().upper()
     old_contract = contract
     print(f"\n[{now_str}] [CHANGE] 收到切換合約請求: {old_contract.code if old_contract else 'None'} -> {code}")
-    
+
     try:
-        # 先解除舊訂閱 (如果有)
+        # 先用 Shioaji 1.7 的統一合約 API 解析，避免代碼錯誤時解除舊報價。
+        if not (code.isdigit() or code.startswith(("TXF", "MXF", "TMF"))):
+            print(f"[{now_str}] [ERROR] 不支援的合約代碼: {code}")
+            return {"status": "error", "message": "不支援的合約代碼"}
+        new_contract = _resolve_market_contract(api, code)
+
+        if not new_contract:
+            return {"status": "error", "message": f"找不到合約: {code}"}
+
         if old_contract:
             try:
                 print(f"[{now_str}] [WS] 正在解除舊合約訂閱: {old_contract.code}")
-                api.quote.unsubscribe(old_contract)
+                _unsubscribe_contract(api, old_contract, sj.QuoteType.Tick)
             except Exception as eUnsub:
                 print(f"[{now_str}] [WARN] 解除訂閱舊合約警告: {eUnsub}")
-                
-        # 根據代碼找到正確的合約對象
-        if "TXF" in code:
-            contract = api.Contracts.Futures.TXF[code]
-        elif "MXF" in code:
-            contract = api.Contracts.Futures.MXF[code]
-        elif "TMF" in code:
-            contract = api.Contracts.Futures.TMF[code]
-        elif code.isdigit() or len(code) == 4:
-            contract = api.Contracts.Stocks[code]
-        else:
-            print(f"[{now_str}] [ERROR] 不支援的合約代碼: {code}")
-            return {"status": "error", "message": "不支援的合約代碼"}
-            
+
+        contract = new_contract
+        _reset_quote_state(contract)
+        _register_quote_callbacks(api)
+
         # 重新訂閱新合約
         print(f"[{now_str}] [WS] 正在向永豐金訂閱新合約 {contract.code} 即時 Tick 報價...")
-        api.quote.subscribe(contract, quote_type=sj.constant.QuoteType.Tick)
-        print(f"[{now_str}] [SUCCESS] 新合約 {contract.code} 訂閱完成！")
-        
+        _subscribe_contract(
+            api, contract, sj.QuoteType.Tick, version=sj.QuoteVersion.v1
+        )
+        print(f"[{now_str}] [WS] 新合約 {contract.code} 訂閱請求已送出。")
+
         # 切換合約時重置即時快取狀態
         with _rt_bar_lock:
             _rt_bar.clear()
-        _rt_contract_code = None
+        _rt_contract_code = contract.code
 
         print(f"[{now_str}] [OK] 合約順利切換完成。\n")
-        return {"status": "success", "contract": contract.code}
+        return {"status": "success", "contract": contract.code, "quote": _quote_health_data()}
     except Exception as e:
+        # 新合約訂閱失敗時，盡力恢復舊合約，避免畫面永久斷流。
+        if old_contract and contract is not old_contract:
+            try:
+                contract = old_contract
+                _reset_quote_state(contract)
+                _subscribe_contract(
+                    api, contract, sj.QuoteType.Tick, version=sj.QuoteVersion.v1
+                )
+            except Exception as restore_error:
+                print(f"[{now_str}] [ERROR] 舊合約恢復失敗: {restore_error}")
         print(f"[{now_str}] [ERROR] 合約切換失敗: {e}\n")
         return {"status": "error", "message": str(e)}
 
@@ -561,9 +1276,63 @@ def _get_cached_dates(contract_code: str) -> set:
         ).fetchall()
     return {r[0] for r in rows}
 
+def _shioaji_wallclock_ns(value: datetime) -> int:
+    """Encode a naive Taiwan wall-clock datetime like Shioaji's raw K-bar ts."""
+    return int(calendar.timegm(value.timetuple()) * 1e9 + value.microsecond * 1000)
+
+def _get_cache_bar_counts(contract_code: str, start: datetime, end: datetime) -> dict[str, int]:
+    """Count cached rows by Shioaji raw calendar date."""
+    start_ns = _shioaji_wallclock_ns(start)
+    end_ns = _shioaji_wallclock_ns(end + timedelta(days=1))
+    with sqlite3.connect(_KBARS_CACHE_DB) as conn:
+        rows = conn.execute(
+            "SELECT date(ts / 1000000000, 'unixepoch') AS d, COUNT(*) "
+            "FROM kbars1m WHERE contract_code=? AND ts>=? AND ts<? GROUP BY d",
+            (contract_code, start_ns, end_ns),
+        ).fetchall()
+    return {str(d): int(count) for d, count in rows}
+
+def _recent_cache_date_is_incomplete(day: datetime, count: int, today) -> bool:
+    """Detect obvious recent futures gaps even if legacy metadata says cached."""
+    calendar_day = day.date()
+    if calendar_day >= today:
+        return True
+    if calendar_day < today - timedelta(days=10):
+        return False
+    weekday = calendar_day.weekday()
+    if weekday == 6:  # Sunday has no TXF session.
+        return False
+    minimum = 650 if weekday == 0 else (180 if weekday == 5 else 850)
+    return count < minimum
+
+def _kbars_date_in_backoff(contract_code: str, day: datetime) -> bool:
+    key = (contract_code, day.strftime("%Y-%m-%d"))
+    with _kbars_retry_lock:
+        retry_at = _kbars_retry_after.get(key, 0.0)
+        if retry_at <= time.monotonic():
+            _kbars_retry_after.pop(key, None)
+            return False
+        return True
+
+def _kbars_range_in_backoff(contract_code: str, start: datetime, end: datetime) -> bool:
+    day = start
+    while day <= end:
+        if not _kbars_date_in_backoff(contract_code, day):
+            return False
+        day += timedelta(days=1)
+    return True
+
+def _set_kbars_backoff(contract_code: str, start: datetime, end: datetime, seconds: int):
+    retry_at = time.monotonic() + max(0, seconds)
+    with _kbars_retry_lock:
+        day = start
+        while day <= end:
+            _kbars_retry_after[(contract_code, day.strftime("%Y-%m-%d"))] = retry_at
+            day += timedelta(days=1)
+
 def _load_from_cache(contract_code: str, start: datetime, end: datetime) -> pd.DataFrame:
-    start_ns = int(start.timestamp() * 1e9)
-    end_ns   = int((end + timedelta(days=1)).timestamp() * 1e9)
+    start_ns = _shioaji_wallclock_ns(start)
+    end_ns = _shioaji_wallclock_ns(end + timedelta(days=1))
     with sqlite3.connect(_KBARS_CACHE_DB) as conn:
         rows = conn.execute(
             "SELECT ts, Open, High, Low, Close, Volume FROM kbars1m "
@@ -575,54 +1344,34 @@ def _load_from_cache(contract_code: str, start: datetime, end: datetime) -> pd.D
     return pd.DataFrame(rows, columns=['ts', 'Open', 'High', 'Low', 'Close', 'Volume'])
 
 def _save_to_cache(contract_code: str, df: pd.DataFrame, cacheable_before: datetime):
-    """將 df 中早於 cacheable_before 的資料存入快取，並記錄已快取日期。"""
+    """Store every returned bar; only mark completed raw calendar dates as final."""
     df_ts = pd.to_datetime(df['ts'], unit='ns', utc=True)
     df = df.copy()
     df['_date'] = df_ts.dt.date
-    # 夜盤尾段 (Shioaji UTC 00:00~04:59 = 台灣時間 00:00~04:59) 屬前一交易日
-    night_mask = df_ts.dt.hour < 5
-    df.loc[night_mask, '_date'] = (
-        df_ts[night_mask].dt.normalize() - pd.Timedelta(days=1)
-    ).dt.date
     mask = df_ts < pd.Timestamp(cacheable_before, tz='UTC')
-    df_save = df[mask]
-    if df_save.empty:
+    completed_dates = [str(d) for d in df.loc[mask, '_date'].unique()]
+    if df.empty:
         return
-    new_dates = [str(d) for d in df_save['_date'].unique()]
     with sqlite3.connect(_KBARS_CACHE_DB) as conn:
         conn.executemany(
             "INSERT OR REPLACE INTO kbars1m VALUES (?,?,?,?,?,?,?)",
             [(contract_code, int(r.ts), r.Open, r.High, r.Low, r.Close, int(r.Volume))
-             for r in df_save.itertuples()]
+             for r in df.itertuples()]
         )
-        conn.executemany(
-            "INSERT OR REPLACE INTO cached_dates VALUES (?,?)",
-            [(contract_code, d) for d in new_dates]
-        )
-    return new_dates
-
-def _mark_date_range_checked(contract_code: str, start: datetime, end: datetime):
-    """將日期範圍內所有日曆天標記為已確認（無論有無資料），防止補取重複空跑。"""
-    dates = []
-    d = start
-    while d <= end:
-        dates.append((contract_code, d.strftime('%Y-%m-%d')))
-        d += timedelta(days=1)
-    if dates:
-        with sqlite3.connect(_KBARS_CACHE_DB) as conn:
+        if completed_dates:
             conn.executemany(
-                "INSERT OR IGNORE INTO cached_dates VALUES (?,?)",
-                dates
+                "INSERT OR REPLACE INTO cached_dates VALUES (?,?)",
+                [(contract_code, d) for d in completed_dates]
             )
-
+    return completed_dates
 
 def _save_rt_bar_to_db(code: str, ts_ns: int, o: float, h: float, l: float, c: float, vol: int):
     """即時 1-min bar 寫入 kbars1m，不更新 cached_dates（今日仍視為未完整快取）。
-    ts_ns 為真實 UTC epoch ns（來自 datetime.now().timestamp()），
-    寫入時補 +8h 偏移以符合 Shioaji UTC+8-biased 格式，
-    確保 get_kbars 統一的 -28800 校正後顯示正確。
+    ts_ns 是該分鐘的起點；寫入時轉為 Shioaji 相同的「分鐘收盤時間」
+    並補 +8h wall-clock 偏移，讓 API 歷史棒與即時暫存棒共用一套分桶規則。
     """
-    biased_ts_ns = ts_ns + 28800 * 1_000_000_000
+    close_ts_ns = ts_ns + 60 * 1_000_000_000
+    biased_ts_ns = close_ts_ns + 28800 * 1_000_000_000
     try:
         with sqlite3.connect(_KBARS_CACHE_DB, timeout=5) as conn:
             # 同時清除舊的未偏移版本（升級前寫入的錯誤資料）
@@ -634,63 +1383,191 @@ def _save_rt_bar_to_db(code: str, ts_ns: int, o: float, h: float, l: float, c: f
     except Exception as e:
         print(f"[RT_CACHE] DB 寫入失敗: {e}")
 
-# Shioaji 期貨月份字母：A=1月, B=2月, ..., L=12月
-_MONTH_LETTERS = 'ABCDEFGHIJKL'
+def _resolve_stock_contract(shioaji_api, code: str):
+    """Resolve a Taiwan stock contract through Shioaji 1.7's unified API."""
+    if not str(code).isdigit():
+        return None
+    return _resolve_market_contract(shioaji_api, code)
+
+def _fetch_twse_stock_snapshots(stock_defs: list[tuple[str, str]]) -> dict:
+    """Fetch TWSE MIS snapshots as a fallback when Shioaji stock kbars are unavailable."""
+    ex_ch = "|".join(f"tse_{code}.tw" for code, _ in stock_defs)
+    url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1&delay=0"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://mis.twse.com.tw/stock/index.jsp",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        payload = json.loads(raw)
+    except Exception as e:
+        print(f"[TWSE] 四大權值股快照 fallback 失敗: {e}")
+        return {}
+
+    rows = payload.get("msgArray") or []
+    return {str(row.get("c") or "").strip(): row for row in rows if row.get("c")}
+
+def _twse_snapshot_to_intraday_payload(code: str, name: str, row: dict) -> dict:
+    """Convert a TWSE MIS quote snapshot into a small chartable intraday path."""
+    date_raw = str(row.get("d") or row.get("^") or "").strip()
+    time_raw = str(row.get("t") or row.get("%") or "13:30:00").strip()
+    if len(date_raw) == 8:
+        date_str = f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+    else:
+        date_str = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d")
+
+    open_p = safe_float(row.get("o"), 0)
+    high_p = safe_float(row.get("h"), 0)
+    low_p = safe_float(row.get("l"), 0)
+    last_p = safe_float(row.get("z"), 0) or safe_float(row.get("pz"), 0)
+    prev_p = safe_float(row.get("y"), 0)
+    total_vol = safe_int(row.get("v"), 0)
+
+    if not last_p:
+        return {"code": code, "name": name, "date": date_str, "source": "twse_snapshot", "bars": []}
+
+    if not open_p:
+        open_p = last_p
+    if not high_p:
+        high_p = max(open_p, last_p)
+    if not low_p:
+        low_p = min(open_p, last_p)
+
+    def _epoch_at(hhmmss: str) -> int:
+        try:
+            dt = datetime.strptime(f"{date_str} {hhmmss}", "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            dt = datetime.strptime(f"{date_str} 13:30:00", "%Y-%m-%d %H:%M:%S")
+        return int(dt.timestamp())
+
+    if last_p >= open_p:
+        path = [("09:00:00", open_p), ("10:30:00", low_p), ("12:00:00", high_p), (time_raw, last_p)]
+    else:
+        path = [("09:00:00", open_p), ("10:30:00", high_p), ("12:00:00", low_p), (time_raw, last_p)]
+
+    bars = []
+    seen_times = set()
+    running_amount = 0.0
+    running_volume = 0
+    chunk_vol = max(total_vol // max(len(path), 1), 1)
+    for idx, (hhmmss, price) in enumerate(path):
+        t = _epoch_at(hhmmss)
+        if t in seen_times:
+            t += idx * 60
+        seen_times.add(t)
+        running_volume += chunk_vol
+        running_amount += price * chunk_vol
+        bars.append({
+            "time": t,
+            "price": price,
+            "avg": running_amount / running_volume if running_volume else price,
+            "volume": chunk_vol,
+        })
+
+    return {
+        "code": code,
+        "name": name,
+        "date": date_str,
+        "is_today": date_str == (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d"),
+        "source": "twse_snapshot",
+        "open": open_p,
+        "last": last_p,
+        "change": last_p - prev_p if prev_p else last_p - open_p,
+        "change_pct": ((last_p - prev_p) / prev_p * 100) if prev_p else ((last_p - open_p) / open_p * 100 if open_p else 0),
+        "bars": bars,
+    }
 
 def _resolve_kbars_contracts(api_instance, base_contract, start_date, end_date, now_str: str) -> list:
     """
-    TXFR1/R2 滾動合約無法直接查 kbars，需展開為月份合約（如 TXFE6 = 2026年5月）。
-    Shioaji 命名格式：{商品}{月份字母}{年份末位}，例如 TXFE6。
-    非滾動合約直接回傳原合約。
+    Shioaji 的 R1/R2 本身就是用來查詢跨到期月份歷史資料的連續合約。
+    不可依日期自行拼 TXFE6 等月份代碼：到期合約通常不在目前 Contracts
+    清單中，而且會造成缺資料、重複合併及換月覆寫順序錯誤。
     """
     code = base_contract.code
-    if not (code.endswith('R1') or code.endswith('R2')):
-        return [base_contract]
+    if code.endswith(("R1", "R2")):
+        print(f"[{now_str}] [CHART] 使用 Shioaji 連續合約 {code} 直接查詢歷史 K 棒")
+    return [base_contract]
 
-    base_symbol = code[:-2]  # "TXFR1" → "TXF"
+def _aggregate_kbars_dataframe(df: pd.DataFrame, period: str) -> pd.DataFrame:
+    """Aggregate close-stamped 1-minute bars on TXF session boundaries."""
+    aggregations = {
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum',
+    }
+    if period == "D":
+        trading_day = pd.Series(df.index.normalize(), index=df.index)
+        after_hours = df.index.hour >= 15
+        trading_day.loc[after_hours] = (
+            trading_day.loc[after_hours] + pd.Timedelta(days=1)
+        )
+        weekday = trading_day.dt.weekday
+        trading_day = trading_day + pd.to_timedelta(
+            weekday.map({5: 2, 6: 1}).fillna(0), unit="D"
+        )
+        grouped = df.groupby(trading_day, sort=True).agg(aggregations).dropna()
+        grouped.index.name = "ts"
+        return grouped
 
-    # 計算需查詢的月份（含 start 前一個月，以涵蓋換月緩衝）
-    if start_date.month > 1:
-        sy, sm = start_date.year, start_date.month - 1
-    else:
-        sy, sm = start_date.year - 1, 12
-    ey, em = end_date.year, end_date.month
+    minutes = {"5min": 5, "15min": 15, "30min": 30, "60min": 60}.get(period)
+    if not minutes:
+        raise ValueError(f"不支援的 K 棒週期: {period}")
 
-    months = []
-    cy, cm = sy, sm
-    while (cy, cm) <= (ey, em):
-        months.append((cy, cm))
-        cy, cm = (cy, cm + 1) if cm < 12 else (cy + 1, 1)
+    effective = pd.Series(df.index - pd.Timedelta(seconds=1), index=df.index)
+    calendar_day = effective.dt.normalize()
+    minute_of_day = effective.dt.hour * 60 + effective.dt.minute
+    anchor = calendar_day.copy()
 
-    try:
-        futures_cat = getattr(api_instance.Contracts.Futures, base_symbol)
-    except Exception:
-        print(f"[{now_str}] [WARN] Contracts.Futures.{base_symbol} 無法存取，回退使用 {code}")
-        return [base_contract]
+    early_night = minute_of_day < 5 * 60
+    late_night = minute_of_day >= 15 * 60
+    day_session = (
+        (minute_of_day >= 8 * 60 + 45)
+        & (minute_of_day <= 13 * 60 + 45)
+    )
+    anchor.loc[early_night] = (
+        calendar_day.loc[early_night]
+        - pd.Timedelta(days=1)
+        + pd.Timedelta(hours=15)
+    )
+    anchor.loc[late_night] = (
+        calendar_day.loc[late_night] + pd.Timedelta(hours=15)
+    )
+    anchor.loc[day_session] = (
+        calendar_day.loc[day_session]
+        + pd.Timedelta(hours=8, minutes=45)
+    )
 
-    result = []
-    for (y, m) in months:
-        c_code = f"{base_symbol}{_MONTH_LETTERS[m - 1]}{y % 10}"  # e.g. TXFE6
-        # 優先用 attribute access（與 api.Contracts.Futures.TXF.TXFE6 等效）
-        c = getattr(futures_cat, c_code, None)
-        if c is None:
-            # fallback：bracket access
-            try:
-                c = futures_cat[c_code]
-            except Exception:
-                c = None
-        if c is not None:
-            print(f"[{now_str}] [CHART]   合約 {c_code} ✓ type={type(c).__name__} code={getattr(c, 'code', '?')}")
-            result.append(c)
-        else:
-            print(f"[{now_str}] [CHART]   合約 {c_code} 不存在（已到期或未上市），跳過")
+    period_delta = pd.Timedelta(minutes=minutes)
+    bucket = anchor + ((effective - anchor) // period_delta) * period_delta
+    grouped = df.groupby(bucket, sort=True).agg(aggregations).dropna()
+    grouped.index.name = "ts"
+    return grouped
 
-    if not result:
-        print(f"[{now_str}] [WARN] 找不到任何月份合約，回退使用 {code}")
-        return [base_contract]
 
-    print(f"[{now_str}] [CHART] 滾動合約 {code} → 查詢清單: [{', '.join(c.code for c in result)}]")
-    return result
+def _drop_incomplete_recent_futures_dates(
+    df: pd.DataFrame, today
+) -> tuple[pd.DataFrame, list[str], int]:
+    """Remove obviously fragmented completed raw dates before charting."""
+    raw_dates = pd.Series(df.index.strftime("%Y-%m-%d"), index=df.index)
+    counts = raw_dates.value_counts()
+    incomplete_dates = []
+    for raw_date, count in counts.items():
+        raw_day = datetime.strptime(str(raw_date), "%Y-%m-%d")
+        if (
+            raw_day.date() < today
+            and _recent_cache_date_is_incomplete(raw_day, int(count), today)
+        ):
+            incomplete_dates.append(str(raw_date))
+    if not incomplete_dates:
+        return df, [], 0
+    filtered = df.loc[~raw_dates.isin(incomplete_dates)]
+    return filtered, sorted(incomplete_dates), len(df) - len(filtered)
 
 
 @app.get("/api/kbars")
@@ -709,14 +1586,9 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
         raise HTTPException(status_code=400, detail=f"日期格式錯誤: {e}")
 
     now_tw = datetime.utcnow() + timedelta(hours=8)  # 轉台灣時間 UTC+8
-    safe_end_date = now_tw.date()
-    # 夜盤至隔天 05:00 才算完整，以此作為快取截止（Shioaji UTC 編碼）
-    if now_tw.hour >= 5:
-        safe_end = datetime(safe_end_date.year, safe_end_date.month, safe_end_date.day, 5, 0, 0)
-    else:
-        # 05:00 前仍在夜盤中，前天夜盤才算完整
-        prev = (now_tw - timedelta(days=1)).date()
-        safe_end = datetime(prev.year, prev.month, prev.day, 5, 0, 0)
+    today_tw = now_tw.date()
+    # DB 與 Shioaji ts 都使用台灣牆鐘日期；今天 00:00 前的原始日曆日已完整。
+    safe_end = datetime(today_tw.year, today_tw.month, today_tw.day)
 
     try:
         kbars_contracts = _resolve_kbars_contracts(api, contract, start_date, end_date, now_str)
@@ -728,9 +1600,18 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
             print(f"[{now_str}] [WARN] 請求天數大於單次最大限制 ({max_days} 天)，自動縮減起點為 {adjusted_start.strftime('%Y-%m-%d')}")
             start_date = adjusted_start
 
+        output_start_date = start_date
+        output_end_date = end_date
+        # 一個期貨交易日包含前一日 15:00 起的夜盤；聚合日 K 時要多載一天，
+        # 最後再裁回使用者要求的交易日區間。
+        source_start_date = (
+            start_date - timedelta(days=1) if period == "D" else start_date
+        )
+        source_end_date = end_date
+
         all_df = []
-        # safe_end 當天資料可能未完整，不快取；之前的都是固定歷史資料可以快取
-        cacheable_before = safe_end  # ts < cacheable_before 才存快取
+        # 今日資料也寫入 SQLite 當暫存，但只有 ts < safe_end 的日曆日標記為完整。
+        cacheable_before = safe_end
 
         # 更新即時快取目標合約（取最新月份）
         if kbars_contracts:
@@ -741,32 +1622,44 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
                     _rt_bar.clear()
                 _rt_contract_code = new_rt_code
 
-        # 05:00 前仍在夜盤：前一日夜盤尾段可能尚未快取，強制重新補取
-        force_refetch_date = None
-        if now_tw.hour < 5:
-            force_refetch_date = (now_tw - timedelta(days=1)).strftime('%Y-%m-%d')
-
         for kbars_contract in kbars_contracts:
             code = kbars_contract.code
             cached_dates = _get_cached_dates(code)
+            cache_counts = _get_cache_bar_counts(
+                code, source_start_date, source_end_date
+            )
+            is_future = code.startswith(("TXF", "MXF", "TMF"))
 
-            # 找出哪些日期尚未快取，需要打 API
+            # 舊版可能把 API 空回傳誤標為完成；最近日期再用筆數檢查明顯缺口。
             uncached = []
-            d = start_date
-            while d <= end_date:
+            d = source_start_date
+            while d <= source_end_date:
                 date_str = d.strftime('%Y-%m-%d')
-                if date_str not in cached_dates or date_str == force_refetch_date:
+                closed_weekend = d.weekday() == 6 if is_future else d.weekday() >= 5
+                incomplete_recent = (
+                    is_future
+                    and _recent_cache_date_is_incomplete(
+                        d, cache_counts.get(date_str, 0), today_tw
+                    )
+                )
+                needs_fetch = date_str not in cached_dates or incomplete_recent
+                if needs_fetch and not closed_weekend and not _kbars_date_in_backoff(code, d):
                     uncached.append(d)
                 d += timedelta(days=1)
 
             # 從快取載入已有的資料
-            cached_df = _load_from_cache(code, start_date, end_date)
+            cached_df = _load_from_cache(
+                code, source_start_date, source_end_date
+            )
             if not cached_df.empty:
                 print(f"[{now_str}] [CACHE] {code} 快取命中 {len(cached_df)} 筆")
                 all_df.append(cached_df)
 
             if not uncached:
-                print(f"[{now_str}] [CACHE] {code} 全區間已快取，略過 API")
+                print(
+                    f"[{now_str}] [CACHE] {code} 全區間已快取，"
+                    "或缺口暫在 API 冷卻中；略過 API"
+                )
                 continue
 
             print(f"[{now_str}] [CACHE] {code} 未快取日期 ({len(uncached)} 天): {[d.strftime('%m/%d') for d in uncached]}")
@@ -786,16 +1679,39 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
                 loop = asyncio.get_running_loop()
                 try:
                     async with _kbars_lock:
+                        # 另一個圖表可能剛查過相同空區間；進鎖後再次檢查冷卻。
+                        if _kbars_range_in_backoff(code, current_start, current_end):
+                            print(f"[{now_str}]  ↳ [BACKOFF] 相同區間剛查過，略過重複 API")
+                            current_start = current_end + timedelta(days=1)
+                            continue
                         kbars = await loop.run_in_executor(
                             None,
-                            lambda c=kbars_contract, s=s_str, e=e_str: api.kbars(c, start=s, end=e, timeout=30000)
+                            lambda c=kbars_contract, s=s_str, e=e_str: api.kbars(
+                                contract=c, start=s, end=e, timeout=30000
+                            )
                         )
                 except Exception as api_err:
                     err_type = type(api_err).__name__
                     err_msg  = str(api_err)
-                    is_quota = any(k in err_msg.lower() for k in ("quota", "limit", "usage", "exceed", "流量", "請求次數"))
+                    error_lower = err_msg.lower()
+                    is_quota = any(
+                        k in error_lower
+                        for k in (
+                            "quota",
+                            "usage limit",
+                            "rate limit",
+                            "exceed",
+                            "流量",
+                            "請求次數",
+                        )
+                    )
                     tag = "[QUOTA]" if is_quota else "[API-ERR]"
-                    print(f"[{now_str}]  ↳ {tag} {code} API 呼叫失敗 ({err_type}): {err_msg}")
+                    # Shioaji 的例外字串可能包含 JWT、身分證字號與連線資訊，不可原樣寫入 log。
+                    print(
+                        f"[{now_str}]  ↳ {tag} {code} API 呼叫失敗 "
+                        f"({err_type})；已啟用冷卻重試"
+                    )
+                    _set_kbars_backoff(code, current_start, current_end, 3600 if is_quota else 300)
                     current_start = current_end + timedelta(days=1)
                     continue
 
@@ -804,46 +1720,33 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
                     print(f"[{now_str}]  ↳ [OK] 取得 {len(df_new)} 筆")
                     all_df.append(df_new)
                     saved = _save_to_cache(code, df_new, cacheable_before)
+                    await manager.broadcast(json.dumps({
+                        "type": "history_cache_updated",
+                        "data": {
+                            "contract": code,
+                            "start": s_str,
+                            "end": e_str,
+                            "rows": len(df_new),
+                        },
+                    }))
+                    success_backoff = (
+                        300 if current_end.date() >= today_tw else 60
+                    )
+                    _set_kbars_backoff(
+                        code, current_start, current_end, success_backoff
+                    )
                     if saved:
-                        print(f"[{now_str}]  ↳ [CACHE] 已存快取 {len(saved)} 天：{saved[0]} ~ {saved[-1]}")
+                        print(f"[{now_str}]  ↳ [CACHE] K 棒已寫入，完成日 {saved[0]} ~ {saved[-1]}")
                     else:
-                        print(f"[{now_str}]  ↳ [SKIP-CACHE] {code} 此批次資料全屬今日（不快取），已合併至回傳資料")
+                        print(f"[{now_str}]  ↳ [CACHE] 今日 K 棒已暫存（不標記完整）")
                 else:
                     ts_len = len(kbars.ts) if kbars and kbars.ts is not None else "N/A"
                     kbars_repr = repr(kbars)[:200] if kbars else "None"
                     print(f"[{now_str}]  ↳ [EMPTY] {code} {s_str}~{e_str} API 回傳空白")
                     print(f"[{now_str}]           kbars={kbars_repr} | ts筆數={ts_len}")
+                    _set_kbars_backoff(code, current_start, current_end, 900)
 
                 current_start = current_end + timedelta(days=1)
-
-        # TXFR1 直查快取補充（涵蓋月份合約查不到的舊資料）
-        orig_code = contract.code if contract else ""
-        if orig_code.endswith('R1') or orig_code.endswith('R2'):
-            txfr1_df = _load_from_cache("TXFR1", start_date, end_date)
-            if not txfr1_df.empty:
-                print(f"[{now_str}] [CACHE] TXFR1 補充快取命中 {len(txfr1_df)} 筆")
-                all_df.append(txfr1_df)
-
-        # 月份合約展開後仍無資料 → 回退用原始合約（TXFR1 等）直接查詢
-        if not all_df and len(kbars_contracts) > 0 and kbars_contracts[0].code != contract.code:
-            print(f"[{now_str}] [CHART] 月份合約皆無資料，改用原始合約 {contract.code} 直接重試...")
-            try:
-                s_str = start_date.strftime('%Y-%m-%d')
-                e_str = end_date.strftime('%Y-%m-%d')
-                fb_loop = asyncio.get_running_loop()
-                async with _kbars_lock:
-                    fb_kbars = await fb_loop.run_in_executor(
-                        None,
-                        lambda: api.kbars(contract, start=s_str, end=e_str, timeout=30000)
-                    )
-                if fb_kbars and fb_kbars.ts and len(fb_kbars.ts) > 0:
-                    df_fb = pd.DataFrame(dict(fb_kbars))
-                    print(f"[{now_str}] [CHART] 原始合約取得 {len(df_fb)} 筆，直接使用。")
-                    all_df.append(df_fb)
-                else:
-                    print(f"[{now_str}] [CHART] 原始合約亦無資料。")
-            except Exception as efb:
-                print(f"[{now_str}] [CHART] 原始合約重試失敗：{efb}")
 
         if not all_df:
             print(f"[{now_str}] [STOP] 查詢結束：所有批次均無返回任何歷史數據，回傳空清單。\n")
@@ -855,15 +1758,30 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
         df.set_index('ts', inplace=True)
         df.sort_index(inplace=True)
 
+        # 最近已結束日若只剩零散即時暫存列，寧可整日先不畫，
+        # 也不要讓殘缺 OHLC 在 5/15/30 分圖上形成漂浮短棒。
+        selected_code = str(getattr(contract, "code", ""))
+        if selected_code.startswith(("TXF", "MXF", "TMF")):
+            df, incomplete_dates, removed_count = (
+                _drop_incomplete_recent_futures_dates(df, today_tw)
+            )
+            if incomplete_dates:
+                print(
+                    f"[{now_str}] [QUALITY] 略過不完整歷史日 "
+                    f"{incomplete_dates}，移除 {removed_count} 筆零散棒"
+                )
+
         original_len = len(df)
 
         if period != "1min":
-            p_map = {"5min": "5min", "15min": "15min", "30min": "30min", "60min": "60min", "D": "D"}
-            resample_p = p_map.get(period, period)
-            print(f"[{now_str}] [PROCESS] 正在進行 K 線週期聚合：將 1min 數據 ({original_len} 筆) 聚合為 {resample_p}...")
-            df = df.resample(resample_p).agg({
-                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-            }).dropna()
+            print(f"[{now_str}] [PROCESS] 依台指期交易時段聚合 {original_len} 筆 1min → {period}")
+            df = _aggregate_kbars_dataframe(df, period)
+            if period == "D":
+                start_bound = pd.Timestamp(output_start_date, tz="UTC")
+                end_bound = pd.Timestamp(
+                    output_end_date + timedelta(days=1), tz="UTC"
+                )
+                df = df.loc[(df.index >= start_bound) & (df.index < end_bound)]
 
         if df.empty:
             print(f"[{now_str}] [STOP] 聚合後無任何有效資料欄位，回傳空清單。\n")
@@ -893,9 +1811,11 @@ async def get_cache_info():
         rows = conn.execute("SELECT date FROM cached_dates ORDER BY date").fetchall()
     all_dates = sorted({r[0] for r in rows})
 
-    # 今日 UTC 範圍
-    now_utc = datetime.utcnow()
-    day_start_ns = int(datetime(now_utc.year, now_utc.month, now_utc.day).timestamp() * 1e9)
+    # DB 使用 Shioaji 台灣牆鐘時間格式，今日範圍也必須用相同編碼。
+    now_tw = datetime.utcnow() + timedelta(hours=8)
+    day_start_ns = _shioaji_wallclock_ns(
+        datetime(now_tw.year, now_tw.month, now_tw.day)
+    )
     day_end_ns   = day_start_ns + 86400 * 1_000_000_000
     rt_count = 0
     if _rt_contract_code:
@@ -921,33 +1841,194 @@ async def get_snapshot():
     if not is_logged_in or not contract:
         raise HTTPException(status_code=401, detail="Not logged in")
     try:
-        snap = api.snapshots([contract])[0]
-        last_snapshot_cache.update({
-            "open": safe_float(snap.open) if snap.open else last_snapshot_cache.get("open", 0.0),
-            "high": safe_float(snap.high) if snap.high else last_snapshot_cache.get("high", 0.0),
-            "low": safe_float(snap.low) if snap.low else last_snapshot_cache.get("low", 0.0),
-            "close": safe_float(snap.close) if snap.close else last_snapshot_cache.get("close", 0.0),
-            "volume": safe_int(snap.volume) if snap.volume else last_snapshot_cache.get("volume", 0),
-            "reference": safe_float(getattr(contract, 'reference', 0.0))
-        })
+        loop = asyncio.get_running_loop()
+        snaps = await loop.run_in_executor(None, lambda: api.snapshots([contract]))
+        if not snaps:
+            raise RuntimeError("Shioaji snapshots 回傳空清單")
+        snap = snaps[0]
+        snap_price = safe_float(getattr(snap, "close", None), 0.0)
+        if snap_price <= 0:
+            raise RuntimeError("Shioaji snapshot close 無有效價格")
+        snap_time = _quote_timestamp(snap)
+        snapshot_payload = _update_snapshot_cache(snap, snap_price, snap_time, "snapshot")
         # 偶爾輸出一行，避免過度洗板
         if datetime.now().second % 15 == 0:
-            print(f"[{now_str}] [SNAPSHOT] 成功抓取最新個股/期貨快照 -> 收盤價: {last_snapshot_cache['close']} | 累計量: {last_snapshot_cache['volume']}")
+            print(
+                f"[{now_str}] [SNAPSHOT] 收盤價: {snapshot_payload['close']} "
+                f"| 累計量: {snapshot_payload['total_volume']}"
+            )
     except Exception as e:
         print(f"[{now_str}] [WARN] snapshots 抓取失敗，採用降級機制: {e}")
         # 如果快取中沒有任何收盤價，我們以合約的 reference（基準價/平盤價）作為所有價格的初始值！
         if last_snapshot_cache.get("close", 0.0) == 0.0:
-            ref = safe_float(getattr(contract, 'reference', 0.0))
+            ref = _contract_reference(contract)
             print(f"[{now_str}]  ↳ ℹ️ 快取無先前紀錄，已採用合約參考平盤價初始化數值: {ref}")
-            last_snapshot_cache.update({
-                "open": ref,
-                "high": ref,
-                "low": ref,
-                "close": ref,
-                "volume": 0,
-                "reference": ref
+            with _quote_state_lock:
+                last_snapshot_cache.update({
+                    "open": ref,
+                    "high": ref,
+                    "low": ref,
+                    "close": ref,
+                    "volume": 0,
+                    "total_volume": 0,
+                    "reference": ref,
+                    "time": None,
+                    "code": getattr(contract, "code", None),
+                    "source": "contract_reference",
+                })
+    with _quote_state_lock:
+        return dict(last_snapshot_cache)
+
+
+@app.get("/api/quote_health")
+async def get_quote_health():
+    """Report the actual Shioaji subscription/Tick health, not only browser WS state."""
+    return _quote_health_data()
+
+
+@app.get("/api/weighted_stocks_stream_health")
+async def get_weighted_stocks_stream_health():
+    """Report subscription and last-message state for the four weighted stocks."""
+    return _weighted_stock_health_data()
+
+
+@app.get("/api/major_weighted_stocks_intraday")
+async def get_major_weighted_stocks_intraday():
+    """Bootstrap the four mini charts; realtime continuation arrives over WebSocket."""
+    global api, is_logged_in
+    stock_defs = list(_WEIGHTED_STOCK_DEFS)
+    today_dt = (datetime.utcnow() + timedelta(hours=8)).date()
+    if not is_logged_in:
+        twse_snapshots = _fetch_twse_stock_snapshots(stock_defs)
+        stocks = [
+            _twse_snapshot_to_intraday_payload(code, name, twse_snapshots.get(code, {}))
+            for code, name in stock_defs
+        ]
+        dates = sorted({s.get("date") for s in stocks if s.get("date")})
+        return {
+            "date": today_dt.strftime("%Y-%m-%d"),
+            "data_date": dates[-1] if dates else None,
+            "source": "twse_snapshot",
+            "stocks": stocks,
+        }
+
+    candidate_dates = [
+        (today_dt - timedelta(days=offset)).strftime("%Y-%m-%d")
+        for offset in range(0, 8)
+    ]
+    loop = asyncio.get_running_loop()
+    result = []
+    twse_snapshots = None
+
+    for code, name in stock_defs:
+        stock_contract = _resolve_stock_contract(api, code)
+        if not stock_contract:
+            if twse_snapshots is None:
+                twse_snapshots = _fetch_twse_stock_snapshots(stock_defs)
+            result.append(_twse_snapshot_to_intraday_payload(code, name, twse_snapshots.get(code, {})))
+            continue
+
+        kbars = None
+        used_date = None
+        last_error = None
+        for date_str in candidate_dates:
+            try:
+                async with _kbars_lock:
+                    kbars = await loop.run_in_executor(
+                        None,
+                        lambda c=stock_contract, d=date_str: api.kbars(
+                            contract=c, start=d, end=d, timeout=15000
+                        )
+                    )
+                if kbars and getattr(kbars, "ts", None) and len(kbars.ts) > 0:
+                    used_date = date_str
+                    break
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        if not used_date:
+            if twse_snapshots is None:
+                twse_snapshots = _fetch_twse_stock_snapshots(stock_defs)
+            payload = _twse_snapshot_to_intraday_payload(code, name, twse_snapshots.get(code, {}))
+            if last_error and not payload.get("bars"):
+                payload["error"] = last_error
+            result.append(payload)
+            continue
+
+        df = pd.DataFrame(dict(kbars))
+        if df.empty:
+            if twse_snapshots is None:
+                twse_snapshots = _fetch_twse_stock_snapshots(stock_defs)
+            result.append(_twse_snapshot_to_intraday_payload(code, name, twse_snapshots.get(code, {})))
+            continue
+
+        df["ts"] = pd.to_datetime(df["ts"], unit="ns", utc=True)
+        df.sort_values("ts", inplace=True)
+        df["time"] = (df["ts"].values.astype("int64") // 10**9) - 28800
+        df.rename(columns={"Close": "price", "Volume": "volume"}, inplace=True)
+
+        if "Amount" in df.columns:
+            amount = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
+        else:
+            amount = pd.to_numeric(df["price"], errors="coerce").fillna(0) * pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+        volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+        cum_volume = volume.cumsum()
+        cum_amount = amount.cumsum()
+        avg_price = cum_amount / cum_volume.where(cum_volume > 0)
+        # 股票 Volume 以「張」計、Amount 以「元」計時，直接相除會放大 1000 倍。
+        # 以價格比例判斷 SDK 回傳單位，兼容可能已是股數的新格式。
+        valid_price = pd.to_numeric(df["price"], errors="coerce").replace(0, pd.NA)
+        unit_ratio = (avg_price / valid_price).replace(
+            [float("inf"), float("-inf")], pd.NA
+        ).dropna()
+        if not unit_ratio.empty and safe_float(unit_ratio.median(), 1) > 100:
+            avg_price = avg_price / 1000
+        df["avg"] = avg_price.ffill().fillna(df["price"])
+
+        first_price = safe_float(df["price"].iloc[0], 0)
+        open_price = (
+            safe_float(df["Open"].iloc[0], first_price)
+            if "Open" in df.columns
+            else first_price
+        )
+        last_price = safe_float(df["price"].iloc[-1], 0)
+        reference = _contract_reference(stock_contract)
+        change_base = reference or open_price or first_price
+        bars = []
+        for row in df[["time", "price", "avg", "volume"]].itertuples(index=False):
+            bars.append({
+                "time": int(row.time),
+                "price": safe_float(row.price),
+                "avg": safe_float(row.avg),
+                "volume": safe_int(row.volume),
             })
-    return last_snapshot_cache
+
+        result.append({
+            "code": code,
+            "name": name,
+            "date": used_date,
+            "is_today": used_date == today_dt.strftime("%Y-%m-%d"),
+            "source": "shioaji_kbars",
+            "open": open_price,
+            "reference": reference,
+            "last": last_price,
+            "change": last_price - change_base if change_base else 0,
+            "change_pct": (
+                (last_price - change_base) / change_base * 100
+                if change_base
+                else 0
+            ),
+            "bars": bars,
+        })
+
+    dates = sorted({s.get("date") for s in result if s.get("date")})
+    return {
+        "date": today_dt.strftime("%Y-%m-%d"),
+        "data_date": dates[-1] if dates else None,
+        "stream": _weighted_stock_health_data(),
+        "stocks": result,
+    }
 
 @app.get("/api/txf_amplitude")
 async def get_txf_amplitude(period: str = "day"):
@@ -993,14 +2074,18 @@ async def get_txf_amplitude(period: str = "day"):
     # Shioaji 時間戳為 UTC+8 編碼（以 UTC 解析即為台灣時間）
     df_ts = pd.to_datetime(df['ts'], unit='ns', utc=True)
 
-    # 交易日 session 定義（對應 TAIFEX 官方日 K 慣例）：
-    # 前一日 15:00（夜盤）→ 當日 13:45（日盤）
-    # 實作：h>=15 的K棒歸入「次日」，h<15 保留原日期
-    df['_date'] = df_ts.dt.date
+    # 交易日 session 定義：前一日 15:00（夜盤）→ 當日 13:45（日盤）。
+    # 週五夜盤與週六凌晨必須併入下週一，不能獨立算成週六。
+    trading_day = pd.Series(df_ts.dt.normalize(), index=df.index)
     evening_mask = df_ts.dt.hour >= 15
-    df.loc[evening_mask, '_date'] = (
-        df_ts[evening_mask].dt.normalize() + pd.Timedelta(days=1)
-    ).dt.date
+    trading_day.loc[evening_mask] = (
+        trading_day.loc[evening_mask] + pd.Timedelta(days=1)
+    )
+    weekday = trading_day.dt.weekday
+    trading_day = trading_day + pd.to_timedelta(
+        weekday.map({5: 2, 6: 1}).fillna(0), unit="D"
+    )
+    df['_date'] = trading_day.dt.date
 
     if period == "week":
         df['_group'] = pd.to_datetime(df['_date'].astype(str)).dt.to_period('W')
@@ -1009,9 +2094,11 @@ async def get_txf_amplitude(period: str = "day"):
     else:
         df['_group'] = df['_date']
 
-    # 每組震幅 = 最高 - 最低
-    # MIN_BARS=400：過濾週一僅日盤的 ~270 根殘留組，同時保留週六夜盤延伸組(831根)
-    MIN_BARS = 400 if period == "day" else 1
+    # 每組振幅 = 最高 - 最低。
+    # day 模式依使用者定義：取過去 20 個交易日，每一天的「最高價 - 最低價」。
+    # 「近20個完整交易日」不可把只有日盤、夜盤或零散即時列的日期納入。
+    # 正常 TXF 交易日約 1,140 根 1 分 K；850 可容許少量缺筆，但排除半日殘缺。
+    MIN_BARS = 850 if period == "day" else 1
     grp = df.groupby('_group').agg(
         grp_high=('High', 'max'), grp_low=('Low', 'min'), bar_count=('ts', 'count')
     )
@@ -1021,6 +2108,8 @@ async def get_txf_amplitude(period: str = "day"):
 
     today = now_tw.date()
     if period == "day":
+        # 日統計採「前 19 個完整交易日 + 本日即時振幅」共 20 日。
+        # 先保留 20 日作為本日尚無資料時的 fallback；取得 amp_today 後再換入。
         hist = grp[grp.index < today].tail(20)
         current_period_row = df[df['_group'] == today]
     else:
@@ -1031,16 +2120,13 @@ async def get_txf_amplitude(period: str = "day"):
         return {"error": "insufficient_data", "amp_max": None, "amp_large": None,
                 "amp_avg": None, "amp_small": None, "amp_min": None, "amp_today": None, "days": 0}
 
-    amps = hist['amplitude'].values.astype(float)
-    amp_min   = float(np.min(amps))
-    amp_max   = float(np.max(amps))
-    amp_avg   = float(np.mean(amps))
-    # 大大震幅 = (平均 + 最大) ÷ 2；小小震幅 = (平均 + 最小) ÷ 2
-    amp_large = (amp_avg + amp_max) / 2
-    amp_small = (amp_avg + amp_min) / 2
+    def _round_amp(value):
+        return int(float(value) + 0.5)
 
     # 本日/本週/本月震幅：從快取取當前進行中 session 的高低
     amp_today = None  # float | None
+    amp_today_high = None
+    amp_today_low = None
     if period == "day":
         # h>=15→次日 架構下，夜盤時段（h>=15）的K棒歸屬「明日」group
         now_hour = now_tw.hour
@@ -1050,28 +2136,71 @@ async def get_txf_amplitude(period: str = "day"):
         else:
             live_session_row = current_period_row
         if not live_session_row.empty:
-            cache_amp = float(live_session_row['High'].max()) - float(live_session_row['Low'].min())
+            amp_today_high = float(live_session_row['High'].max())
+            amp_today_low = float(live_session_row['Low'].min())
+            cache_amp = amp_today_high - amp_today_low
             amp_today = cache_amp if cache_amp > 0 else None
     elif not current_period_row.empty:
-        cache_amp = float(current_period_row['High'].max()) - float(current_period_row['Low'].min())
+        amp_today_high = float(current_period_row['High'].max())
+        amp_today_low = float(current_period_row['Low'].min())
+        cache_amp = amp_today_high - amp_today_low
         amp_today = cache_amp if cache_amp > 0 else None
 
     if period == "day" and is_logged_in:
-        snap_high = last_snapshot_cache.get("high", 0)
-        snap_low  = last_snapshot_cache.get("low", 0)
+        with _quote_state_lock:
+            snap_high = safe_float(last_snapshot_cache.get("high"), 0)
+            snap_low = safe_float(last_snapshot_cache.get("low"), 0)
         if snap_high > 0 and snap_low > 0:
-            # 即時快照覆蓋 DB 值（快照含最新 tick，DB 以分 K 為主）
-            amp_today = snap_high - snap_low
+            # Snapshot 的 high/low 可能只涵蓋目前盤段；不可覆蓋已包含夜盤的
+            # 完整交易日 K 棒。兩者合併後再由最新 Tick 持續延伸。
+            amp_today_high = (
+                max(amp_today_high, snap_high)
+                if amp_today_high is not None else snap_high
+            )
+            amp_today_low = (
+                min(amp_today_low, snap_low)
+                if amp_today_low is not None else snap_low
+            )
+            amp_today = amp_today_high - amp_today_low
+
+    historical_amps = hist['amplitude'].values.astype(float)
+    if period == "day" and amp_today is not None:
+        # 本日進行中也算在「近 20 日」內，因此換掉最舊的一個完整交易日。
+        amps = np.append(historical_amps[-19:], float(amp_today))
+    else:
+        amps = historical_amps
+
+    amp_sum = float(np.sum(amps))
+    amp_count = len(amps)
+    amp_min = _round_amp(np.min(amps))
+    amp_max = _round_amp(np.max(amps))
+    amp_avg_raw = amp_sum / amp_count if amp_count else 0
+    amp_avg = _round_amp(amp_avg_raw)
+    # 大大震幅 = (平均震幅 + 最大震幅) / 2；小小震幅 = (平均震幅 + 最小震幅) / 2
+    amp_large = _round_amp((amp_avg + amp_max) / 2)
+    amp_small = _round_amp((amp_avg + amp_min) / 2)
 
     return {
-        "amp_max":   round(amp_max),
-        "amp_large": round(amp_large),
-        "amp_avg":   round(amp_avg),
-        "amp_small": round(amp_small),
-        "amp_min":   round(amp_min),
-        "amp_today": round(amp_today) if amp_today is not None else None,
-        "days":      len(amps),
+        "amp_max":   amp_max,
+        "amp_large": amp_large,
+        "amp_avg":   amp_avg,
+        "amp_small": amp_small,
+        "amp_min":   amp_min,
+        "amp_today": _round_amp(amp_today) if amp_today is not None else None,
+        "amp_today_high": _round_amp(amp_today_high) if amp_today_high is not None else None,
+        "amp_today_low": _round_amp(amp_today_low) if amp_today_low is not None else None,
+        "amp_sum":   _round_amp(amp_sum),
+        "days":      amp_count,
         "period":    period,
+        "definitions": {
+            "amp_max": "日週期為前19個完整交易日加本日即時振幅的最大值；其他週期取近20個完整週期",
+            "amp_large": "(平均振幅 + 最大振幅) / 2",
+            "amp_avg": "日週期為前19個完整交易日加本日即時振幅後除以20",
+            "amp_sum": "納入統計的20日高低振幅點數加總",
+            "amp_small": "(平均振幅 + 最小振幅) / 2",
+            "amp_min": "日週期為前19個完整交易日加本日即時振幅的最小值；其他週期取近20個完整週期",
+            "amp_today": "目前進行中週期的高低點振幅",
+        },
     }
 
 
@@ -1185,20 +2314,19 @@ async def get_amplitude_statistics(days: int = 20, contract: str = "TXFR1", date
         has_today = any((today, s) in session_lookup for s in ('morning', 'afternoon', 'night'))
         if not has_today:
             try:
-                base_sym = _rt_contract_code[:3]
-                futures_cat = getattr(api.Contracts.Futures, base_sym, None)
-                rt_obj = (getattr(futures_cat, _rt_contract_code, None)
-                          if futures_cat else None)
-                if rt_obj is None and futures_cat:
-                    try: rt_obj = futures_cat[_rt_contract_code]
-                    except Exception: pass
+                rt_obj = _resolve_market_contract(api, _rt_contract_code)
                 if rt_obj:
                     today_str = today.isoformat()
                     loop = asyncio.get_running_loop()
                     async with _kbars_lock:
                         today_kbars = await loop.run_in_executor(
                             None,
-                            lambda: api.kbars(rt_obj, start=today_str, end=today_str, timeout=15000)
+                            lambda: api.kbars(
+                                contract=rt_obj,
+                                start=today_str,
+                                end=today_str,
+                                timeout=15000,
+                            )
                         )
                     if today_kbars and today_kbars.ts and len(today_kbars.ts) > 0:
                         df_t = pd.DataFrame(dict(today_kbars))
@@ -3606,17 +4734,24 @@ async def api_debug_contracts():
     if not is_logged_in:
         raise HTTPException(status_code=401, detail="Not logged in")
     try:
-        futures_txf = api.Contracts.Futures.TXF
+        futures = api.contracts.list(sj.SecurityType.Futures)
         found = []
-        for attr in dir(futures_txf):
-            if attr.startswith("TXF") and len(attr) == 5:
-                c = getattr(futures_txf, attr, None)
-                if c is not None:
-                    found.append({
-                        "code": getattr(c, "code", attr),
-                        "name": getattr(c, "name", ""),
-                        "delivery_date": str(getattr(c, "delivery_date", "")),
-                    })
+        for c in futures:
+            code = str(getattr(c, "code", "") or "")
+            if not code.startswith("TXF"):
+                continue
+            try:
+                info = api.contracts.info(c)
+            except Exception:
+                info = None
+            found.append({
+                "code": code,
+                "target_code": getattr(c, "target_code", None),
+                "name": getattr(info, "name", "") if info else "",
+                "delivery_date": (
+                    str(getattr(info, "delivery_date", "")) if info else ""
+                ),
+            })
         found.sort(key=lambda x: x["code"])
         return {"count": len(found), "contracts": found}
     except Exception as e:
@@ -4193,10 +5328,18 @@ async def api_integrated_strategy():
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
+        await websocket.send_text(json.dumps({
+            "type": "quote_status",
+            "data": _quote_health_data(),
+        }))
         while True:
-            data = await websocket.receive_text()
+            await websocket.receive_text()
             # 可以接收前端 ping 等訊息
     except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[WS] 前端連線異常: {e}")
+    finally:
         manager.disconnect(websocket)
 
 @app.on_event("startup")
