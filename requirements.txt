@@ -1,9 +1,12 @@
 fastapi
 uvicorn[standard]
-shioaji==1.7.1
 pandas
 python-dotenv
 websockets
 certifi
 apscheduler
 anthropic
+urllib3<2; python_version < "3.10" and sys_platform == "darwin"
+
+# 富邦新一代 API 是官方平台專用 binary，請執行：
+# python3 install_fubon_sdk.py

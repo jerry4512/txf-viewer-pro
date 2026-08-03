@@ -31,9 +31,9 @@
 | 資料 | 來源 |
 |---|---|
 | 法人買賣超 | TWSE T86 + TPEx，存入 `stock_cache.db > institutional_trading` |
-| 日 K 線 | Shioaji API，存入 `stock_cache.db > daily_kbars` |
+| 日 K 線 | 現有本地資料，存於 `stock_cache.db > daily_kbars`；富邦期貨行情串接不更新個股日 K |
 | 今日行情 | TWSE `STOCK_DAY_ALL` + TPEx OpenAPI（即時爬取） |
-| 股票名稱 / 產業 | Shioaji contract 屬性，存入 `stock_names` |
+| 股票名稱 / 產業 | 既有券商合約匯入資料，存入 `stock_names` |
 
 ---
 
@@ -168,7 +168,7 @@ totalInstitutionBuy5 > 0  AND  (foreignBuy5 > 0 OR investmentTrustBuy5 > 0)
 
 | 指標 | 計算方式 |
 |---|---|
-| `volume` 單位 | **張（lot）**，Shioaji 日K即為張，`_VOLUME_UNIT = "lot"` |
+| `volume` 單位 | **張（lot）**，舊日 K 匯入資料即為張，`_VOLUME_UNIT = "lot"` |
 | `amountToday` | `close * volume * 1000`（每張 = 1000 股） |
 | `amount_ma5` | `amount` 的 5 日移動平均 |
 | `amount_ma20` | `amount` 的 20 日移動平均 |
@@ -558,7 +558,7 @@ s['hasIndustryResonance'] = (s['score'] >= 75 and industry_score >= 80)
 
 ### 11.4 股票所屬產業
 
-優先來源：`stock_names.category`（由 `sync_stock_kbars` 從 Shioaji `contract.category` 取得），
+優先來源：`stock_names.category`（由舊版 `sync_stock_kbars` 從券商 `contract.category` 取得），
 再轉換 `_resolve_industry()` 為中文。ETF 代碼產業 → `'ETF/其他'`。
 
 ---
@@ -767,5 +767,5 @@ results.sort(key=lambda x: (
 | `major_bonus max` | 8 | 主力特徵加分上限 |
 | 最小 K 線根數 | 62 | 能計算60MA的最低需求 |
 | K 線同步天數 | 115 天 | `end_date - 115 days` |
-| API batch 大小 | 30 天 | Shioaji API 單次上限 |
+| 舊匯入器 API batch 大小 | 30 天 | 僅供既有個股日 K 匯入器相容 |
 | 排程時間 | 平日 18:00 | APScheduler CronTrigger |

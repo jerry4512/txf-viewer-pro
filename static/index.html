@@ -541,14 +541,15 @@
             box-shadow: 0 0 8px rgba(255,91,91,0.58);
         }
         .fl-weighted-stocks {
-            flex: 0 0 282px;
-            min-height: 220px;
+            flex: 1 1 auto;
+            min-height: 0;
         }
         .fl-weighted-grid {
             flex: 1;
             min-height: 0;
             display: grid;
-            grid-template-columns: repeat(4, minmax(150px, 1fr));
+            grid-template-columns: minmax(0, 1fr);
+            grid-template-rows: repeat(4, minmax(0, 1fr));
             gap: 6px;
             padding: 6px;
             background: #0d0f14;
@@ -593,12 +594,36 @@
             min-height: 0;
             position: relative;
         }
+        .fl-weighted-hour-axis {
+            position: absolute;
+            left: 24px;
+            right: 58px;
+            bottom: 1px;
+            z-index: 8;
+            height: 17px;
+            color: #d7dce5;
+            font-family: -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, sans-serif;
+            font-size: 10px;
+            font-weight: 600;
+            line-height: 17px;
+            font-variant-numeric: tabular-nums;
+            pointer-events: none;
+            white-space: nowrap;
+        }
+        .fl-weighted-hour-label {
+            position: absolute;
+            top: 0;
+            transform: translateX(-50%);
+            text-shadow: 0 1px 2px #000;
+        }
+        .fl-weighted-hour-label:first-child {
+            transform: none;
+        }
         @media (max-width: 1280px) {
-            .fl-weighted-stocks {
-                flex-basis: 360px;
-            }
-            .fl-weighted-grid {
-                grid-template-columns: repeat(2, minmax(180px, 1fr));
+            #fl-right-panel {
+                width: 28% !important;
+                min-width: 250px !important;
+                max-width: 350px !important;
             }
         }
         @media (max-width: 900px) {
@@ -611,11 +636,18 @@
                 width: 100% !important;
                 max-width: none !important;
             }
-            .fl-weighted-stocks {
-                flex-basis: 520px;
+            #fl-center-panel {
+                width: 100% !important;
+                flex: 0 0 620px !important;
+                min-height: 620px;
             }
-            .fl-weighted-grid {
-                grid-template-columns: 1fr;
+            #fl-right-panel {
+                flex: 0 0 560px !important;
+                min-height: 560px;
+            }
+            #fl-right-panel .fl-weighted-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                grid-template-rows: repeat(2, minmax(0, 1fr));
             }
             .fl-chart-toolbar {
                 flex-wrap: wrap;
@@ -646,6 +678,16 @@
             .fl-chart-period-control > span,
             .fl-chart-market-label {
                 display: none;
+            }
+        }
+        @media (max-width: 620px) {
+            #fl-right-panel {
+                flex-basis: 900px !important;
+                min-height: 900px;
+            }
+            #fl-right-panel .fl-weighted-grid {
+                grid-template-columns: minmax(0, 1fr);
+                grid-template-rows: repeat(4, minmax(0, 1fr));
             }
         }
 
@@ -798,19 +840,27 @@
             <i class="fas fa-chart-line" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #4facfe; font-size: 1.8rem; animation: loading-pulse 2s infinite;"></i>
         </div>
         <div id="initial-loading-title" style="font-size: 1.4rem; font-weight: bold; margin-bottom: 10px; letter-spacing: 1px; background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">系統啟動與數據同步中</div>
-        <div id="initial-loading-text" style="color: #a0a0a0; font-size: 1.05rem; animation: loading-fadePulse 1.5s infinite;">正在登入並同步永豐金證券伺服器...</div>
+        <div id="initial-loading-text" style="color: #a0a0a0; font-size: 1.05rem; animation: loading-fadePulse 1.5s infinite;">正在登入並同步富邦期貨行情服務...</div>
     </div>
     
     <!-- 登入畫面 -->
     <div id="login-container" class="container">
-        <h2>🔑 系統登入</h2>
+        <h2>🔑 富邦新一代 API 行情登入</h2>
         <div class="form-group">
-            <label>API Key</label>
-            <input type="password" id="api_key">
+            <label>身分證字號</label>
+            <input type="password" id="person_id" autocomplete="username">
         </div>
         <div class="form-group">
-            <label>Secret Key</label>
-            <input type="password" id="secret_key">
+            <label>API Key</label>
+            <input type="password" id="api_key" autocomplete="current-password">
+        </div>
+        <div class="form-group">
+            <label>憑證路徑（選填；未填使用 API Key DMA 登入）</label>
+            <input type="text" id="cert_path" placeholder="例如 /Users/you/Downloads/cert.pfx">
+        </div>
+        <div class="form-group">
+            <label>憑證密碼（選填）</label>
+            <input type="password" id="cert_pass" autocomplete="off">
         </div>
         <div class="form-group row">
             <input type="checkbox" id="save_keys" checked>
@@ -2103,53 +2153,53 @@
                     </div>
                 </div>
 
-                <!-- 日多方關卡價 -->
-                <div class="fl-left-section-header" style="background:#081e10; color:#26de81; border-bottom:1px solid #0f2e18;">
+                <!-- 日多方關卡價（台股慣例：紅漲） -->
+                <div class="fl-left-section-header" style="background:#1c0808; color:#ff6b6b; border-bottom:1px solid #2e1010;">
                     日多方關卡價
-                </div>
-                <div style="background:#060f08; font-size:0.78rem;">
-                    <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
-                        <span style="color:#26de81;">開卡值5</span><span id="fl-long-5" style="color:#ddd; font-family:monospace;">--</span>
-                    </div>
-                    <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
-                        <span style="color:#26de81;">開卡值4</span><span id="fl-long-4" style="color:#ddd; font-family:monospace;">--</span>
-                    </div>
-                    <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
-                        <span style="color:#26de81;">開卡值3</span><span id="fl-long-3" style="color:#ddd; font-family:monospace;">--</span>
-                    </div>
-                    <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
-                        <span style="color:#26de81;">開卡值2</span><span id="fl-long-2" style="color:#ddd; font-family:monospace;">--</span>
-                    </div>
-                    <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
-                        <span style="color:#26de81;">開卡值1</span><span id="fl-long-1" style="color:#ddd; font-family:monospace;">--</span>
-                    </div>
-                    <div class="fl-barrier-row">
-                        <span style="color:#888;">最低值</span><span id="fl-long-low" style="color:#ddd; font-family:monospace;">--</span>
-                    </div>
-                </div>
-
-                <!-- 日空方關卡價 -->
-                <div class="fl-left-section-header" style="background:#1c0808; color:#ff6b6b; border-top:1px solid #2e1010; border-bottom:1px solid #2e1010;">
-                    日空方關卡價
                 </div>
                 <div style="background:#0f0606; font-size:0.78rem;">
                     <div class="fl-barrier-row" style="border-bottom:1px solid #1c0c0c;">
-                        <span style="color:#888;">最高值</span><span id="fl-short-high" style="color:#ddd; font-family:monospace;">--</span>
+                        <span style="color:#ff6b6b;">開卡值5</span><span id="fl-long-5" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #1c0c0c;">
-                        <span style="color:#ff6b6b;">開卡值1</span><span id="fl-short-1" style="color:#ddd; font-family:monospace;">--</span>
+                        <span style="color:#ff6b6b;">開卡值4</span><span id="fl-long-4" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #1c0c0c;">
-                        <span style="color:#ff6b6b;">開卡值2</span><span id="fl-short-2" style="color:#ddd; font-family:monospace;">--</span>
+                        <span style="color:#ff6b6b;">開卡值3</span><span id="fl-long-3" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #1c0c0c;">
-                        <span style="color:#ff6b6b;">開卡值3</span><span id="fl-short-3" style="color:#ddd; font-family:monospace;">--</span>
+                        <span style="color:#ff6b6b;">開卡值2</span><span id="fl-long-2" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #1c0c0c;">
-                        <span style="color:#ff6b6b;">開卡值4</span><span id="fl-short-4" style="color:#ddd; font-family:monospace;">--</span>
+                        <span style="color:#ff6b6b;">開卡值1</span><span id="fl-long-1" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row">
-                        <span style="color:#ff6b6b;">開卡值5</span><span id="fl-short-5" style="color:#ddd; font-family:monospace;">--</span>
+                        <span style="color:#aaa;">今日最低價</span><span id="fl-long-low" style="color:#ff9a94; font-family:monospace; font-weight:bold;">--</span>
+                    </div>
+                </div>
+
+                <!-- 日空方關卡價（台股慣例：綠跌） -->
+                <div class="fl-left-section-header" style="background:#081e10; color:#26de81; border-top:1px solid #0f2e18; border-bottom:1px solid #0f2e18;">
+                    日空方關卡價
+                </div>
+                <div style="background:#060f08; font-size:0.78rem;">
+                    <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
+                        <span style="color:#aaa;">今日最高價</span><span id="fl-short-high" style="color:#78e394; font-family:monospace; font-weight:bold;">--</span>
+                    </div>
+                    <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
+                        <span style="color:#26de81;">開卡值1</span><span id="fl-short-1" style="color:#ddd; font-family:monospace;">--</span>
+                    </div>
+                    <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
+                        <span style="color:#26de81;">開卡值2</span><span id="fl-short-2" style="color:#ddd; font-family:monospace;">--</span>
+                    </div>
+                    <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
+                        <span style="color:#26de81;">開卡值3</span><span id="fl-short-3" style="color:#ddd; font-family:monospace;">--</span>
+                    </div>
+                    <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
+                        <span style="color:#26de81;">開卡值4</span><span id="fl-short-4" style="color:#ddd; font-family:monospace;">--</span>
+                    </div>
+                    <div class="fl-barrier-row">
+                        <span style="color:#26de81;">開卡值5</span><span id="fl-short-5" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                 </div>
 
@@ -2254,9 +2304,19 @@
                 </div>
             </div>
 
-            <!-- [區塊 C2] 四大權值股：日內走勢 + 均價線 -->
+        </div><!-- /#fl-center-panel -->
+
+        <!-- ─────────────────────────────────────────────
+             右側欄 (Right Panel)：四大權值股
+             ───────────────────────────────────────────── -->
+        <div id="fl-right-panel" style="width:26%; min-width:280px; max-width:400px; display:flex; flex-direction:column; flex-shrink:0; min-height:0;">
+
+            <!-- 四大權值股：四張圖依右欄高度平均自適應 -->
             <div id="fl-weighted-stocks" class="fl-block fl-weighted-stocks">
-                <div class="fl-block-header">四大權值股</div>
+                <div class="fl-block-header" style="display:flex; align-items:center; justify-content:space-between;">
+                    <span>四大權值股</span>
+                    <span id="fl-weighted-source" style="font-size:0.68rem; color:#26de81; font-weight:600;">● 富邦即時</span>
+                </div>
                 <div class="fl-weighted-grid">
                     <div class="fl-weighted-card" data-code="2330">
                         <div class="fl-weighted-card-head">
@@ -2287,43 +2347,6 @@
                         <div id="fl-weighted-chart-2308" class="fl-weighted-chart"></div>
                     </div>
                 </div>
-            </div>
-
-        </div><!-- /#fl-center-panel -->
-
-        <!-- ─────────────────────────────────────────────
-             右側欄 (Right Panel) ~22% width
-             ───────────────────────────────────────────── -->
-        <div id="fl-right-panel" style="width:22%; min-width:220px; max-width:340px; display:flex; flex-direction:column; gap:6px; flex-shrink:0;">
-
-            <!-- [區塊 R1] 大盤資訊 / 市場摘要 -->
-            <div id="fl-right-market" class="fl-block" style="flex:0 0 90px;">
-                <div class="fl-block-header">🌐 fl-right-market｜大盤摘要</div>
-                <div class="fl-block-body">大盤資訊區塊</div>
-            </div>
-
-            <!-- [區塊 R2] 輔助小圖 1（例如：個股日線） -->
-            <div id="fl-right-chart-1" class="fl-block" style="flex:1;">
-                <div class="fl-block-header">🔷 fl-right-chart-1｜輔助圖 1</div>
-                <div class="fl-block-body">輔助圖表 1 區塊</div>
-            </div>
-
-            <!-- [區塊 R3] 輔助小圖 2 -->
-            <div id="fl-right-chart-2" class="fl-block" style="flex:1;">
-                <div class="fl-block-header">🔷 fl-right-chart-2｜輔助圖 2</div>
-                <div class="fl-block-body">輔助圖表 2 區塊</div>
-            </div>
-
-            <!-- [區塊 R4] 輔助小圖 3 -->
-            <div id="fl-right-chart-3" class="fl-block" style="flex:1;">
-                <div class="fl-block-header">🔷 fl-right-chart-3｜輔助圖 3</div>
-                <div class="fl-block-body">輔助圖表 3 區塊</div>
-            </div>
-
-            <!-- [區塊 R5] 新聞 / 消息面 -->
-            <div id="fl-news-feed" class="fl-block" style="flex:0 0 130px;">
-                <div class="fl-block-header">📰 fl-news-feed｜新聞消息</div>
-                <div class="fl-block-body">新聞 / 消息面區塊</div>
             </div>
 
         </div><!-- /#fl-right-panel -->
@@ -2358,7 +2381,7 @@
                     </div>
                 </div>
                 <div style="color:#555; font-size:0.78rem; display:flex; align-items:center; gap:8px;">
-                    <span style="color:#444; font-size:0.68rem;">資料來源：永豐 Shioaji TXFR1 / 近月合約 1分K</span>
+                    <span style="color:#444; font-size:0.68rem;">資料來源：富邦新一代 API 近月期貨 1分K＋本地快取</span>
                     <span>更新：<span id="amp-stats-updated-at">-</span></span>
                     <button onclick="loadAmplitudeStatistics()" style="background:#1a2a3a; border:1px solid #334; color:#4facfe; font-size:0.72rem; padding:2px 8px; border-radius:4px; cursor:pointer;">🔄</button>
                     <button id="amp-send-tg-btn" onclick="sendAmplitudeDailyReport()" style="background:rgba(79,172,254,0.12); border:1px solid rgba(79,172,254,0.4); color:#4facfe; font-size:0.72rem; padding:2px 10px; border-radius:4px; cursor:pointer; white-space:nowrap;">📤 發送昨日震幅狀態</button>
@@ -2494,7 +2517,7 @@
     <div id="drawer-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998;" onclick="closeStockDrawer()"></div>
 
     <!-- 載入主程式 (加入版本號避免快取問題) -->
-    <script src="app_pro.js?v=freelancer-cost-line-break-v18"></script>
+    <script src="app_pro.js?v=weighted-open-overlap-v28"></script>
 </body>
 </html>
 

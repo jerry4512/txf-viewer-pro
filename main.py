@@ -12,7 +12,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import shioaji as sj
 import pandas as pd
 from dotenv import load_dotenv, set_key
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -24,6 +23,7 @@ import broker_analysis  # key broker analysis tab
 import broker_fetcher  # official on-demand broker data fetcher
 import moneydj_fetcher  # MoneyDJ Fubon broker period summary fetcher
 from market_status import sync_taiex_daily_kbars, normalize_date, TAIEX_SYMBOL
+from fubon_market_data import FubonMarketDataClient, FubonMarketDataError
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
@@ -69,12 +69,12 @@ def sanitize_for_json(obj):
             return obj.item()  # converts any numpy scalar to Python native
     return obj
 
-# 全域 API 實例與狀態
-api = sj.Shioaji(simulation=(os.getenv("SHIOAJI_SIMULATION", "False") == "True"))
+# 全域行情 API 實例與狀態（只使用富邦行情，不含任何交易功能）
+api = FubonMarketDataClient()
 is_logged_in = False
 contract = None
 main_loop = None
-_kbars_lock = asyncio.Lock()  # Shioaji kbars 不支援並發，全局序列化
+_kbars_lock = asyncio.Lock()  # 富邦 REST 查詢全局序列化，避免碰觸速率限制
 _kbars_retry_after: dict[tuple[str, str], float] = {}
 _kbars_retry_lock = threading.Lock()
 _HISTORY_START = datetime(2025, 1, 1)  # 歷史補取目標起點
@@ -123,7 +123,7 @@ last_snapshot_cache = {
 
 
 def _quote_scalar(value):
-    """Normalize Shioaji v1 scalars and legacy one-element list payloads."""
+    """Normalize scalar and legacy one-element list payloads."""
     while isinstance(value, (list, tuple)):
         if not value:
             return None
@@ -220,8 +220,11 @@ def _weighted_stock_health_data() -> dict:
             stocks.append(state)
     return {
         "logged_in": is_logged_in,
-        "shioaji_version": getattr(sj, "__version__", "unknown"),
-        "kbar_callback_available": hasattr(api, "set_on_kbar_callback"),
+        "provider": "fubon",
+        "source": "fubon_stock_marketdata",
+        "websocket_connected": bool(getattr(api, "stock_connected", False)),
+        "fubon_version": getattr(api, "version", "unknown"),
+        "kbar_callback_available": True,
         "stocks": stocks,
     }
 
@@ -236,7 +239,7 @@ def _stream_callback_broadcast(message_type: str, payload: dict):
 
 
 def _weighted_kbar_timestamp(kbar) -> int:
-    """Convert Shioaji's Taiwan wall-clock KBar date/time to real UTC epoch."""
+    """Convert Taiwan wall-clock KBar date/time to real UTC epoch."""
     date_value = _quote_field(kbar, "date", "Date")
     time_value = _quote_field(kbar, "time", "Time")
     if date_value is not None and time_value is not None:
@@ -317,12 +320,12 @@ def _handle_weighted_stock_tick(quote):
         "change_pct": (change / reference * 100) if reference else 0,
         "tick_volume": tick_volume,
         "total_volume": total_volume,
-        "source": "shioaji_tick",
+        "source": "market_stream",
     })
 
 
 def weighted_stock_kbar_callback(*args):
-    """Receive Shioaji 1.7.1 server-side realtime one-minute stock KBars."""
+    """Normalize a server-side realtime one-minute stock KBar."""
     try:
         if not args:
             return
@@ -339,6 +342,10 @@ def weighted_stock_kbar_callback(*args):
         open_price = safe_float(_quote_field(kbar, "open", "Open"), close_price)
         volume = max(0, safe_int(_quote_field(kbar, "volume", "Volume"), 0))
         amount = max(0.0, safe_float(_quote_field(kbar, "amount", "Amount"), 0))
+        candle_average = safe_float(
+            _quote_field(kbar, "average", "Average", "avg_price", "AvgPrice"),
+            0,
+        )
 
         with _weighted_stock_state_lock:
             state = _weighted_stock_stream_state.setdefault(
@@ -348,13 +355,14 @@ def weighted_stock_kbar_callback(*args):
                 ),
             )
             reference = safe_float(state.get("reference"), 0)
-            avg_price = safe_float(state.get("avg"), 0) or close_price
+            avg_price = candle_average or safe_float(state.get("avg"), 0) or close_price
             state.update({
                 "kbar_subscription": "live",
                 "last_kbar_received_at": received_at,
                 "last_kbar_exchange_time": event_time,
                 "kbar_count": safe_int(state.get("kbar_count"), 0) + 1,
                 "last": close_price,
+                "avg": avg_price,
                 "open": safe_float(state.get("open"), 0) or open_price,
                 "error": None,
             })
@@ -376,7 +384,7 @@ def weighted_stock_kbar_callback(*args):
             "reference": reference,
             "change": change,
             "change_pct": (change / reference * 100) if reference else 0,
-            "source": "shioaji_kbar",
+            "source": "market_kbar",
         })
     except Exception as exc:
         print(f"[WEIGHTED_KBAR] 即時 K 棒處理異常: {exc}")
@@ -396,37 +404,17 @@ def _contract_reference(contract_obj=None) -> float:
 
 
 def _resolve_market_contract(api_instance, code: str):
-    """Resolve through Shioaji 1.7's maintained lowercase contract API."""
+    """Resolve a futures alias through Fubon's current contract list."""
     if not api_instance or not code:
         return None
     code = str(code).strip().upper()
-    contracts_api = getattr(api_instance, "contracts", None)
-    if contracts_api and hasattr(contracts_api, "get"):
-        try:
-            resolved = contracts_api.get(code)
-            if resolved:
-                try:
-                    info = contracts_api.info(resolved)
-                    with _contract_info_lock:
-                        _contract_info_cache[code] = info
-                except Exception:
-                    pass
-                return resolved
-        except Exception:
-            pass
-
-    # Only for older SDK compatibility. Shioaji 1.7 keeps this API working but
-    # no longer maintains it.
-    try:
-        if code.isdigit():
-            return api_instance.Contracts.Stocks[code]
-        root = code[:3]
-        futures_root = getattr(api_instance.Contracts.Futures, root, None)
-        if futures_root:
-            return futures_root[code]
-    except Exception:
-        pass
-    return None
+    if not code.startswith(("TXF", "MXF", "TMF")):
+        return None
+    resolved = api_instance.resolve_contract(code)
+    if resolved:
+        with _contract_info_lock:
+            _contract_info_cache[code] = resolved
+    return resolved
 
 
 def _reset_quote_state(contract_obj=None):
@@ -497,7 +485,10 @@ def _update_snapshot_cache(quote, price: float, event_time: int, source: str) ->
     high_value = safe_float(_quote_field(quote, "high", "High"), 0.0)
     low_value = safe_float(_quote_field(quote, "low", "Low"), 0.0)
     change_value = _quote_field(quote, "price_chg", "change_price")
-    reference = _contract_reference()
+    reference = safe_float(
+        _quote_field(quote, "reference", "previousClose"),
+        _contract_reference(),
+    )
     if reference <= 0 and change_value is not None:
         reference = price - safe_float(change_value, 0.0)
 
@@ -576,29 +567,19 @@ def _quote_health_data() -> dict:
         "tick_code": tick_code,
         "selected_code": getattr(contract, "code", None) if contract else None,
         "target_code": getattr(contract, "target_code", None) if contract else None,
-        "kbar_source": (
-            "historical_api_plus_tick_aggregation"
-            if str(getattr(contract, "security_type", "")) in {"FUT", "SecurityType.Futures"}
-            else "historical_api"
-        ),
+        "provider": "fubon",
+        "kbar_source": "fubon_intraday_rest_plus_websocket_candles",
     }
 
 
-def global_quote_event_callback(resp_code: int, event_code: int, info: str, event: str):
+def global_quote_event_callback(*args):
     global _quote_subscription_status, _quote_event_detail
-    if event_code == 16:
-        status = "subscribed"
-    elif event_code in {0, 13}:
-        status = "connected"
-    elif event_code in {1, 2, 3, 4, 5}:
-        status = "error"
-    else:
-        status = _quote_subscription_status
-    detail = f"{event or ''} {info or ''}".strip()[:240]
+    status = "connected"
+    detail = "Fubon market data connected"
     with _quote_state_lock:
         _quote_subscription_status = status
         _quote_event_detail = detail
-    print(f"[QUOTE_EVENT] response={resp_code} event={event_code} status={status} {detail}")
+    print("[QUOTE_EVENT] Fubon WebSocket connected")
     if main_loop:
         asyncio.run_coroutine_threadsafe(
             manager.broadcast(json.dumps({"type": "quote_status", "data": _quote_health_data()})),
@@ -606,12 +587,12 @@ def global_quote_event_callback(resp_code: int, event_code: int, info: str, even
         )
 
 
-def global_quote_session_down_callback():
+def global_quote_session_down_callback(*args):
     global _quote_subscription_status, _quote_event_detail
     with _quote_state_lock:
         _quote_subscription_status = "disconnected"
-        _quote_event_detail = "Shioaji quote session down"
-    print("[QUOTE_EVENT] Shioaji 報價連線中斷")
+        _quote_event_detail = "Fubon quote session down"
+    print("[QUOTE_EVENT] Fubon 報價連線中斷，背景重連中")
     if main_loop:
         asyncio.run_coroutine_threadsafe(
             manager.broadcast(json.dumps({"type": "quote_status", "data": _quote_health_data()})),
@@ -619,108 +600,179 @@ def global_quote_session_down_callback():
         )
 
 
-def _register_quote_callbacks(api_instance):
-    """Register Shioaji 1.7 direct callbacks, with legacy fallback."""
-    callback_api = (
-        api_instance
-        if hasattr(api_instance, "set_on_tick_fop_v1_callback")
-        else api_instance.quote
+def global_fubon_candle_callback(candle):
+    """Persist Fubon's authoritative server-side one-minute futures candle."""
+    code = str(_quote_field(candle, "code") or "")
+    event_time = _quote_timestamp(candle)
+    close_price = safe_float(_quote_field(candle, "close"), 0)
+    if not code.startswith(("TXF", "MXF", "TMF")) or event_time <= 0 or close_price <= 0:
+        return
+    bucket_ns = (event_time // 60) * 60 * 1_000_000_000
+    _save_rt_bar_to_db(
+        code,
+        bucket_ns,
+        safe_float(_quote_field(candle, "open"), close_price),
+        safe_float(_quote_field(candle, "high"), close_price),
+        safe_float(_quote_field(candle, "low"), close_price),
+        close_price,
+        max(0, safe_int(_quote_field(candle, "volume"), 0)),
     )
-    callback_api.set_on_tick_fop_v1_callback(global_quote_callback)
-    callback_api.set_on_tick_stk_v1_callback(global_quote_callback)
-    if not hasattr(callback_api, "set_on_kbar_callback"):
-        raise RuntimeError("Shioaji 版本不支援即時 K 棒，請安裝 1.7.1")
-    callback_api.set_on_kbar_callback(weighted_stock_kbar_callback)
+    if main_loop:
+        asyncio.run_coroutine_threadsafe(
+            manager.broadcast(json.dumps({"type": "cache_updated"})), main_loop
+        )
 
-    event_api = (
-        api_instance
-        if hasattr(api_instance, "set_event_callback")
-        else api_instance.quote
+
+def global_fubon_aggregate_callback(aggregate):
+    """Refresh session OHLC/reference without double-counting trades."""
+    if not _quote_matches_selected_contract(aggregate):
+        return
+    price = safe_float(
+        _quote_field(aggregate, "closePrice", "lastPrice", "close"), 0
     )
-    event_api.set_event_callback(global_quote_event_callback)
-    if hasattr(event_api, "set_session_down_callback"):
-        event_api.set_session_down_callback(global_quote_session_down_callback)
+    if price <= 0:
+        return
+    normalized = {
+        "code": _quote_field(aggregate, "code", "symbol"),
+        "close": price,
+        "open": _quote_field(aggregate, "openPrice", "open"),
+        "high": _quote_field(aggregate, "highPrice", "high"),
+        "low": _quote_field(aggregate, "lowPrice", "low"),
+        "reference": _quote_field(aggregate, "previousClose", "reference"),
+        "total_volume": _quote_field(aggregate, "tradeVolume"),
+        "ts": _quote_field(aggregate, "lastUpdated", "closeTime"),
+    }
+    total = _quote_field(aggregate, "total", default={}) or {}
+    if isinstance(total, dict):
+        normalized["total_volume"] = total.get(
+            "tradeVolume", normalized["total_volume"]
+        )
+    reference = safe_float(normalized.get("reference"), 0)
+    if reference > 0 and contract:
+        contract.reference = reference
+    _update_snapshot_cache(
+        normalized, price, _quote_timestamp(normalized), "fubon_aggregates"
+    )
+
+
+def global_fubon_error_callback(error):
+    global _quote_subscription_status, _quote_event_detail
+    detail = str(error)[:240]
+    with _quote_state_lock:
+        _quote_subscription_status = "error"
+        _quote_event_detail = detail
+    print(f"[QUOTE_EVENT] Fubon market data error: {detail}")
+
+
+def global_fubon_stock_connect_callback(*args):
+    del args
+    print("[WEIGHTED_STREAM] Fubon stock WebSocket connected")
+
+
+def global_fubon_stock_disconnect_callback(*args):
+    del args
+    with _weighted_stock_state_lock:
+        for state in _weighted_stock_stream_state.values():
+            state.update({
+                "tick_subscription": "disconnected",
+                "kbar_subscription": "disconnected",
+                "error": "富邦股票行情連線中斷，背景重連中",
+            })
+    print("[WEIGHTED_STREAM] Fubon stock WebSocket disconnected")
+
+
+def global_fubon_stock_error_callback(error):
+    detail = str(error)[:160]
+    with _weighted_stock_state_lock:
+        for state in _weighted_stock_stream_state.values():
+            if state.get("tick_subscription") != "live":
+                state["error"] = detail
+    print(f"[WEIGHTED_STREAM] Fubon stock market data error: {detail}")
+
+
+def _register_quote_callbacks(api_instance):
+    """Register Fubon read-only futures and stock market-data callbacks."""
+    api_instance.set_callbacks(
+        tick=global_quote_callback,
+        candle=global_fubon_candle_callback,
+        aggregate=global_fubon_aggregate_callback,
+        connect=global_quote_event_callback,
+        disconnect=global_quote_session_down_callback,
+        error=global_fubon_error_callback,
+        stock_tick=_handle_weighted_stock_tick,
+        stock_candle=weighted_stock_kbar_callback,
+        stock_connect=global_fubon_stock_connect_callback,
+        stock_disconnect=global_fubon_stock_disconnect_callback,
+        stock_error=global_fubon_stock_error_callback,
+    )
 
 
 def _subscribe_contract(api_instance, contract_obj, quote_type, version=None):
-    subscribe = getattr(api_instance, "subscribe", None)
-    if not callable(subscribe):
-        subscribe = api_instance.quote.subscribe
-    if version is None:
-        return subscribe(contract_obj, quote_type=quote_type)
-    return subscribe(contract_obj, quote_type=quote_type, version=version)
+    del quote_type, version
+    return api_instance.subscribe_contract(contract_obj)
 
 
 def _unsubscribe_contract(api_instance, contract_obj, quote_type, version=None):
-    unsubscribe = getattr(api_instance, "unsubscribe", None)
-    if not callable(unsubscribe):
-        unsubscribe = api_instance.quote.unsubscribe
-    if version is None:
-        return unsubscribe(contract_obj, quote_type=quote_type)
-    return unsubscribe(contract_obj, quote_type=quote_type, version=version)
+    # 三種指數期貨都持續寫入本地 DB；切換畫面不解除背景行情。
+    del api_instance, contract_obj, quote_type, version
+    return None
 
 
 def _subscribe_weighted_stock_streams(unsubscribe_first=False) -> dict:
-    """Subscribe four stocks to both server-side KBar and v1 Tick streams."""
-    if not hasattr(sj.QuoteType, "KBar"):
-        raise RuntimeError("目前 Shioaji 未提供 QuoteType.KBar")
-
+    """Subscribe four weighted stocks to Fubon trades and 1-minute candles."""
+    del unsubscribe_first
     subscribed = []
     errors = {}
-    tick_version = getattr(sj.QuoteVersion, "v1", None)
     for code, name in _WEIGHTED_STOCK_DEFS:
-        stock_contract = _resolve_stock_contract(api, code)
-        if not stock_contract:
-            errors[code] = "找不到股票合約"
-            with _weighted_stock_state_lock:
-                _weighted_stock_stream_state[code]["error"] = errors[code]
-            continue
-
-        _weighted_stock_contracts[code] = stock_contract
-        reference = _contract_reference(stock_contract)
-        with _weighted_stock_state_lock:
-            _weighted_stock_stream_state[code].update({
-                "contract": getattr(stock_contract, "code", code),
-                "reference": reference,
-                "tick_subscription": "subscribing",
-                "kbar_subscription": "subscribing",
-                "error": None,
-            })
-
         try:
-            if unsubscribe_first:
-                for quote_type, version in (
-                    (sj.QuoteType.Tick, tick_version),
-                    (sj.QuoteType.KBar, None),
-                ):
-                    try:
-                        _unsubscribe_contract(
-                            api, stock_contract, quote_type, version=version
-                        )
-                    except Exception:
-                        pass
+            stock_contract = _resolve_stock_contract(api, code)
+            if not stock_contract:
+                raise RuntimeError("找不到富邦股票資料")
+            _weighted_stock_contracts[code] = stock_contract
 
-            _subscribe_contract(api, stock_contract, sj.QuoteType.KBar)
-            _subscribe_contract(
-                api, stock_contract, sj.QuoteType.Tick, version=tick_version
+            snapshot = None
+            try:
+                snapshots = api.snapshots([stock_contract])
+                snapshot = snapshots[0] if snapshots else None
+            except Exception:
+                snapshot = None
+
+            reference = (
+                safe_float(getattr(snapshot, "reference", 0), 0)
+                if snapshot else _contract_reference(stock_contract)
             )
+            open_price = safe_float(getattr(snapshot, "open", 0), 0) if snapshot else 0
+            avg_price = safe_float(getattr(snapshot, "avg_price", 0), 0) if snapshot else 0
+            last_price = safe_float(getattr(snapshot, "close", 0), 0) if snapshot else 0
+            api.subscribe_stock(stock_contract)
             with _weighted_stock_state_lock:
                 _weighted_stock_stream_state[code].update({
+                    "contract": stock_contract.target_code,
                     "tick_subscription": "subscribed",
                     "kbar_subscription": "subscribed",
+                    "last": last_price,
+                    "avg": avg_price,
+                    "open": open_price,
+                    "reference": reference,
+                    "error": None,
                 })
             subscribed.append(code)
-            print(f"[WEIGHTED_STREAM] {code} {name} KBar + Tick 訂閱請求已送出")
+            print(f"[WEIGHTED_STREAM] {code} {name} Fubon trades + candles subscribed")
         except Exception as exc:
-            errors[code] = f"{type(exc).__name__}: {exc}"
+            errors[code] = type(exc).__name__
             with _weighted_stock_state_lock:
                 _weighted_stock_stream_state[code].update({
+                    "contract": code,
                     "tick_subscription": "error",
                     "kbar_subscription": "error",
-                    "error": str(exc)[:240],
+                    "error": f"{type(exc).__name__}: {str(exc)[:120]}",
                 })
-            print(f"[WEIGHTED_STREAM] {code} 訂閱失敗: {type(exc).__name__}")
-    return {"subscribed": subscribed, "errors": errors}
+            print(f"[WEIGHTED_STREAM] {code} Fubon subscription failed: {type(exc).__name__}")
+    return {
+        "subscribed": subscribed,
+        "errors": errors,
+        "source": "fubon_stock_marketdata",
+    }
 
 # 儲存活躍的 WebSocket 連線
 class ConnectionManager:
@@ -748,12 +800,10 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 class LoginRequest(BaseModel):
-    api_key: str
-    secret_key: str
+    api_key: str = ""
     person_id: str = ""
-    is_simulation: bool
-    ca_path: str = ""
-    ca_passwd: str = ""
+    cert_path: str = ""
+    cert_pass: str = ""
     save_keys: bool = True
 
 # 報價健康監控：不輪詢 snapshots，避免把查詢型 API 當成即時源
@@ -781,7 +831,7 @@ async def _prefetch_kbars_background():
     now_tw = datetime.utcnow() + timedelta(hours=8)
     today = datetime(now_tw.year, now_tw.month, now_tw.day)
 
-    # SQLite 以 Shioaji 原始「台灣牆鐘時間」儲存；今天 00:00 前的日曆日已完整。
+    # SQLite 延續既有「台灣牆鐘時間」格式；今天 00:00 前的日曆日已完整。
     cacheable_before = datetime(now_tw.year, now_tw.month, now_tw.day)
 
     print(f"[PREFETCH] ▶ 背景補快取啟動 {now_tw.strftime('%H:%M')} UTC+8 — 目標補至 {_HISTORY_START.strftime('%Y-%m-%d')}")
@@ -992,7 +1042,7 @@ def global_quote_callback(*args):
                 main_loop,
             )
 
-        # 高頻 Tick 不逐筆 print，避免 stdout I/O 阻塞 Shioaji callback。
+        # 高頻 Tick 不逐筆 print，避免 stdout I/O 阻塞行情 callback。
         if monotonic_now - _quote_log_monotonic >= 5:
             with _quote_state_lock:
                 ticks_in_window = _quote_tick_count_since_log
@@ -1015,28 +1065,12 @@ async def resubscribe():
         if not contract:
             return {"status": "error", "message": "合約資訊遺失，請嘗試重新登入"}
 
-        _register_quote_callbacks(api)
         loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(
-                None,
-                lambda: _unsubscribe_contract(api, contract, sj.QuoteType.Tick),
-            )
-        except Exception as unsubscribe_error:
-            print(f"[QUOTE] 解除舊訂閱警告（仍會繼續訂閱）: {unsubscribe_error}")
-        await asyncio.sleep(0.5)
         with _quote_state_lock:
             _quote_subscription_status = "subscribing"
             _quote_event_detail = "manual resubscribe"
-        await loop.run_in_executor(
-            None,
-            lambda: _subscribe_contract(
-                api, contract, sj.QuoteType.Tick, version=sj.QuoteVersion.v1
-            ),
-        )
-        weighted_result = await loop.run_in_executor(
-            None, lambda: _subscribe_weighted_stock_streams(unsubscribe_first=True)
-        )
+        await loop.run_in_executor(None, api.resubscribe_all)
+        weighted_result = _subscribe_weighted_stock_streams(unsubscribe_first=True)
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] [OK] 已強行重新訂閱 {contract.code}")
         return {
@@ -1054,7 +1088,7 @@ async def shutdown_event():
     if api:
         try:
             api.logout()
-            print("Successfully logged out from Shioaji.")
+            print("Successfully logged out from Fubon market data.")
         except:
             pass
 
@@ -1064,8 +1098,12 @@ async def login(req: LoginRequest):
     global _quote_subscription_status, _quote_event_detail
     global _rt_contract_code, _rt_bar
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"\n[{now_str}] [SECURE] 收到系統登入請求 [帳號模式: {'模擬交易 (Simulation)' if req.is_simulation else '實盤交易 (Real)'}]")
-    print(f"[{now_str}] [DIR] CA 憑證路徑: {req.ca_path or '未提供'}")
+    personal_id = req.person_id.strip() or os.getenv("FUBON_PERSON_ID", "").strip()
+    api_key = req.api_key.strip() or os.getenv("FUBON_API_KEY", "").strip()
+    cert_path = req.cert_path.strip() or os.getenv("FUBON_CERT_PATH", "").strip()
+    cert_pass = req.cert_pass or os.getenv("FUBON_CERT_PASS", "")
+    print(f"\n[{now_str}] [SECURE] 收到富邦唯讀期貨行情登入請求")
+    print(f"[{now_str}] [DIR] 登入模式: {'API Key + 憑證' if cert_path else 'API Key DMA'}")
     try:
         main_loop = asyncio.get_running_loop()
         is_logged_in = False
@@ -1073,99 +1111,108 @@ async def login(req: LoginRequest):
         # 釋放舊連線
         if api:
             try:
-                print(f"[{now_str}] [RESET] 正在登出舊有 Shioaji 工作階段連線...")
+                print(f"[{now_str}] [RESET] 正在登出舊有富邦行情工作階段...")
                 api.logout()
             except: pass
-                
-        api = sj.Shioaji(simulation=req.is_simulation)
+
+        api = FubonMarketDataClient()
+        _register_quote_callbacks(api)
         with _contract_info_lock:
             _contract_info_cache.clear()
-        
-        print(f"[{now_str}] [WAIT] 正在登入永豐金證券伺服器...")
-        api.login(api_key=req.api_key, secret_key=req.secret_key)
-        print(f"[{now_str}] [SUCCESS] 永豐金證券 API 登入成功！")
 
-        # 使用 Shioaji v1 正式 setter；不可覆寫 api.quote.on_quote 方法。
-        _register_quote_callbacks(api)
-        print(f"[{now_str}] [WS] Tick FOP/STK V1、KBar 與連線事件回呼綁定完成。")
-        
-        if not req.is_simulation and req.ca_path and req.ca_passwd:
-            print(f"[{now_str}] [KEY] 正在啟用 CA 憑證授權...")
-            api.activate_ca(ca_path=req.ca_path, ca_passwd=req.ca_passwd, person_id=req.person_id)
-            print(f"[{now_str}] [SUCCESS] CA 憑證授權成功！")
+        loop = asyncio.get_running_loop()
+        print(f"[{now_str}] [WAIT] 正在登入富邦新一代 API 行情服務...")
+        await loop.run_in_executor(
+            None,
+            lambda: api.login(
+                personal_id=personal_id,
+                api_key=api_key,
+                cert_path=cert_path,
+                cert_pass=cert_pass or None,
+            ),
+        )
+        print(f"[{now_str}] [SUCCESS] 富邦 API Key 登入成功，Normal Mode 已建立！")
 
-        contract = _resolve_market_contract(api, "TXFR1")
+        contract = await loop.run_in_executor(
+            None, lambda: _resolve_market_contract(api, "TXFR1")
+        )
         if not contract:
-            raise RuntimeError("Shioaji 1.7 無法解析 TXFR1 合約")
+            raise RuntimeError("富邦契約清單無法解析 TXFR1 近月合約")
         _reset_quote_state(contract)
         with _rt_bar_lock:
             _rt_bar.clear()
         _rt_contract_code = contract.code
         print(
-            f"[{now_str}] [CONTRACT] 預設訂閱合約: {contract.code} "
+            f"[{now_str}] [CONTRACT] 預設商品: {contract.code} → {contract.target_code} "
             f"(平盤參考價: {_contract_reference(contract) or '未知'})"
         )
-        
-        # 嘗試訂閱 WebSocket 報價
-        try:
-            print(f"[{now_str}] [WS] 正在向永豐金 WebSocket 伺服器訂閱 {contract.code} 即時報價...")
-            _subscribe_contract(
-                api, contract, sj.QuoteType.Tick, version=sj.QuoteVersion.v1
-            )
-            print(f"[{now_str}] [WS] {contract.code} 訂閱請求已送出，等待 Shioaji Event 16 確認。")
-        except Exception as eSub:
-            with _quote_state_lock:
-                _quote_subscription_status = "error"
-                _quote_event_detail = str(eSub)[:240]
-            print(f"[{now_str}] [ERROR] WebSocket 訂閱失敗 ({eSub})，可使用重新訂閱按鈕重試。")
 
-        # 等待 Shioaji SDK 完成內部初始化，避免後續 kbars/snapshot 呼叫拿到空值
-        print(f"[{now_str}] [WAIT] 等待 SDK 穩定中（3秒）...")
-        await asyncio.sleep(3)
+        # 三種商品的日／夜盤 trades、aggregates、candles 全部持續訂閱並存 DB。
+        futures_subscribed = []
+        futures_errors = {}
+        for alias in ("TXFR1", "MXFR1", "TMFR1"):
+            try:
+                item = contract if alias == "TXFR1" else await loop.run_in_executor(
+                    None, lambda a=alias: _resolve_market_contract(api, a)
+                )
+                if not item:
+                    raise RuntimeError("找不到近月契約")
+                await loop.run_in_executor(None, lambda c=item: api.subscribe_contract(c))
+                futures_subscribed.append({"code": alias, "target_code": item.target_code})
+            except Exception as exc:
+                futures_errors[alias] = type(exc).__name__
+                print(f"[{now_str}] [WS] {alias} 訂閱失敗: {type(exc).__name__}")
 
         is_logged_in = True
         _reset_weighted_stock_stream_state()
-        loop = asyncio.get_running_loop()
-        weighted_result = await loop.run_in_executor(
-            None, _subscribe_weighted_stock_streams
+        weighted_result = _subscribe_weighted_stock_streams()
+        print(f"[{now_str}] [WS] 富邦期貨訂閱完成: {futures_subscribed}")
+        print(
+            f"[{now_str}] [WS] 富邦四大權值股訂閱完成: "
+            f"{weighted_result.get('subscribed', [])}"
         )
-        if weighted_result["errors"]:
+        if futures_errors:
+            print(f"[{now_str}] [WS] 部分期貨商品待重試: {sorted(futures_errors)}")
+        if weighted_result.get("errors"):
             print(
-                f"[{now_str}] [WEIGHTED_STREAM] 部分訂閱失敗: "
+                f"[{now_str}] [WS] 部分權值股待重試: "
                 f"{sorted(weighted_result['errors'])}"
-            )
-        else:
-            print(
-                f"[{now_str}] [WEIGHTED_STREAM] 四大權值股 KBar + Tick "
-                f"已全部送出訂閱。"
             )
 
         # 儲存登入憑證至 .env
         if req.save_keys:
             env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-            set_key(env_path, "SHIOAJI_API_KEY", req.api_key)
-            set_key(env_path, "SHIOAJI_SECRET_KEY", req.secret_key)
-            set_key(env_path, "SHIOAJI_PERSON_ID", req.person_id)
-            set_key(env_path, "SHIOAJI_SIMULATION", str(req.is_simulation))
-            set_key(env_path, "SHIOAJI_CA_PATH", req.ca_path or "")
-            set_key(env_path, "SHIOAJI_CA_PASSWD", req.ca_passwd or "")
-            print(f"[{now_str}] [SAVE] 登入憑證已儲存至 .env")
+            set_key(env_path, "FUBON_API_KEY", api_key)
+            set_key(env_path, "FUBON_PERSON_ID", personal_id)
+            set_key(env_path, "FUBON_CERT_PATH", cert_path)
+            set_key(env_path, "FUBON_CERT_PASS", cert_pass)
+            os.environ.update({
+                "FUBON_API_KEY": api_key,
+                "FUBON_PERSON_ID": personal_id,
+                "FUBON_CERT_PATH": cert_path,
+                "FUBON_CERT_PASS": cert_pass,
+            })
+            print(f"[{now_str}] [SAVE] 富邦登入資訊已儲存至本機 .env")
 
-        # 大量歷史 1 分 K 會快速耗盡 Shioaji 每日流量；預設不在登入時全量回補。
-        # 如需離峰補資料，可在 .env 明確設為 True。
-        if os.getenv("PREFETCH_KBARS_ON_LOGIN", "False").lower() == "true":
-            asyncio.create_task(_prefetch_kbars_background())
-            print(f"[{now_str}] [PREFETCH] 已依設定啟動歷史 K 棒背景回補。")
-        else:
-            print(f"[{now_str}] [PREFETCH] 登入全量回補已停用（避免耗盡 Shioaji 每日流量）。")
+        print(
+            f"[{now_str}] [HISTORY] 期貨由富邦日內 REST 補當日日／夜盤；"
+            "四大權值股由富邦股票 REST 補當日分時。"
+        )
         print(f"[{now_str}] [READY] 系統完全就緒，連線就緒開始看盤！\n")
         return {
             "status": "success",
             "contract": contract.code,
+            "target_contract": contract.target_code,
+            "futures": futures_subscribed,
+            "futures_errors": futures_errors,
             "weighted_stocks": weighted_result,
         }
     except Exception as e:
         is_logged_in = False
+        try:
+            api.logout()
+        except Exception:
+            pass
         print(f"[{now_str}] [ERROR] 登入失敗！異常訊息: {e}\n")
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1182,8 +1229,7 @@ async def select_contract(req: dict):
     print(f"\n[{now_str}] [CHANGE] 收到切換合約請求: {old_contract.code if old_contract else 'None'} -> {code}")
 
     try:
-        # 先用 Shioaji 1.7 的統一合約 API 解析，避免代碼錯誤時解除舊報價。
-        if not (code.isdigit() or code.startswith(("TXF", "MXF", "TMF"))):
+        if not code.startswith(("TXF", "MXF", "TMF")):
             print(f"[{now_str}] [ERROR] 不支援的合約代碼: {code}")
             return {"status": "error", "message": "不支援的合約代碼"}
         new_contract = _resolve_market_contract(api, code)
@@ -1191,23 +1237,13 @@ async def select_contract(req: dict):
         if not new_contract:
             return {"status": "error", "message": f"找不到合約: {code}"}
 
-        if old_contract:
-            try:
-                print(f"[{now_str}] [WS] 正在解除舊合約訂閱: {old_contract.code}")
-                _unsubscribe_contract(api, old_contract, sj.QuoteType.Tick)
-            except Exception as eUnsub:
-                print(f"[{now_str}] [WARN] 解除訂閱舊合約警告: {eUnsub}")
-
         contract = new_contract
         _reset_quote_state(contract)
-        _register_quote_callbacks(api)
-
-        # 重新訂閱新合約
-        print(f"[{now_str}] [WS] 正在向永豐金訂閱新合約 {contract.code} 即時 Tick 報價...")
-        _subscribe_contract(
-            api, contract, sj.QuoteType.Tick, version=sj.QuoteVersion.v1
+        api.subscribe_contract(contract)
+        print(
+            f"[{now_str}] [WS] 畫面切換為 {contract.code} → "
+            f"{contract.target_code}；其他商品繼續背景存檔。"
         )
-        print(f"[{now_str}] [WS] 新合約 {contract.code} 訂閱請求已送出。")
 
         # 切換合約時重置即時快取狀態
         with _rt_bar_lock:
@@ -1222,9 +1258,7 @@ async def select_contract(req: dict):
             try:
                 contract = old_contract
                 _reset_quote_state(contract)
-                _subscribe_contract(
-                    api, contract, sj.QuoteType.Tick, version=sj.QuoteVersion.v1
-                )
+                api.subscribe_contract(contract)
             except Exception as restore_error:
                 print(f"[{now_str}] [ERROR] 舊合約恢復失敗: {restore_error}")
         print(f"[{now_str}] [ERROR] 合約切換失敗: {e}\n")
@@ -1236,13 +1270,13 @@ async def get_status():
     return {
         "logged_in": is_logged_in,
         "contract": contract.code if contract else None,
+        "target_contract": contract.target_code if contract else None,
+        "provider": "fubon",
         "env": {
-            "api_key": os.getenv("SHIOAJI_API_KEY", ""),
-            "secret_key": os.getenv("SHIOAJI_SECRET_KEY", ""),
-            "person_id": os.getenv("SHIOAJI_PERSON_ID", ""),
-            "is_simulation": os.getenv("SHIOAJI_SIMULATION", "False") == "True",
-            "ca_path": os.getenv("SHIOAJI_CA_PATH", ""),
-            "ca_passwd": os.getenv("SHIOAJI_CA_PASSWD", "")
+            "has_api_key": bool(os.getenv("FUBON_API_KEY", "").strip()),
+            "has_person_id": bool(os.getenv("FUBON_PERSON_ID", "").strip()),
+            "has_cert_path": bool(os.getenv("FUBON_CERT_PATH", "").strip()),
+            "has_cert_pass": bool(os.getenv("FUBON_CERT_PASS", "")),
         }
     }
 
@@ -1276,14 +1310,14 @@ def _get_cached_dates(contract_code: str) -> set:
         ).fetchall()
     return {r[0] for r in rows}
 
-def _shioaji_wallclock_ns(value: datetime) -> int:
-    """Encode a naive Taiwan wall-clock datetime like Shioaji's raw K-bar ts."""
+def _taipei_wallclock_ns(value: datetime) -> int:
+    """Encode a naive Taiwan wall-clock datetime for the legacy cache format."""
     return int(calendar.timegm(value.timetuple()) * 1e9 + value.microsecond * 1000)
 
 def _get_cache_bar_counts(contract_code: str, start: datetime, end: datetime) -> dict[str, int]:
-    """Count cached rows by Shioaji raw calendar date."""
-    start_ns = _shioaji_wallclock_ns(start)
-    end_ns = _shioaji_wallclock_ns(end + timedelta(days=1))
+    """Count cached rows by Taiwan wall-clock calendar date."""
+    start_ns = _taipei_wallclock_ns(start)
+    end_ns = _taipei_wallclock_ns(end + timedelta(days=1))
     with sqlite3.connect(_KBARS_CACHE_DB) as conn:
         rows = conn.execute(
             "SELECT date(ts / 1000000000, 'unixepoch') AS d, COUNT(*) "
@@ -1331,8 +1365,8 @@ def _set_kbars_backoff(contract_code: str, start: datetime, end: datetime, secon
             day += timedelta(days=1)
 
 def _load_from_cache(contract_code: str, start: datetime, end: datetime) -> pd.DataFrame:
-    start_ns = _shioaji_wallclock_ns(start)
-    end_ns = _shioaji_wallclock_ns(end + timedelta(days=1))
+    start_ns = _taipei_wallclock_ns(start)
+    end_ns = _taipei_wallclock_ns(end + timedelta(days=1))
     with sqlite3.connect(_KBARS_CACHE_DB) as conn:
         rows = conn.execute(
             "SELECT ts, Open, High, Low, Close, Volume FROM kbars1m "
@@ -1367,7 +1401,7 @@ def _save_to_cache(contract_code: str, df: pd.DataFrame, cacheable_before: datet
 
 def _save_rt_bar_to_db(code: str, ts_ns: int, o: float, h: float, l: float, c: float, vol: int):
     """即時 1-min bar 寫入 kbars1m，不更新 cached_dates（今日仍視為未完整快取）。
-    ts_ns 是該分鐘的起點；寫入時轉為 Shioaji 相同的「分鐘收盤時間」
+    ts_ns 是該分鐘的起點；寫入時轉為既有快取的「分鐘收盤時間」
     並補 +8h wall-clock 偏移，讓 API 歷史棒與即時暫存棒共用一套分桶規則。
     """
     close_ts_ns = ts_ns + 60 * 1_000_000_000
@@ -1383,14 +1417,14 @@ def _save_rt_bar_to_db(code: str, ts_ns: int, o: float, h: float, l: float, c: f
     except Exception as e:
         print(f"[RT_CACHE] DB 寫入失敗: {e}")
 
-def _resolve_stock_contract(shioaji_api, code: str):
-    """Resolve a Taiwan stock contract through Shioaji 1.7's unified API."""
-    if not str(code).isdigit():
+def _resolve_stock_contract(market_api, code: str):
+    """Resolve a Taiwan stock through Fubon's official intraday ticker API."""
+    if not market_api or not code:
         return None
-    return _resolve_market_contract(shioaji_api, code)
+    return market_api.resolve_stock_contract(str(code).strip())
 
 def _fetch_twse_stock_snapshots(stock_defs: list[tuple[str, str]]) -> dict:
-    """Fetch TWSE MIS snapshots as a fallback when Shioaji stock kbars are unavailable."""
+    """Fetch TWSE MIS snapshots for the four weighted-stock mini charts."""
     ex_ch = "|".join(f"tse_{code}.tw" for code, _ in stock_defs)
     url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1&delay=0"
     req = urllib.request.Request(
@@ -1483,13 +1517,16 @@ def _twse_snapshot_to_intraday_payload(code: str, name: str, row: dict) -> dict:
 
 def _resolve_kbars_contracts(api_instance, base_contract, start_date, end_date, now_str: str) -> list:
     """
-    Shioaji 的 R1/R2 本身就是用來查詢跨到期月份歷史資料的連續合約。
-    不可依日期自行拼 TXFE6 等月份代碼：到期合約通常不在目前 Contracts
-    清單中，而且會造成缺資料、重複合併及換月覆寫順序錯誤。
+    富邦用即時契約清單把 R1/R2 alias 解析為目前月份；快取仍以 alias
+    保存，換月後可延續成同一條本地近月序列。
     """
+    del api_instance, start_date, end_date
     code = base_contract.code
     if code.endswith(("R1", "R2")):
-        print(f"[{now_str}] [CHART] 使用 Shioaji 連續合約 {code} 直接查詢歷史 K 棒")
+        print(
+            f"[{now_str}] [CHART] 富邦近月 {code} → "
+            f"{base_contract.target_code}；日內 REST＋本地歷史"
+        )
     return [base_contract]
 
 def _aggregate_kbars_dataframe(df: pd.DataFrame, period: str) -> pd.DataFrame:
@@ -1587,7 +1624,7 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
 
     now_tw = datetime.utcnow() + timedelta(hours=8)  # 轉台灣時間 UTC+8
     today_tw = now_tw.date()
-    # DB 與 Shioaji ts 都使用台灣牆鐘日期；今天 00:00 前的原始日曆日已完整。
+    # DB 延續台灣牆鐘日期；今天 00:00 前的原始日曆日已完整。
     safe_end = datetime(today_tw.year, today_tw.month, today_tw.day)
 
     try:
@@ -1706,7 +1743,7 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
                         )
                     )
                     tag = "[QUOTA]" if is_quota else "[API-ERR]"
-                    # Shioaji 的例外字串可能包含 JWT、身分證字號與連線資訊，不可原樣寫入 log。
+                    # SDK 例外可能包含連線資訊，不可原樣寫入 log。
                     print(
                         f"[{now_str}]  ↳ {tag} {code} API 呼叫失敗 "
                         f"({err_type})；已啟用冷卻重試"
@@ -1748,6 +1785,21 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
 
                 current_start = current_end + timedelta(days=1)
 
+            # 啟動／切換商品時可能同時出現多個歷史請求。第二個請求會在
+            # _kbars_lock 外先讀到舊快取，等第一個請求補完後又因 backoff
+            # 略過 API；若直接回傳，舊快取就會覆蓋前一個完整結果。
+            # API 批次結束後必須重新讀取 SQLite，讓每個併發請求都回傳
+            # 目前最新、已包含關機期間回補資料的版本。
+            refreshed_df = _load_from_cache(
+                code, source_start_date, source_end_date
+            )
+            if not refreshed_df.empty:
+                all_df.append(refreshed_df)
+                print(
+                    f"[{now_str}] [CACHE] {code} 補取後重新載入 "
+                    f"{len(refreshed_df)} 筆"
+                )
+
         if not all_df:
             print(f"[{now_str}] [STOP] 查詢結束：所有批次均無返回任何歷史數據，回傳空清單。\n")
             return []
@@ -1788,7 +1840,7 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
             return []
 
         df.reset_index(inplace=True)
-        # 永豐金原始數據帶有 8 小時偏移，手動減去 (28800秒) 以對齊 UTC
+        # 快取使用台灣牆鐘偏移，回傳前減 8 小時還原為真實 UTC epoch。
         df['time'] = (df['ts'].values.astype('int64') // 10**9) - 28800
         df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
 
@@ -1811,9 +1863,9 @@ async def get_cache_info():
         rows = conn.execute("SELECT date FROM cached_dates ORDER BY date").fetchall()
     all_dates = sorted({r[0] for r in rows})
 
-    # DB 使用 Shioaji 台灣牆鐘時間格式，今日範圍也必須用相同編碼。
+    # DB 使用既有台灣牆鐘時間格式，今日範圍也必須用相同編碼。
     now_tw = datetime.utcnow() + timedelta(hours=8)
-    day_start_ns = _shioaji_wallclock_ns(
+    day_start_ns = _taipei_wallclock_ns(
         datetime(now_tw.year, now_tw.month, now_tw.day)
     )
     day_end_ns   = day_start_ns + 86400 * 1_000_000_000
@@ -1844,11 +1896,11 @@ async def get_snapshot():
         loop = asyncio.get_running_loop()
         snaps = await loop.run_in_executor(None, lambda: api.snapshots([contract]))
         if not snaps:
-            raise RuntimeError("Shioaji snapshots 回傳空清單")
+            raise RuntimeError("富邦即時報價回傳空清單")
         snap = snaps[0]
         snap_price = safe_float(getattr(snap, "close", None), 0.0)
         if snap_price <= 0:
-            raise RuntimeError("Shioaji snapshot close 無有效價格")
+            raise RuntimeError("富邦即時報價無有效成交價")
         snap_time = _quote_timestamp(snap)
         snapshot_payload = _update_snapshot_cache(snap, snap_price, snap_time, "snapshot")
         # 偶爾輸出一行，避免過度洗板
@@ -1882,7 +1934,7 @@ async def get_snapshot():
 
 @app.get("/api/quote_health")
 async def get_quote_health():
-    """Report the actual Shioaji subscription/Tick health, not only browser WS state."""
+    """Report the actual Fubon subscription/Tick health, not only browser WS state."""
     return _quote_health_data()
 
 
@@ -1894,7 +1946,7 @@ async def get_weighted_stocks_stream_health():
 
 @app.get("/api/major_weighted_stocks_intraday")
 async def get_major_weighted_stocks_intraday():
-    """Bootstrap the four mini charts; realtime continuation arrives over WebSocket."""
+    """Bootstrap four mini charts from Fubon REST; continue over Fubon WebSocket."""
     global api, is_logged_in
     stock_defs = list(_WEIGHTED_STOCK_DEFS)
     today_dt = (datetime.utcnow() + timedelta(hours=8)).date()
@@ -1968,22 +2020,20 @@ async def get_major_weighted_stocks_intraday():
         df["time"] = (df["ts"].values.astype("int64") // 10**9) - 28800
         df.rename(columns={"Close": "price", "Volume": "volume"}, inplace=True)
 
-        if "Amount" in df.columns:
+        if "Average" in df.columns:
+            avg_price = pd.to_numeric(df["Average"], errors="coerce")
+        elif "Amount" in df.columns:
             amount = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
+            volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+            cum_volume = volume.cumsum()
+            cum_amount = amount.cumsum()
+            avg_price = cum_amount / cum_volume.where(cum_volume > 0)
         else:
             amount = pd.to_numeric(df["price"], errors="coerce").fillna(0) * pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-        volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-        cum_volume = volume.cumsum()
-        cum_amount = amount.cumsum()
-        avg_price = cum_amount / cum_volume.where(cum_volume > 0)
-        # 股票 Volume 以「張」計、Amount 以「元」計時，直接相除會放大 1000 倍。
-        # 以價格比例判斷 SDK 回傳單位，兼容可能已是股數的新格式。
-        valid_price = pd.to_numeric(df["price"], errors="coerce").replace(0, pd.NA)
-        unit_ratio = (avg_price / valid_price).replace(
-            [float("inf"), float("-inf")], pd.NA
-        ).dropna()
-        if not unit_ratio.empty and safe_float(unit_ratio.median(), 1) > 100:
-            avg_price = avg_price / 1000
+            volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+            cum_volume = volume.cumsum()
+            cum_amount = amount.cumsum()
+            avg_price = cum_amount / cum_volume.where(cum_volume > 0)
         df["avg"] = avg_price.ffill().fillna(df["price"])
 
         first_price = safe_float(df["price"].iloc[0], 0)
@@ -2004,12 +2054,12 @@ async def get_major_weighted_stocks_intraday():
                 "volume": safe_int(row.volume),
             })
 
-        result.append({
+        stock_payload = {
             "code": code,
             "name": name,
             "date": used_date,
             "is_today": used_date == today_dt.strftime("%Y-%m-%d"),
-            "source": "shioaji_kbars",
+            "source": "fubon_stock_candles",
             "open": open_price,
             "reference": reference,
             "last": last_price,
@@ -2020,12 +2070,32 @@ async def get_major_weighted_stocks_intraday():
                 else 0
             ),
             "bars": bars,
-        })
+        }
+        result.append(stock_payload)
+        with _weighted_stock_state_lock:
+            state = _weighted_stock_stream_state.setdefault(
+                code, _new_weighted_stock_state(code, name)
+            )
+            state.update({
+                "last": last_price,
+                "avg": safe_float(df["avg"].iloc[-1], last_price),
+                "open": open_price,
+                "reference": reference,
+            })
 
     dates = sorted({s.get("date") for s in result if s.get("date")})
+    fubon_count = sum(
+        1 for stock in result
+        if str(stock.get("source") or "").startswith("fubon_")
+    )
     return {
         "date": today_dt.strftime("%Y-%m-%d"),
         "data_date": dates[-1] if dates else None,
+        "source": (
+            "fubon_stock_marketdata" if fubon_count else "twse_snapshot"
+        ),
+        "fubon_stock_count": fubon_count,
+        "fallback_stock_count": len(result) - fubon_count,
         "stream": _weighted_stock_health_data(),
         "stocks": result,
     }
@@ -2046,7 +2116,7 @@ async def get_txf_amplitude(period: str = "day"):
     look_back_days = {"day": 45, "week": 200, "month": 700}.get(period, 45)
     start_dt = now_tw - timedelta(days=look_back_days)
     # calendar.timegm 把 naive datetime 當作 UTC 轉 epoch，
-    # 與 Shioaji 用「UTC+8 時間直接當 UTC 儲存」的格式一致
+    # 與既有快取的「UTC+8 時間直接當 UTC 儲存」格式一致
     start_ns = int(_cal.timegm(start_dt.timetuple()) * 1e9)
     end_ns   = int(_cal.timegm(now_tw.timetuple()) * 1e9)
 
@@ -2071,7 +2141,7 @@ async def get_txf_amplitude(period: str = "day"):
                 "amp_small": None, "amp_min": None, "amp_today": None, "days": 0}
 
     df = pd.DataFrame(rows, columns=['ts', 'High', 'Low'])
-    # Shioaji 時間戳為 UTC+8 編碼（以 UTC 解析即為台灣時間）
+    # 快取時間戳為 UTC+8 牆鐘編碼（以 UTC 解析即為台灣時間）
     df_ts = pd.to_datetime(df['ts'], unit='ns', utc=True)
 
     # 交易日 session 定義：前一日 15:00（夜盤）→ 當日 13:45（日盤）。
@@ -2241,7 +2311,7 @@ async def get_amplitude_statistics(days: int = 20, contract: str = "TXFR1", date
         return {"success": False, "error": "no_data", "columns": [], "rows": [], "stats": {}}
 
     df = pd.DataFrame(rows, columns=['ts', 'High', 'Low'])
-    # Shioaji 時間戳：UTC+8 編碼為 UTC，以 UTC 解析後直接得到台灣時間
+    # 快取時間戳：UTC+8 編碼為 UTC，以 UTC 解析後直接得到台灣時間
     df_ts = pd.to_datetime(df['ts'], unit='ns', utc=True)
 
     tw_hour   = df_ts.dt.hour.values
@@ -2309,7 +2379,7 @@ async def get_amplitude_statistics(days: int = 20, contract: str = "TXFR1", date
         for _, row in grp.iterrows()
     }
 
-    # ── 今日資料補取：DB 若無今日任何時段，從 Shioaji 即時取 ───────────────────
+    # ── 今日資料補取：DB 若無今日任何時段，從富邦日內 REST 取 ───────────────────
     if is_logged_in and api and _rt_contract_code:
         has_today = any((today, s) in session_lookup for s in ('morning', 'afternoon', 'night'))
         if not has_today:
@@ -4503,22 +4573,29 @@ async def sync_all_stock_screener_data(target_date: str = "") -> dict:
     }
     print(f"[同步選股數據] sync_institutional={'success' if synced_days > 0 else 'warning'}, latest={last_inst_date}")
 
-    # 2. 個股日K同步（需要 API 登入）
+    # 2. 個股日K：本次富邦授權範圍僅限期貨行情，不能拿期貨 SDK
+    #    冒充股票日K來源。保留既有 DB 供篩選使用，並明確回報新鮮度。
     kbar_result = {"success": False, "latest_date": "", "error": None}
-    if is_logged_in and api:
-        try:
-            candidates = screener.get_inst_5d_candidates()
-            sync_codes = candidates if candidates else screener.DEFAULT_STOCKS
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: screener.sync_stock_kbars(api, sync_codes))
-            kbar_result = {"success": True, "latest_date": target_date, "error": None}
-            print(f"[同步選股數據] sync_stock_daily_kbars=success, latest={target_date}")
-        except Exception as e:
-            kbar_result = {"success": False, "latest_date": "", "error": str(e)}
-            print(f"[同步選股數據] sync_stock_daily_kbars=failed: {e}")
-    else:
-        kbar_result = {"success": False, "latest_date": "", "error": "尚未登入，略過個股日K同步"}
-        print("[同步選股數據] sync_stock_daily_kbars=skipped (not logged in)")
+    try:
+        _conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+        _row = _conn.execute("SELECT MAX(date) FROM daily_kbars").fetchone()
+        _conn.close()
+        _latest_stock_kbar = normalize_date(str(_row[0])) if _row and _row[0] else ""
+        _is_current = bool(_latest_stock_kbar and _latest_stock_kbar >= target_date)
+        kbar_result = {
+            "success": _is_current,
+            "latest_date": _latest_stock_kbar,
+            "error": None if _is_current else (
+                "富邦目前只串接期貨行情；個股日K沿用本地DB，尚未更新到目標日期"
+            ),
+        }
+        print(
+            "[同步選股數據] stock_daily_kbars="
+            f"{'cache-current' if _is_current else 'cache-stale'}, latest={_latest_stock_kbar or 'none'}"
+        )
+    except Exception as e:
+        kbar_result = {"success": False, "latest_date": "", "error": str(e)}
+        print(f"[同步選股數據] stock_daily_kbars=failed: {e}")
 
     # 3. 大盤 TAIEX 日K同步（不需要登入）
     market_result = sync_taiex_daily_kbars(target_date)
@@ -4730,29 +4807,18 @@ async def _scheduled_amplitude_morning_report():
 
 @app.get("/api/debug/contracts")
 async def api_debug_contracts():
-    """列出 Shioaji 目前可存取的 TXF 合約清單，用於診斷歷史補取問題"""
+    """列出富邦目前可存取的 TXF 合約清單。"""
     if not is_logged_in:
         raise HTTPException(status_code=401, detail="Not logged in")
     try:
-        futures = api.contracts.list(sj.SecurityType.Futures)
-        found = []
-        for c in futures:
-            code = str(getattr(c, "code", "") or "")
-            if not code.startswith("TXF"):
-                continue
-            try:
-                info = api.contracts.info(c)
-            except Exception:
-                info = None
-            found.append({
-                "code": code,
-                "target_code": getattr(c, "target_code", None),
-                "name": getattr(info, "name", "") if info else "",
-                "delivery_date": (
-                    str(getattr(info, "delivery_date", "")) if info else ""
-                ),
-            })
-        found.sort(key=lambda x: x["code"])
+        loop = asyncio.get_running_loop()
+        futures = await loop.run_in_executor(None, lambda: api.list_contracts("TXF"))
+        found = [{
+            "code": item.code,
+            "target_code": item.target_code,
+            "name": item.name,
+            "delivery_date": item.delivery_date,
+        } for item in futures]
         return {"count": len(found), "contracts": found}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

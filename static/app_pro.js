@@ -36,7 +36,7 @@ function getKbarBucketTime(time, period, isCloseTimestamp = false) {
     }
 
     const periodSeconds = (parseInt(period, 10) || 1) * 60;
-    // Shioaji 歷史 1 分 K 的 ts 是收盤時間；即時 Tick 則是成交時間。
+    // 本地歷史 1 分 K 的 ts 是收盤時間；即時 Tick 則是成交時間。
     const effective = original - (isCloseTimestamp ? 1 : 0);
     const wallSeconds = effective + 28800;
     const wall = new Date(wallSeconds * 1000);
@@ -70,6 +70,17 @@ function shiftIsoDate(dateString, days) {
 function isoTaiwanDateBucket(dateString) {
     const [year, month, day] = String(dateString).split('-').map(Number);
     return Date.UTC(year, month - 1, day) / 1000 - 28800;
+}
+
+function hasMissingFuturesSessionGap(lastTime, currentTime) {
+    const previous = Number(lastTime);
+    const current = Number(currentTime);
+    if (!Number.isFinite(previous) || !Number.isFinite(current)) return false;
+    if (current <= previous || current - previous <= 6 * 60 * 60) return false;
+
+    // 一般午休、日夜盤間隔不應清圖；跨週末但仍屬同一交易日也保留。
+    // 只有跨過不同交易日且超過六小時，才代表中間真的缺少交易時段。
+    return flFuturesTradingDayKey(previous) !== flFuturesTradingDayKey(current);
 }
 
 class TradingPane {
@@ -1351,6 +1362,19 @@ const FREELANCER_FUTURES = Object.freeze({
 const FREELANCER_HISTORY_FLOOR = '2025-01-01';
 const FREELANCER_HISTORY_CHUNK_DAYS = 30;
 const FREELANCER_HISTORY_EDGE_THRESHOLD = 15;
+const FREELANCER_INITIAL_HISTORY_DAYS = 7;
+const FREELANCER_INITIAL_MAX_BARS = 220;
+const FREELANCER_MARKET_COLORS = Object.freeze({
+    up: '#ef554a',
+    down: '#26a69a',
+    flat: '#aeb6c3',
+    upTop: 'rgba(239, 85, 74, 0.20)',
+    upBottom: 'rgba(239, 85, 74, 0.02)',
+    downTop: 'rgba(38, 166, 154, 0.20)',
+    downBottom: 'rgba(38, 166, 154, 0.02)',
+    flatTop: 'rgba(174, 182, 195, 0.12)',
+    flatBottom: 'rgba(174, 182, 195, 0.02)'
+});
 const FREELANCER_COST_LINE = Object.freeze({
     color: '#ff9800',
     lineWidth: 2,
@@ -2118,13 +2142,83 @@ class FreelancerKChart {
         this.clearCostLine();
         this.updateLegend(null);
 
-        // 後端以 1 分 K 補資料，單次維持在 Shioaji 的安全區間內。
-        const days = this.currentPeriod === 'D' ? 59 : 30;
+        // 啟動只先補足最近畫面所需區間；往左滑到邊界時，再以 30 天一批
+        // 從本機 DB／富邦日內行情延伸，避免每次開啟都重查整個範圍。
+        const days = this.currentPeriod === 'D'
+            ? 59
+            : FREELANCER_INITIAL_HISTORY_DAYS;
         const end = new Date().toLocaleDateString('en-CA');
         const startDate = new Date(Date.now() - days * 86400000);
         const start = startDate.toLocaleDateString('en-CA');
         this.loadedStartDate = start;
         await this.fetchData(start, end, requestId);
+        await this.reconcileLatestSnapshot(requestId);
+    }
+
+    async reconcileLatestSnapshot(requestId = this.loadRequestId) {
+        try {
+            const res = await fetch('/api/snapshot');
+            if (!res.ok) return;
+            const snapshot = await res.json();
+            if (requestId !== this.loadRequestId) return;
+
+            const price = Number(snapshot?.close);
+            const time = Number(snapshot?.time);
+            const code = String(snapshot?.code || '');
+            const expectedRoot = this.instrument().code;
+            if (
+                !Number.isFinite(price)
+                || price <= 0
+                || !Number.isFinite(time)
+                || time <= 0
+                || !code.startsWith(expectedRoot)
+            ) return;
+
+            // 切換商品期間也要套用已收到的最新報價；否則低成交頻率商品
+            // 會等到下一筆 tick 才發現歷史資料與即時價之間存在整段缺口。
+            this.onTick(price, time, true);
+        } catch (error) {
+            console.warn('[FreelancerKChart] 最新報價校準失敗:', error);
+        }
+    }
+
+    initialVisibleFromIndex() {
+        const fallback = Math.max(
+            0,
+            this.kbarsCache.length - FREELANCER_INITIAL_MAX_BARS
+        );
+        if (this.currentPeriod === 'D' || this.kbarsCache.length === 0) {
+            return fallback;
+        }
+
+        const lastTime = Number(
+            this.kbarsCache[this.kbarsCache.length - 1]?.time
+        );
+        if (!Number.isFinite(lastTime)) return fallback;
+
+        // 「全」盤的一個交易日從 15:00 夜盤開始，接續到隔日日盤。
+        // 週末或休市日沒有 15:00 棒時，findIndex 會自然落到下一根有效棒。
+        const wall = new Date((lastTime + 28800) * 1000);
+        const minuteOfDay = wall.getUTCHours() * 60 + wall.getUTCMinutes();
+        const anchorDayOffset = minuteOfDay >= 15 * 60 ? 0 : -1;
+        const sessionStart = (
+            Date.UTC(
+                wall.getUTCFullYear(),
+                wall.getUTCMonth(),
+                wall.getUTCDate() + anchorDayOffset,
+                15,
+                0,
+                0
+            ) / 1000
+        ) - 28800;
+        const sessionIndex = this.kbarsCache.findIndex(
+            bar => Number(bar.time) >= sessionStart
+        );
+        if (sessionIndex < 0) return fallback;
+
+        // 5 分以上可完整呈現本交易日；1 分線若超過 220 根則保留可讀性，
+        // 更早的同日資料仍已載入，往右拖即可看到。
+        return Math.max(sessionIndex, fallback);
     }
 
     async fetchData(start, end, requestId = this.loadRequestId) {
@@ -2148,10 +2242,16 @@ class FreelancerKChart {
             this.candleSeries.setData(this.kbarsCache);
             this.rebuildCostLine();
             this.updateLegend(this.kbarsCache[this.kbarsCache.length - 1]);
+            if (this.kbarsCache.length === 0) {
+                this.showHistoryStatus(
+                    `${this.instrument().name}歷史 K 棒暫無回傳，先顯示即時資料`,
+                    'warning'
+                );
+            }
             this.resize();
             if (this.kbarsCache.length > 0) {
                 this.chart.timeScale().setVisibleLogicalRange({
-                    from: Math.max(0, this.kbarsCache.length - 120),
+                    from: this.initialVisibleFromIndex(),
                     to: this.kbarsCache.length + 8
                 });
             }
@@ -2200,16 +2300,36 @@ class FreelancerKChart {
         return result.sort((a, b) => a.time - b.time);
     }
 
-    onTick(price, time) {
+    onTick(price, time, force = false) {
         if (
             !this.candleSeries
             || !price
             || this.isLoading
-            || this.isSwitchingContract
+            || (this.isSwitchingContract && !force)
         ) return;
         this.lastRealtimeTickAt = Date.now();
         const t = time || Math.floor(Date.now() / 1000);
         const bucketT = getKbarBucketTime(t, this.currentPeriod, false);
+
+        const existingLast = this.kbarsCache[this.kbarsCache.length - 1];
+        if (
+            existingLast
+            && hasMissingFuturesSessionGap(existingLast.time, bucketT)
+        ) {
+            const staleTime = existingLast.time;
+            this.kbarsCache = [];
+            this.candleSeries.setData([]);
+            this.clearCostLine();
+            this.updateLegend(null);
+            this.showHistoryStatus(
+                `${this.instrument().name}本交易時段歷史資料未補齊，已隔離舊資料並先顯示即時價`,
+                'warning'
+            );
+            console.warn(
+                `[FreelancerKChart] ${this.symbol} 隔離歷史缺口：`
+                + `${staleTime} → ${bucketT}`
+            );
+        }
 
         if (this.kbarsCache.length === 0) {
             const firstBar = { time: bucketT, open: price, high: price, low: price, close: price };
@@ -2260,8 +2380,12 @@ class FreelancerKChart {
 
         const diff = bar.close - bar.open;
         const pct = bar.open ? (diff / bar.open) * 100 : 0;
-        const color = diff >= 0 ? '#00ff55' : '#ff5b5b';
-        const sign = diff >= 0 ? '+' : '';
+        const color = diff > 0
+            ? FREELANCER_MARKET_COLORS.up
+            : diff < 0
+                ? FREELANCER_MARKET_COLORS.down
+                : FREELANCER_MARKET_COLORS.flat;
+        const sign = diff > 0 ? '+' : '';
         const periodLabelMap = {
             '1min': '1分',
             '5min': '5分',
@@ -2584,10 +2708,9 @@ class FreelancerWeightedStocksPane {
                 borderColor: '#333',
                 timeVisible: true,
                 secondsVisible: false,
-                tickMarkFormatter: (time) => {
-                    const d = new Date((time + 28800) * 1000);
-                    return String(d.getUTCHours()).padStart(2, '0');
-                }
+                // 原生刻度會因右欄寬度自動省略成 09、11、13；文字交由
+                // 自訂小時軸繪製，才能穩定顯示每一個整點。
+                tickMarkFormatter: () => ''
             },
             localization: {
                 timeFormatter: (ts) => {
@@ -2602,9 +2725,9 @@ class FreelancerWeightedStocksPane {
         });
 
         const priceSeries = chart.addAreaSeries({
-            lineColor: '#00ff35',
-            topColor: 'rgba(0, 255, 53, 0.18)',
-            bottomColor: 'rgba(0, 255, 53, 0.02)',
+            lineColor: FREELANCER_MARKET_COLORS.flat,
+            topColor: FREELANCER_MARKET_COLORS.flatTop,
+            bottomColor: FREELANCER_MARKET_COLORS.flatBottom,
             lineWidth: 2,
             priceFormat: { type: 'price', precision: 2, minMove: 0.01 }
         });
@@ -2618,13 +2741,27 @@ class FreelancerWeightedStocksPane {
         const volumeSeries = chart.addHistogramSeries({
             color: '#1186d9',
             priceFormat: { type: 'volume' },
-            priceScaleId: ''
+            priceScaleId: '',
+            priceLineVisible: false,
+            lastValueVisible: false
         });
         volumeSeries.priceScale().applyOptions({
             scaleMargins: { top: 0.76, bottom: 0 }
         });
 
-        this.charts[code] = { chart, priceSeries, avgSeries, volumeSeries };
+        const hourAxis = document.createElement('div');
+        hourAxis.className = 'fl-weighted-hour-axis';
+        hourAxis.setAttribute('aria-hidden', 'true');
+        el.appendChild(hourAxis);
+
+        this.charts[code] = {
+            chart,
+            priceSeries,
+            avgSeries,
+            volumeSeries,
+            openPriceLine: null,
+            hourAxis
+        };
         this.resizeOne(code);
     }
 
@@ -2643,6 +2780,12 @@ class FreelancerWeightedStocksPane {
             const res = await fetch('/api/major_weighted_stocks_intraday');
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const payload = await res.json();
+            const sourceEl = document.getElementById('fl-weighted-source');
+            if (sourceEl) {
+                const isFubon = payload.source === 'fubon_stock_marketdata';
+                sourceEl.textContent = isFubon ? '● 富邦即時' : '● 備援資料';
+                sourceEl.style.color = isFubon ? '#26de81' : '#f5a623';
+            }
             (payload.stocks || []).forEach(stock => this.renderStock(stock));
             } catch (err) {
                 console.warn('[FL] 四大權值股載入失敗:', err);
@@ -2676,6 +2819,7 @@ class FreelancerWeightedStocksPane {
                 valueEl.textContent = '無資料';
                 valueEl.style.color = '#858c9a';
             }
+            this.updateHourAxis(code, null);
             return;
         }
 
@@ -2700,7 +2844,12 @@ class FreelancerWeightedStocksPane {
             reference
         };
 
-        this.applyTrend(code, change);
+        this.applyTrend(code, change, changePct);
+        this.updateOpenPriceLine(
+            code,
+            this.stockState[code].open,
+            lastPrice
+        );
         parts.priceSeries.setData(priceData);
         parts.avgSeries.setData(avgData);
         parts.volumeSeries.setData(volData);
@@ -2710,15 +2859,103 @@ class FreelancerWeightedStocksPane {
         this.resizeOne(code);
     }
 
-    applyTrend(code, change) {
+    updateHourAxis(code, lastTime = this.stockState[code]?.lastTime) {
+        const hourAxis = this.charts[code]?.hourAxis;
+        if (!hourAxis) return;
+        hourAxis.replaceChildren();
+
+        const timestamp = Number(lastTime);
+        if (!Number.isFinite(timestamp) || timestamp <= 0) return;
+
+        const wall = new Date((timestamp + 28800) * 1000);
+        const sessionStartMinute = 9 * 60;
+        const sessionEndMinute = 13 * 60 + 30;
+        const lastMinute = Math.min(
+            sessionEndMinute,
+            Math.max(
+                sessionStartMinute,
+                wall.getUTCHours() * 60 + wall.getUTCMinutes()
+            )
+        );
+        const visibleMinutes = Math.max(1, lastMinute - sessionStartMinute);
+
+        for (let hour = 9; hour <= 13; hour += 1) {
+            const hourMinute = hour * 60;
+            if (hourMinute > lastMinute) break;
+            const label = document.createElement('span');
+            label.className = 'fl-weighted-hour-label';
+            label.textContent = String(hour).padStart(2, '0');
+            label.style.left = `${(
+                (hourMinute - sessionStartMinute) / visibleMinutes
+            ) * 100}%`;
+            hourAxis.appendChild(label);
+        }
+    }
+
+    marketDirection(change, changePct = 0) {
+        const numericChange = Number(change);
+        const numericPct = Number(changePct);
+        const value = Number.isFinite(numericChange) && numericChange !== 0
+            ? numericChange
+            : (Number.isFinite(numericPct) ? numericPct : 0);
+        return value > 0 ? 1 : value < 0 ? -1 : 0;
+    }
+
+    applyTrend(code, change, changePct = 0) {
         const parts = this.charts[code];
         if (!parts) return;
-        const isUp = Number(change) >= 0;
+        const direction = this.marketDirection(change, changePct);
+        const lineColor = direction > 0
+            ? FREELANCER_MARKET_COLORS.up
+            : direction < 0
+                ? FREELANCER_MARKET_COLORS.down
+                : FREELANCER_MARKET_COLORS.flat;
+        const topColor = direction > 0
+            ? FREELANCER_MARKET_COLORS.upTop
+            : direction < 0
+                ? FREELANCER_MARKET_COLORS.downTop
+                : FREELANCER_MARKET_COLORS.flatTop;
+        const bottomColor = direction > 0
+            ? FREELANCER_MARKET_COLORS.upBottom
+            : direction < 0
+                ? FREELANCER_MARKET_COLORS.downBottom
+                : FREELANCER_MARKET_COLORS.flatBottom;
         parts.priceSeries.applyOptions({
-            lineColor: isUp ? '#00ff35' : '#ff4b4b',
-            topColor: isUp ? 'rgba(0, 255, 53, 0.18)' : 'rgba(255, 75, 75, 0.17)',
-            bottomColor: isUp ? 'rgba(0, 255, 53, 0.02)' : 'rgba(255, 75, 75, 0.02)'
+            lineColor,
+            topColor,
+            bottomColor
         });
+    }
+
+    updateOpenPriceLine(code, price, currentPrice = null) {
+        const parts = this.charts[code];
+        const open = Number(price);
+        if (!parts || !Number.isFinite(open) || open <= 0) return;
+
+        const current = Number(currentPrice);
+        const overlapsCurrent = Number.isFinite(current)
+            && Math.abs(current - open) < 0.005;
+
+        // 開盤價與現價相同時，兩組右軸標籤會完全疊在一起。此時暫時
+        // 隱藏現價序列的右軸標籤（表頭仍有現價），優先顯示橘色開盤線。
+        parts.priceSeries.applyOptions({
+            priceLineVisible: !overlapsCurrent,
+            lastValueVisible: !overlapsCurrent
+        });
+
+        const options = {
+            price: open,
+            color: '#f5a623',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: ''
+        };
+        if (parts.openPriceLine) {
+            parts.openPriceLine.applyOptions(options);
+        } else {
+            parts.openPriceLine = parts.priceSeries.createPriceLine(options);
+        }
     }
 
     updateValue(code, price, changePct, change) {
@@ -2726,9 +2963,14 @@ class FreelancerWeightedStocksPane {
         if (!valueEl || !Number.isFinite(Number(price))) return;
         const numericChange = Number(change) || 0;
         const pct = Number(changePct) || 0;
-        const sign = numericChange >= 0 ? '+' : '';
+        const direction = this.marketDirection(numericChange, pct);
+        const sign = direction > 0 ? '+' : '';
         valueEl.textContent = `${Number(price).toFixed(2)} ${sign}${pct.toFixed(2)}%`;
-        valueEl.style.color = numericChange >= 0 ? '#00ff35' : '#ff4b4b';
+        valueEl.style.color = direction > 0
+            ? FREELANCER_MARKET_COLORS.up
+            : direction < 0
+                ? FREELANCER_MARKET_COLORS.down
+                : FREELANCER_MARKET_COLORS.flat;
     }
 
     updateTick(tick) {
@@ -2776,8 +3018,10 @@ class FreelancerWeightedStocksPane {
         state.open = Number(tick.open) || state.open || price;
         state.reference = reference;
         this.stockState[code] = state;
-        this.applyTrend(code, change);
+        this.applyTrend(code, change, changePct);
+        this.updateOpenPriceLine(code, state.open, price);
         this.updateValue(code, price, changePct, change);
+        this.updateHourAxis(code, state.lastTime);
     }
 
     updateKbar(kbar) {
@@ -2822,17 +3066,20 @@ class FreelancerWeightedStocksPane {
         state.open = state.open || Number(kbar.open) || close;
         state.reference = reference;
         this.stockState[code] = state;
-        this.applyTrend(code, change);
+        this.applyTrend(code, change, changePct);
+        this.updateOpenPriceLine(code, state.open, close);
         this.updateValue(code, close, changePct, change);
+        this.updateHourAxis(code, state.lastTime);
     }
 
     start() {
         this.init();
-        // 歷史資料只載入一次；後續由 Shioaji KBar + Tick 經 WebSocket 推進。
+        // 啟動時由富邦 REST 補當日分時，後續由富邦股票 WebSocket 推進。
+        // 每五分鐘低頻校正一次，避免短暫斷線造成局部分時缺口。
         if (this.refreshTimer) {
             clearInterval(this.refreshTimer);
-            this.refreshTimer = null;
         }
+        this.refreshTimer = setInterval(() => this.load(), 300000);
         setTimeout(() => this.resize(), 80);
     }
 
@@ -2849,7 +3096,10 @@ class FreelancerWeightedStocksPane {
         if (!el || !parts) return;
         const width = el.clientWidth;
         const height = el.clientHeight;
-        if (width > 0 && height > 0) parts.chart.resize(width, height);
+        if (width > 0 && height > 0) {
+            parts.chart.resize(width, height);
+            this.updateHourAxis(code);
+        }
     }
 
     resize() {
@@ -4019,7 +4269,7 @@ async function startApp(contractCode) {
         initOverlay.style.display = 'flex';
         initOverlay.style.opacity = '1';
         const loadText = document.getElementById('initial-loading-text');
-        if (loadText) loadText.innerText = "正在登入並同步永豐金證券伺服器...";
+        if (loadText) loadText.innerText = "正在登入並同步富邦期貨行情服務...";
     } else {
         if (initOverlay) initOverlay.style.display = 'none';
     }
@@ -4556,7 +4806,7 @@ async function startApp(contractCode) {
     loadCacheInfo();
     setInterval(loadCacheInfo, 60000);
 
-    // 即時欄位由 Shioaji 訂閱 Tick 推送；snapshot 僅在初始載入時查一次。
+    // 即時欄位由富邦 trades 推送；snapshot 僅在初始載入時查一次。
 
     // 7. 啟動秒級心跳 (僅針對「非連動中」且「非滑鼠指著」的視窗更新倒數)
     setInterval(() => {
@@ -4649,10 +4899,9 @@ if (loginBtn) {
         if (msgEl) msgEl.innerText = "連線中...";
         const req = {
             api_key: document.getElementById('api_key').value,
-            secret_key: document.getElementById('secret_key').value,
-            is_simulation: false,
-            ca_path: '',
-            ca_passwd: '',
+            person_id: document.getElementById('person_id').value,
+            cert_path: document.getElementById('cert_path').value,
+            cert_pass: document.getElementById('cert_pass').value,
             save_keys: document.getElementById('save_keys').checked
         };
         try {
@@ -4741,14 +4990,14 @@ function updateQuoteStatus(health) {
     const statusEl = document.getElementById('ws-status');
     if (!statusEl || !health) return;
     const labels = {
-        live: ['🟢 永豐報價正常', '#00FF00'],
+        live: ['🟢 富邦報價正常', '#00FF00'],
         subscribed: ['🟡 已訂閱，等待成交', '#ffd54f'],
         connected: ['🟡 報價連線中', '#ffd54f'],
         waiting: ['🟡 等待第一筆成交', '#ffd54f'],
         idle: ['⚪ 非交易時段', '#aaaaaa'],
         stale: ['🔴 報價逾時', '#ff5252'],
-        error: ['🔴 永豐訂閱錯誤', '#ff5252'],
-        disconnected: ['🔴 永豐報價斷線', '#ff5252']
+        error: ['🔴 富邦訂閱錯誤', '#ff5252'],
+        disconnected: ['🔴 富邦報價斷線', '#ff5252']
     };
     const key = health.status || health.subscription || 'waiting';
     const [label, color] = labels[key] || labels.waiting;
@@ -4797,7 +5046,7 @@ function connectWebSocket() {
         wsHasOpened = true;
         const statusEl = document.getElementById('ws-status');
         if (statusEl) {
-            statusEl.innerText = '🟡 瀏覽器已連線，確認永豐報價中';
+            statusEl.innerText = '🟡 瀏覽器已連線，確認富邦報價中';
             statusEl.style.color = '#ffd54f';
         }
         if (isReconnect) {
@@ -4857,7 +5106,7 @@ function connectWebSocket() {
                 if (freelancerChartPane) {
                     freelancerChartPane.onTick(msg.data.price, msg.data.time);
                 }
-                flUpdateTodayAmplitudeFromTick(msg.data.price);
+                flUpdateTodayAmplitudeFromTick(msg.data.price, msg.data.time);
             }
             return;
         }
@@ -4917,10 +5166,13 @@ async function checkStatus() {
             document.getElementById('login-container').style.display = 'block';
             document.getElementById('app-container').style.display = 'none';
             
-            // 自動填入已儲存的金鑰
+            // 機密值不從後端送回瀏覽器；留空即可沿用本機 .env。
             if (data.env) {
-                if (data.env.api_key) document.getElementById('api_key').value = data.env.api_key;
-                if (data.env.secret_key) document.getElementById('secret_key').value = data.env.secret_key;
+                const savedHint = '已儲存在本機，留空即可沿用';
+                if (data.env.has_api_key) document.getElementById('api_key').placeholder = savedHint;
+                if (data.env.has_person_id) document.getElementById('person_id').placeholder = savedHint;
+                if (data.env.has_cert_path) document.getElementById('cert_path').placeholder = savedHint;
+                if (data.env.has_cert_pass) document.getElementById('cert_pass').placeholder = savedHint;
             }
         }
     } catch (e) {
@@ -5182,6 +5434,8 @@ document.addEventListener('DOMContentLoaded', () => {
 let _flAmpPeriod = 'day';
 let _flTodayAmpHigh = null;
 let _flTodayAmpLow = null;
+let _flDailyAmplitudeStats = null;
+let _flTodayTradingDayKey = null;
 
 function flSelectTxfTab(tab) {
     document.querySelectorAll('.fl-txf-tab-btn').forEach(btn => btn.classList.remove('active'));
@@ -5206,6 +5460,80 @@ function flSetAmpValue(id, val, fallback = '--') {
     }
 }
 
+function flComputeBarrierLevels(todayLow, todayHigh, stats = {}) {
+    const toFiniteNumber = value => (
+        value === null || value === undefined || value === ''
+            ? Number.NaN
+            : Number(value)
+    );
+    const low = toFiniteNumber(todayLow);
+    const high = toFiniteNumber(todayHigh);
+    const amplitudes = [
+        stats.amp_min,
+        stats.amp_small,
+        stats.amp_avg,
+        stats.amp_large,
+        stats.amp_max,
+    ].map(toFiniteNumber);
+
+    if (
+        !Number.isFinite(low)
+        || !Number.isFinite(high)
+        || amplitudes.some(value => !Number.isFinite(value))
+    ) {
+        return null;
+    }
+
+    return {
+        long: amplitudes.map(amplitude => Math.round(low + amplitude)),
+        short: amplitudes.map(amplitude => Math.round(high - amplitude)),
+    };
+}
+
+function flSetBarrierValue(id, value) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const numericValue = value === null || value === undefined || value === ''
+        ? Number.NaN
+        : Number(value);
+    el.textContent = Number.isFinite(numericValue) ? Math.round(numericValue) : '--';
+}
+
+function flUpdateBarrierLevels() {
+    flSetBarrierValue('fl-long-low', _flTodayAmpLow);
+    flSetBarrierValue('fl-short-high', _flTodayAmpHigh);
+
+    const levels = flComputeBarrierLevels(
+        _flTodayAmpLow,
+        _flTodayAmpHigh,
+        _flDailyAmplitudeStats || {}
+    );
+    for (let level = 1; level <= 5; level += 1) {
+        flSetBarrierValue(`fl-long-${level}`, levels?.long[level - 1]);
+        flSetBarrierValue(`fl-short-${level}`, levels?.short[level - 1]);
+    }
+}
+
+function flFuturesTradingDayKey(timestamp = Date.now() / 1000) {
+    const seconds = Number(timestamp);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    const wall = new Date((seconds + 28800) * 1000);
+    let tradingDayMs = Date.UTC(
+        wall.getUTCFullYear(),
+        wall.getUTCMonth(),
+        wall.getUTCDate()
+    );
+    if (wall.getUTCHours() >= 15) tradingDayMs += 86400000;
+
+    // 週五夜盤與週六凌晨皆歸入下週一交易日。
+    let tradingDay = new Date(tradingDayMs);
+    while (tradingDay.getUTCDay() === 0 || tradingDay.getUTCDay() === 6) {
+        tradingDayMs += 86400000;
+        tradingDay = new Date(tradingDayMs);
+    }
+    return tradingDay.toISOString().slice(0, 10);
+}
+
 function flSortAmplitudeRows() {
     const section = document.getElementById('fl-amplitude-section');
     if (!section) return;
@@ -5227,15 +5555,30 @@ function flSortAmplitudeRows() {
     });
 }
 
-function flUpdateTodayAmplitudeFromTick(price) {
-    if (_flAmpPeriod !== 'day' || price === null || price === undefined) return;
+function flUpdateTodayAmplitudeFromTick(price, timestamp = Date.now() / 1000) {
+    if (price === null || price === undefined) return;
     const p = Number(price);
     if (!Number.isFinite(p) || p <= 0) return;
-    _flTodayAmpHigh = (_flTodayAmpHigh === null) ? p : Math.max(_flTodayAmpHigh, p);
-    _flTodayAmpLow = (_flTodayAmpLow === null) ? p : Math.min(_flTodayAmpLow, p);
+    const tradingDayKey = flFuturesTradingDayKey(timestamp);
+    if (
+        tradingDayKey
+        && _flTodayTradingDayKey
+        && tradingDayKey !== _flTodayTradingDayKey
+    ) {
+        // 15:00 進入新交易日，第一筆成交即為新的日高與日低。
+        _flTodayAmpHigh = p;
+        _flTodayAmpLow = p;
+    } else {
+        _flTodayAmpHigh = (_flTodayAmpHigh === null) ? p : Math.max(_flTodayAmpHigh, p);
+        _flTodayAmpLow = (_flTodayAmpLow === null) ? p : Math.min(_flTodayAmpLow, p);
+    }
+    if (tradingDayKey) _flTodayTradingDayKey = tradingDayKey;
     if (_flTodayAmpHigh !== null && _flTodayAmpLow !== null) {
-        flSetAmpValue('fl-amp-today', Math.round(_flTodayAmpHigh - _flTodayAmpLow));
-        flSortAmplitudeRows();
+        if (_flAmpPeriod === 'day') {
+            flSetAmpValue('fl-amp-today', Math.round(_flTodayAmpHigh - _flTodayAmpLow));
+            flSortAmplitudeRows();
+        }
+        flUpdateBarrierLevels();
     }
 }
 
@@ -5269,8 +5612,23 @@ async function flLoadAmplitude(period = 'day') {
         flSetAmpValue('fl-amp-small', d.amp_small);
         flSetAmpValue('fl-amp-min',   d.amp_min);
         flSetAmpValue('fl-amp-today', d.amp_today);
-        _flTodayAmpHigh = (d.amp_today_high !== null && d.amp_today_high !== undefined) ? Number(d.amp_today_high) : null;
-        _flTodayAmpLow = (d.amp_today_low !== null && d.amp_today_low !== undefined) ? Number(d.amp_today_low) : null;
+        if (period === 'day') {
+            _flTodayTradingDayKey = flFuturesTradingDayKey();
+            _flDailyAmplitudeStats = {
+                amp_min: d.amp_min,
+                amp_small: d.amp_small,
+                amp_avg: d.amp_avg,
+                amp_large: d.amp_large,
+                amp_max: d.amp_max,
+            };
+            _flTodayAmpHigh = (
+                d.amp_today_high !== null && d.amp_today_high !== undefined
+            ) ? Number(d.amp_today_high) : null;
+            _flTodayAmpLow = (
+                d.amp_today_low !== null && d.amp_today_low !== undefined
+            ) ? Number(d.amp_today_low) : null;
+            flUpdateBarrierLevels();
+        }
         flSortAmplitudeRows();
     } catch (e) {
         console.warn('[FL] 震幅統計載入失敗:', e);

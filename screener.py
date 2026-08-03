@@ -91,7 +91,7 @@ _INDUSTRY_MAP = {
 }
 
 def _resolve_industry(raw: str) -> str:
-    """將 Shioaji 回傳的產業代碼（如 '24'）轉為中文名稱，已是中文則直接回傳"""
+    """將券商合約的產業代碼（如 '24'）轉為中文名稱，已是中文則直接回傳。"""
     if not raw:
         return ''
     key = raw.strip().zfill(2)
@@ -427,9 +427,9 @@ def sync_twse_institutional_data(target_date=None):
     else:
         print("[Screener] No institutional data found (possibly non-trading day).")
 
-def sync_stock_kbars(shioaji_api, codes=None, progress_callback=None):
+def sync_stock_kbars(legacy_stock_api, codes=None, progress_callback=None):
     """
-    從 Shioaji 下載指定股票的日 K 線（約 100 個交易日，足夠計算 60MA）。
+    舊版券商股票日 K 匯入器（目前富邦期貨行情流程不會呼叫）。
     codes 為 None 時下載全部 DEFAULT_STOCKS。
     使用 3 條執行緒並行下載，並以批次 INSERT 取代逐行寫入。
     """
@@ -439,8 +439,8 @@ def sync_stock_kbars(shioaji_api, codes=None, progress_callback=None):
     init_db()
     if codes is None:
         codes = DEFAULT_STOCKS
-    if shioaji_api is None:
-        print("[Screener] ERROR: shioaji_api is None, cannot sync K-bars")
+    if legacy_stock_api is None:
+        print("[Screener] ERROR: legacy_stock_api is None, cannot sync K-bars")
         return
 
     end_date = datetime.now()
@@ -470,7 +470,7 @@ def sync_stock_kbars(shioaji_api, codes=None, progress_callback=None):
             gap = _MIN_INTERVAL - (time.time() - _last_call[0])
             if gap > 0:
                 time.sleep(gap)
-            result = shioaji_api.kbars(contract, start=start, end=end)
+            result = legacy_stock_api.kbars(contract, start=start, end=end)
             _last_call[0] = time.time()
         return result
 
@@ -481,7 +481,7 @@ def sync_stock_kbars(shioaji_api, codes=None, progress_callback=None):
         contract = None
         for market in ('TSE', 'OTC'):
             try:
-                c = getattr(shioaji_api.Contracts.Stocks, market)[code]
+                c = getattr(legacy_stock_api.Contracts.Stocks, market)[code]
                 if c:
                     contract = c
                     break
@@ -717,7 +717,7 @@ def run_screener_query(
         q = daily_quotes.get(code)
         sub_df = df_k[df_k['code'] == code].copy()
 
-        # Shioaji kbars 通常 T+1 才有今日資料；若 DB 最新日期 < 今天，
+        # 券商日 K 可能 T+1 才有今日資料；若 DB 最新日期 < 今天，
         # 且 TWSE 資料確認是今日，才補一筆，避免用昨日收盤冒充今日。
         if q and twse_is_today and (sub_df.empty or sub_df.iloc[-1]['date'] < today_str):
             today_row = pd.DataFrame([{
@@ -915,7 +915,7 @@ def run_screener_query(
             dealerBuy5   = sum(r['dealer_buy'] for r in last_5_inst)
             totalInstitutionBuy5 = foreignBuy5 + investmentTrustBuy5 + dealerBuy5
             
-            # Shioaji 日K volume 單位為張；法人買超在 sync 時已除以 1000 轉換為張
+            # 舊日K匯入器的 volume 單位為張；法人買超在 sync 時已除以 1000 轉換為張
             # 法人佔比 = 近5日法人買超張數 / 近5日成交量張數 * 100
             last_5_kbars = sub_df.tail(len(last_5_inst)).to_dict('records')
             total_vol_lots = sum(r['volume'] for r in last_5_kbars)  # 已是張
