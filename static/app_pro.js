@@ -1363,7 +1363,10 @@ const FREELANCER_HISTORY_FLOOR = '2025-01-01';
 const FREELANCER_HISTORY_CHUNK_DAYS = 30;
 const FREELANCER_HISTORY_EDGE_THRESHOLD = 15;
 const FREELANCER_INITIAL_HISTORY_DAYS = 7;
+const FREELANCER_INITIAL_VISIBLE_BARS = 120;
 const FREELANCER_INITIAL_MAX_BARS = 220;
+const FREELANCER_INITIAL_BACKFILL_ATTEMPTS = 2;
+const FREELANCER_RECENT_RECONCILE_MIN_MS = 45000;
 const FREELANCER_MARKET_COLORS = Object.freeze({
     up: '#ef554a',
     down: '#26a69a',
@@ -1380,6 +1383,18 @@ const FREELANCER_COST_LINE = Object.freeze({
     lineWidth: 2,
     showResetMarks: false
 });
+const FREELANCER_MACD = Object.freeze({
+    fastLength: 12,
+    slowLength: 26,
+    signalLength: 9,
+    macdColor: '#2962ff',
+    signalColor: '#ff6d00',
+    positiveRising: '#26a69a',
+    positiveFalling: '#b2dfdb',
+    negativeRising: '#ffcdd2',
+    negativeFalling: '#ff5252',
+    zeroColor: '#787b8680'
+});
 
 class FreelancerKChart {
     constructor() {
@@ -1388,6 +1403,11 @@ class FreelancerKChart {
         this.candleSeries = null;
         this.dayCostSeries = null;
         this.nightCostSeries = null;
+        this.macdChart = null;
+        this.macdSeries = { line: null, signal: null, histogram: null };
+        this.macdCache = this.emptyMacdCache();
+        this.macdByTime = new Map();
+        this.isSyncingMacdRange = false;
         this.costLineByTime = new Map();
         this.costLineState = this.emptyCostLineState();
         this.costLineSegments = [];
@@ -1411,6 +1431,8 @@ class FreelancerKChart {
         this.drawingOverlay = null;
         this.countdownTimer = null;
         this.lastRealtimeTickAt = 0;
+        this.isReconcilingRecent = false;
+        this.lastRecentReconcileAt = 0;
     }
 
     init(symbol = 'TXFR1') {
@@ -1433,13 +1455,18 @@ class FreelancerKChart {
                 vertLines: { color: '#2b3040', style: LightweightCharts.LineStyle.Dotted },
                 horzLines: { color: '#2b3040', style: LightweightCharts.LineStyle.Dotted }
             },
-            crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+            crosshair: {
+                mode: LightweightCharts.CrosshairMode.Normal,
+                vertLine: { labelVisible: false }
+            },
             rightPriceScale: {
                 borderColor: '#c9ced8',
-                scaleMargins: { top: 0.08, bottom: 0.08 }
+                scaleMargins: { top: 0.08, bottom: 0.08 },
+                minimumWidth: 88
             },
             timeScale: {
                 borderColor: '#c9ced8',
+                visible: false,
                 timeVisible: true,
                 secondsVisible: false,
                 tickMarkFormatter: (time) => {
@@ -1492,15 +1519,48 @@ class FreelancerKChart {
         };
         this.dayCostSeries = this.chart.addLineSeries(costLineOptions);
         this.nightCostSeries = this.chart.addLineSeries(costLineOptions);
+        this.initMacdChart();
         this.startCountdownTimer();
 
         this.chart.subscribeCrosshairMove((param) => {
             const bar = param?.seriesData?.get(this.candleSeries);
             this.updateLegend(bar || this.kbarsCache[this.kbarsCache.length - 1]);
+            const macdPoint = param?.time
+                ? this.macdByTime.get(Number(param.time))
+                : undefined;
+            this.updateMacdLegend(macdPoint);
+            this.updateCrosshairTimeLabel(param);
         });
+        mainEl.addEventListener('mouseleave', () => this.hideCrosshairTimeLabel());
         this.chart.timeScale().subscribeVisibleLogicalRangeChange(
-            (range) => this.handleVisibleRangeChange(range)
+            (range) => {
+                this.handleVisibleRangeChange(range);
+                this.syncMacdVisibleRange(range, this.macdChart);
+            }
         );
+        if (this.macdChart) {
+            const macdEl = document.getElementById('fl-chart-macd');
+            macdEl?.addEventListener('mouseleave', () => this.hideCrosshairTimeLabel());
+            this.macdChart.timeScale().subscribeVisibleLogicalRangeChange(
+                (range) => this.syncMacdVisibleRange(range, this.chart)
+            );
+            this.macdChart.subscribeCrosshairMove((param) => {
+                this.updateCrosshairTimeLabel(param);
+                const linePoint = param?.seriesData?.get(this.macdSeries.line);
+                const signalPoint = param?.seriesData?.get(this.macdSeries.signal);
+                const histPoint = param?.seriesData?.get(this.macdSeries.histogram);
+                if (param?.time && linePoint && signalPoint && histPoint) {
+                    this.updateMacdLegend({
+                        macd: Number(linePoint.value),
+                        signal: Number(signalPoint.value),
+                        hist: Number(histPoint.value),
+                        color: histPoint.color
+                    });
+                } else {
+                    this.updateMacdLegend();
+                }
+            });
+        }
 
         const periodEl = document.getElementById('fl-chart-period');
         if (periodEl) {
@@ -1521,6 +1581,158 @@ class FreelancerKChart {
         this.setupProductSwitch();
         this.setupDrawingTools();
         this.reload();
+    }
+
+    initMacdChart() {
+        const macdEl = document.getElementById('fl-chart-macd');
+        if (!macdEl || this.macdChart || !window.LightweightCharts) return;
+
+        this.macdChart = LightweightCharts.createChart(macdEl, {
+            layout: {
+                textColor: '#aeb7c6',
+                background: { type: 'solid', color: '#0d1018' },
+                fontSize: 11
+            },
+            grid: {
+                vertLines: { color: '#252b38', style: LightweightCharts.LineStyle.Dotted },
+                horzLines: { color: '#252b38', style: LightweightCharts.LineStyle.Dotted }
+            },
+            crosshair: {
+                mode: LightweightCharts.CrosshairMode.Normal,
+                vertLine: { labelVisible: false }
+            },
+            rightPriceScale: {
+                borderColor: '#c9ced8',
+                scaleMargins: { top: 0.14, bottom: 0.14 },
+                minimumWidth: 88
+            },
+            timeScale: {
+                borderColor: '#c9ced8',
+                visible: true,
+                timeVisible: true,
+                secondsVisible: false,
+                tickMarkFormatter: (time) => {
+                    if (this.currentPeriod === 'D') {
+                        const d = new Date((time + 28800) * 1000);
+                        const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+                        const day = String(d.getUTCDate()).padStart(2, '0');
+                        return `${month}/${day}`;
+                    }
+                    const d = new Date((time + 28800) * 1000);
+                    const hour = String(d.getUTCHours()).padStart(2, '0');
+                    const minute = String(d.getUTCMinutes()).padStart(2, '0');
+                    return `${hour}:${minute}`;
+                }
+            },
+            localization: {
+                timeFormatter: (time) => {
+                    const d = new Date((time + 28800) * 1000);
+                    const year = d.getUTCFullYear();
+                    const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+                    const day = String(d.getUTCDate()).padStart(2, '0');
+                    const hour = String(d.getUTCHours()).padStart(2, '0');
+                    const minute = String(d.getUTCMinutes()).padStart(2, '0');
+                    return `${year}/${month}/${day} ${hour}:${minute}`;
+                }
+            }
+        });
+
+        const commonLineOptions = {
+            lineWidth: 2,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerRadius: 3,
+            priceFormat: { type: 'price', precision: 2, minMove: 0.01 }
+        };
+        this.macdSeries.histogram = this.macdChart.addHistogramSeries({
+            color: FREELANCER_MACD.positiveRising,
+            base: 0,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            priceFormat: { type: 'price', precision: 2, minMove: 0.01 }
+        });
+        this.macdSeries.line = this.macdChart.addLineSeries({
+            ...commonLineOptions,
+            color: FREELANCER_MACD.macdColor
+        });
+        this.macdSeries.signal = this.macdChart.addLineSeries({
+            ...commonLineOptions,
+            color: FREELANCER_MACD.signalColor
+        });
+        this.macdSeries.histogram.createPriceLine({
+            price: 0,
+            color: FREELANCER_MACD.zeroColor,
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Solid,
+            axisLabelVisible: false,
+            title: ''
+        });
+    }
+
+    syncMacdVisibleRange(range, targetChart) {
+        if (!range || !targetChart || this.isSyncingMacdRange) return;
+        this.isSyncingMacdRange = true;
+        try {
+            targetChart.timeScale().setVisibleLogicalRange(range);
+        } finally {
+            this.isSyncingMacdRange = false;
+        }
+    }
+
+    formatCrosshairTime(time) {
+        const stamp = Number(time);
+        if (!Number.isFinite(stamp)) return '';
+        const wall = new Date((stamp + 28800) * 1000);
+        const weekdays = ['日', '一', '二', '三', '四', '五', '六'];
+        const year = wall.getUTCFullYear();
+        const month = String(wall.getUTCMonth() + 1).padStart(2, '0');
+        const day = String(wall.getUTCDate()).padStart(2, '0');
+        const weekday = weekdays[wall.getUTCDay()];
+        if (this.currentPeriod === 'D') {
+            return `週${weekday} ${year}-${month}-${day}`;
+        }
+        const hour = String(wall.getUTCHours()).padStart(2, '0');
+        const minute = String(wall.getUTCMinutes()).padStart(2, '0');
+        return `週${weekday} ${year}-${month}-${day}  ${hour}:${minute}`;
+    }
+
+    hideCrosshairTimeLabel() {
+        document.getElementById('fl-chart-crosshair-time')
+            ?.classList.remove('visible');
+    }
+
+    updateCrosshairTimeLabel(param) {
+        const label = document.getElementById('fl-chart-crosshair-time');
+        const stack = label?.parentElement;
+        const time = Number(param?.time);
+        const x = Number(param?.point?.x);
+        if (!label || !stack || !Number.isFinite(time) || !Number.isFinite(x)) {
+            this.hideCrosshairTimeLabel();
+            return;
+        }
+
+        const text = this.formatCrosshairTime(time);
+        if (!text) {
+            this.hideCrosshairTimeLabel();
+            return;
+        }
+        label.textContent = text;
+        label.classList.add('visible');
+
+        const labelWidth = label.offsetWidth || 176;
+        let priceScaleWidth = 88;
+        try {
+            priceScaleWidth = this.chart?.priceScale('right').width() || priceScaleWidth;
+        } catch (_) {
+            // Lightweight Charts 舊版沒有 width() 時採用固定的價格軸寬度。
+        }
+        const halfWidth = labelWidth / 2;
+        const plotRight = Math.max(halfWidth, stack.clientWidth - priceScaleWidth);
+        const clampedX = Math.max(
+            halfWidth,
+            Math.min(plotRight - halfWidth, x)
+        );
+        label.style.left = `${Math.round(clampedX)}px`;
     }
 
     instrument(symbol = this.symbol) {
@@ -1662,6 +1874,168 @@ class FreelancerKChart {
             lastBarTime: null,
             value: null
         };
+    }
+
+    emptyMacdCache() {
+        return {
+            times: [],
+            fast: [],
+            slow: [],
+            macd: [],
+            signal: [],
+            hist: []
+        };
+    }
+
+    macdHistogramColor(value, previousValue) {
+        const rising = Number.isFinite(previousValue) && value > previousValue;
+        if (value >= 0) {
+            return rising
+                ? FREELANCER_MACD.positiveRising
+                : FREELANCER_MACD.positiveFalling;
+        }
+        return rising
+            ? FREELANCER_MACD.negativeRising
+            : FREELANCER_MACD.negativeFalling;
+    }
+
+    calculateMacdPoint(index) {
+        const bar = this.kbarsCache[index];
+        const close = Number(bar?.close);
+        const time = Number(bar?.time);
+        if (!Number.isFinite(close) || !Number.isFinite(time)) return null;
+
+        const previousFast = this.macdCache.fast[index - 1];
+        const previousSlow = this.macdCache.slow[index - 1];
+        const previousSignal = this.macdCache.signal[index - 1];
+        const previousHist = this.macdCache.hist[index - 1];
+        const fastAlpha = 2 / (FREELANCER_MACD.fastLength + 1);
+        const slowAlpha = 2 / (FREELANCER_MACD.slowLength + 1);
+        const signalAlpha = 2 / (FREELANCER_MACD.signalLength + 1);
+        const fast = Number.isFinite(previousFast)
+            ? close * fastAlpha + previousFast * (1 - fastAlpha)
+            : close;
+        const slow = Number.isFinite(previousSlow)
+            ? close * slowAlpha + previousSlow * (1 - slowAlpha)
+            : close;
+        const macd = fast - slow;
+        const signal = Number.isFinite(previousSignal)
+            ? macd * signalAlpha + previousSignal * (1 - signalAlpha)
+            : macd;
+        const hist = macd - signal;
+        return {
+            time,
+            fast,
+            slow,
+            macd,
+            signal,
+            hist,
+            color: this.macdHistogramColor(hist, previousHist)
+        };
+    }
+
+    storeMacdPoint(index, point) {
+        this.macdCache.times[index] = point.time;
+        this.macdCache.fast[index] = point.fast;
+        this.macdCache.slow[index] = point.slow;
+        this.macdCache.macd[index] = point.macd;
+        this.macdCache.signal[index] = point.signal;
+        this.macdCache.hist[index] = point.hist;
+        this.macdByTime.set(point.time, point);
+    }
+
+    clearMacd() {
+        this.macdCache = this.emptyMacdCache();
+        this.macdByTime.clear();
+        if (this.macdSeries.line) this.macdSeries.line.setData([]);
+        if (this.macdSeries.signal) this.macdSeries.signal.setData([]);
+        if (this.macdSeries.histogram) this.macdSeries.histogram.setData([]);
+        this.updateMacdLegend(null);
+    }
+
+    rebuildMacd() {
+        this.macdCache = this.emptyMacdCache();
+        this.macdByTime.clear();
+        const macdData = [];
+        const signalData = [];
+        const histogramData = [];
+
+        this.kbarsCache.forEach((bar, index) => {
+            const point = this.calculateMacdPoint(index);
+            if (!point) return;
+            this.storeMacdPoint(index, point);
+            macdData.push({ time: point.time, value: point.macd });
+            signalData.push({ time: point.time, value: point.signal });
+            histogramData.push({
+                time: point.time,
+                value: point.hist,
+                color: point.color
+            });
+        });
+
+        if (this.macdSeries.line) this.macdSeries.line.setData(macdData);
+        if (this.macdSeries.signal) this.macdSeries.signal.setData(signalData);
+        if (this.macdSeries.histogram) {
+            this.macdSeries.histogram.setData(histogramData);
+        }
+        this.updateMacdLegend();
+    }
+
+    updateMacdForLatestBar() {
+        const index = this.kbarsCache.length - 1;
+        if (index < 0) {
+            this.clearMacd();
+            return;
+        }
+
+        const time = Number(this.kbarsCache[index]?.time);
+        const canAppend = this.macdCache.times.length === index;
+        const canReplace = (
+            this.macdCache.times.length === this.kbarsCache.length
+            && Number(this.macdCache.times[index]) === time
+        );
+        if (!canAppend && !canReplace) {
+            this.rebuildMacd();
+            return;
+        }
+
+        const point = this.calculateMacdPoint(index);
+        if (!point) return;
+        this.storeMacdPoint(index, point);
+        this.macdSeries.line?.update({ time: point.time, value: point.macd });
+        this.macdSeries.signal?.update({ time: point.time, value: point.signal });
+        this.macdSeries.histogram?.update({
+            time: point.time,
+            value: point.hist,
+            color: point.color
+        });
+        this.updateMacdLegend(point);
+    }
+
+    updateMacdLegend(point = undefined) {
+        const macdEl = document.getElementById('fl-macd-value');
+        const signalEl = document.getElementById('fl-macd-signal');
+        const histEl = document.getElementById('fl-macd-histogram');
+        if (!macdEl || !signalEl || !histEl) return;
+
+        let selected = point;
+        if (selected === undefined) {
+            const lastTime = this.macdCache.times[this.macdCache.times.length - 1];
+            selected = this.macdByTime.get(Number(lastTime));
+        }
+        if (!selected) {
+            macdEl.textContent = 'MACD --';
+            signalEl.textContent = 'Signal --';
+            histEl.textContent = 'Histogram --';
+            histEl.style.color = '#9aa3b2';
+            return;
+        }
+
+        macdEl.textContent = `MACD ${Number(selected.macd).toFixed(2)}`;
+        signalEl.textContent = `Signal ${Number(selected.signal).toFixed(2)}`;
+        histEl.textContent = `Histogram ${Number(selected.hist).toFixed(2)}`;
+        histEl.style.color = selected.color
+            || this.macdHistogramColor(Number(selected.hist), NaN);
     }
 
     costLineResetType(time) {
@@ -2090,6 +2464,7 @@ class FreelancerKChart {
             this.hasMoreHistory = rangeStart > FREELANCER_HISTORY_FLOOR;
             this.candleSeries.setData(this.kbarsCache);
             this.rebuildCostLine();
+            this.rebuildMacd();
             if (visibleRange && addedCount > 0) {
                 this.chart.timeScale().setVisibleLogicalRange({
                     from: visibleRange.from + addedCount,
@@ -2140,6 +2515,7 @@ class FreelancerKChart {
         this.lastRealtimeTickAt = 0;
         this.candleSeries.setData([]);
         this.clearCostLine();
+        this.clearMacd();
         this.updateLegend(null);
 
         // 啟動只先補足最近畫面所需區間；往左滑到邊界時，再以 30 天一批
@@ -2151,8 +2527,42 @@ class FreelancerKChart {
         const startDate = new Date(Date.now() - days * 86400000);
         const start = startDate.toLocaleDateString('en-CA');
         this.loadedStartDate = start;
-        await this.fetchData(start, end, requestId);
+        await this.fetchData(start, end, requestId, true);
+        await this.ensureInitialHistoryCoverage(requestId);
         await this.reconcileLatestSnapshot(requestId);
+        this.setInitialVisibleRange();
+    }
+
+    initialVisibleBarTarget() {
+        return this.currentPeriod === 'D'
+            ? 60
+            : FREELANCER_INITIAL_VISIBLE_BARS;
+    }
+
+    async ensureInitialHistoryCoverage(requestId = this.loadRequestId) {
+        let attempts = 0;
+        const target = this.initialVisibleBarTarget();
+        while (
+            requestId === this.loadRequestId
+            && this.kbarsCache.length < target
+            && this.hasMoreHistory
+            && attempts < FREELANCER_INITIAL_BACKFILL_ATTEMPTS
+        ) {
+            const before = this.kbarsCache.length;
+            attempts += 1;
+            await this.loadEarlierHistory();
+            if (requestId !== this.loadRequestId || this.kbarsCache.length <= before) {
+                break;
+            }
+        }
+    }
+
+    setInitialVisibleRange() {
+        if (!this.chart || this.kbarsCache.length === 0) return;
+        this.chart.timeScale().setVisibleLogicalRange({
+            from: this.initialVisibleFromIndex(),
+            to: this.kbarsCache.length + 8
+        });
     }
 
     async reconcileLatestSnapshot(requestId = this.loadRequestId) {
@@ -2183,18 +2593,22 @@ class FreelancerKChart {
     }
 
     initialVisibleFromIndex() {
-        const fallback = Math.max(
+        const readableFallback = Math.max(
             0,
             this.kbarsCache.length - FREELANCER_INITIAL_MAX_BARS
         );
+        const minimumFillFallback = Math.max(
+            0,
+            this.kbarsCache.length - this.initialVisibleBarTarget()
+        );
         if (this.currentPeriod === 'D' || this.kbarsCache.length === 0) {
-            return fallback;
+            return minimumFillFallback;
         }
 
         const lastTime = Number(
             this.kbarsCache[this.kbarsCache.length - 1]?.time
         );
-        if (!Number.isFinite(lastTime)) return fallback;
+        if (!Number.isFinite(lastTime)) return minimumFillFallback;
 
         // 「全」盤的一個交易日從 15:00 夜盤開始，接續到隔日日盤。
         // 週末或休市日沒有 15:00 棒時，findIndex 會自然落到下一根有效棒。
@@ -2214,14 +2628,26 @@ class FreelancerKChart {
         const sessionIndex = this.kbarsCache.findIndex(
             bar => Number(bar.time) >= sessionStart
         );
-        if (sessionIndex < 0) return fallback;
+        if (sessionIndex < 0) return minimumFillFallback;
+
+        const sessionBarCount = this.kbarsCache.length - sessionIndex;
+        if (sessionBarCount < this.initialVisibleBarTarget()) {
+            // 剛開盤或大週期時，本交易時段的 K 棒不足一個畫面；允許帶入
+            // 前一時段的本機歷史資料，避免重新整理後只剩幾根孤立 K 棒。
+            return minimumFillFallback;
+        }
 
         // 5 分以上可完整呈現本交易日；1 分線若超過 220 根則保留可讀性，
         // 更早的同日資料仍已載入，往右拖即可看到。
-        return Math.max(sessionIndex, fallback);
+        return Math.max(sessionIndex, readableFallback);
     }
 
-    async fetchData(start, end, requestId = this.loadRequestId) {
+    async fetchData(
+        start,
+        end,
+        requestId = this.loadRequestId,
+        refreshRecent = false
+    ) {
         this.isLoading = true;
         const loadingEl = document.getElementById('fl-chart-loading');
         if (loadingEl) loadingEl.style.display = 'flex';
@@ -2230,7 +2656,10 @@ class FreelancerKChart {
             const apiStart = this.currentPeriod === 'D'
                 ? shiftIsoDate(start, -1)
                 : start;
-            const res = await fetch(`/api/kbars?start=${apiStart}&end=${end}&period=1min`);
+            const recentParam = refreshRecent ? '&refresh_recent=true' : '';
+            const res = await fetch(
+                `/api/kbars?start=${apiStart}&end=${end}&period=1min${recentParam}`
+            );
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
             if (requestId !== this.loadRequestId) return;
@@ -2241,7 +2670,9 @@ class FreelancerKChart {
             );
             this.candleSeries.setData(this.kbarsCache);
             this.rebuildCostLine();
-            this.updateLegend(this.kbarsCache[this.kbarsCache.length - 1]);
+            this.rebuildMacd();
+            const latestBar = this.kbarsCache[this.kbarsCache.length - 1];
+            this.updateLegend(latestBar);
             if (this.kbarsCache.length === 0) {
                 this.showHistoryStatus(
                     `${this.instrument().name}歷史 K 棒暫無回傳，先顯示即時資料`,
@@ -2249,12 +2680,7 @@ class FreelancerKChart {
                 );
             }
             this.resize();
-            if (this.kbarsCache.length > 0) {
-                this.chart.timeScale().setVisibleLogicalRange({
-                    from: this.initialVisibleFromIndex(),
-                    to: this.kbarsCache.length + 8
-                });
-            }
+            this.setInitialVisibleRange();
             window.setTimeout(() => {
                 if (requestId === this.loadRequestId) {
                     this.historyInteractionArmed = true;
@@ -2271,6 +2697,190 @@ class FreelancerKChart {
                 if (loadingEl) loadingEl.style.display = 'none';
                 this.isLoading = false;
             }
+        }
+    }
+
+    hasRecentSessionGap() {
+        if (this.currentPeriod === 'D' || this.kbarsCache.length < 2) return false;
+        const periodSeconds = this.periodSeconds();
+        const firstIndex = Math.max(1, this.kbarsCache.length - 500);
+        for (let index = firstIndex; index < this.kbarsCache.length; index += 1) {
+            const previous = Number(this.kbarsCache[index - 1]?.time);
+            const current = Number(this.kbarsCache[index]?.time);
+            if (
+                !Number.isFinite(previous)
+                || !Number.isFinite(current)
+                || current - previous <= periodSeconds
+            ) continue;
+
+            // 05:00～08:45、13:45～15:00 與週末是正常休市；只要缺口中
+            // 存在一個本來應該開盤的分桶，才判定為資料缺失。
+            for (
+                let candidate = previous + periodSeconds;
+                candidate < current;
+                candidate += periodSeconds
+            ) {
+                if (this.isFuturesSessionOpen(candidate)) return true;
+            }
+        }
+        return false;
+    }
+
+    barsDiffer(left, right) {
+        return ['open', 'high', 'low', 'close'].some(
+            key => Number(left?.[key]) !== Number(right?.[key])
+        );
+    }
+
+    async reconcileRecentHistory(reason = '最近交易時段校準', forceRefresh = false) {
+        if (
+            !this.candleSeries
+            || this.isLoading
+            || this.isLoadingHistory
+            || this.isSwitchingContract
+            || this.isReconcilingRecent
+        ) return;
+
+        const startedAt = Date.now();
+        if (
+            !forceRefresh
+            && startedAt - this.lastRecentReconcileAt
+                < FREELANCER_RECENT_RECONCILE_MIN_MS
+        ) return;
+
+        const requestId = this.loadRequestId;
+        const expectedSymbol = this.symbol;
+        const visibleRange = this.chart?.timeScale().getVisibleLogicalRange();
+        const previousLength = this.kbarsCache.length;
+        const wasFollowingRealtime = (
+            !visibleRange
+            || visibleRange.to >= previousLength - 2
+        );
+        const anchorIndex = visibleRange
+            ? Math.max(0, Math.min(
+                previousLength - 1,
+                Math.floor(visibleRange.from)
+            ))
+            : -1;
+        const anchorTime = anchorIndex >= 0
+            ? Number(this.kbarsCache[anchorIndex]?.time)
+            : null;
+        const anchorOffset = visibleRange && anchorIndex >= 0
+            ? visibleRange.from - anchorIndex
+            : 0;
+        const visibleSpan = visibleRange
+            ? visibleRange.to - visibleRange.from
+            : 0;
+
+        const end = new Date().toLocaleDateString('en-CA');
+        const start = shiftIsoDate(end, -1);
+        const refreshParam = forceRefresh || this.hasRecentSessionGap()
+            ? '&refresh_recent=true'
+            : '';
+
+        this.isReconcilingRecent = true;
+        try {
+            const res = await fetch(
+                `/api/kbars?start=${start}&end=${end}&period=1min${refreshParam}`
+            );
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (
+                requestId !== this.loadRequestId
+                || expectedSymbol !== this.symbol
+            ) return;
+
+            const incomingBars = this.filterBarsForRequestedRange(
+                this.aggregateBars(data || []),
+                start,
+                end
+            );
+            if (incomingBars.length === 0) return;
+
+            const mergedByTime = new Map(
+                this.kbarsCache.map(bar => [Number(bar.time), bar])
+            );
+            const now = Math.floor(Date.now() / 1000);
+            const currentBucket = getKbarBucketTime(
+                now,
+                this.currentPeriod,
+                false
+            );
+            const hasFreshRealtime = (
+                Date.now() - this.lastRealtimeTickAt < 5 * 60 * 1000
+            );
+            let repairedBars = 0;
+
+            incomingBars.forEach((incoming) => {
+                const time = Number(incoming.time);
+                const existing = mergedByTime.get(time);
+                let next = incoming;
+                if (
+                    existing
+                    && hasFreshRealtime
+                    && time === currentBucket
+                ) {
+                    next = {
+                        time,
+                        open: Number(incoming.open),
+                        high: Math.max(
+                            Number(incoming.high),
+                            Number(existing.high)
+                        ),
+                        low: Math.min(
+                            Number(incoming.low),
+                            Number(existing.low)
+                        ),
+                        close: Number(existing.close)
+                    };
+                }
+                if (!existing || this.barsDiffer(existing, next)) repairedBars += 1;
+                mergedByTime.set(time, next);
+            });
+
+            this.kbarsCache = Array.from(mergedByTime.values())
+                .sort((a, b) => Number(a.time) - Number(b.time));
+            this.candleSeries.setData(this.kbarsCache);
+            this.rebuildCostLine();
+            this.rebuildMacd();
+            this.updateLegend(this.kbarsCache[this.kbarsCache.length - 1]);
+
+            if (wasFollowingRealtime) {
+                this.chart.timeScale().scrollToRealTime();
+            } else if (visibleRange && Number.isFinite(anchorTime)) {
+                const newAnchorIndex = this.kbarsCache.findIndex(
+                    bar => Number(bar.time) === anchorTime
+                );
+                if (newAnchorIndex >= 0) {
+                    const from = newAnchorIndex + anchorOffset;
+                    this.chart.timeScale().setVisibleLogicalRange({
+                        from,
+                        to: from + visibleSpan
+                    });
+                }
+            }
+
+            this.renderDrawings();
+            await this.reconcileLatestSnapshot(requestId);
+            if (repairedBars > 0) {
+                this.showHistoryStatus(
+                    `已校準最近交易時段，修復 ${repairedBars} 根 K 棒`,
+                    'complete',
+                    3200
+                );
+                console.info(
+                    `[FreelancerKChart] ${expectedSymbol} ${reason}：`
+                    + `修復 ${repairedBars} 根`
+                );
+            }
+            this.lastRecentReconcileAt = Date.now();
+        } catch (error) {
+            console.warn(`[FreelancerKChart] ${reason}失敗:`, error);
+        } finally {
+            // 校準失敗時也要進入冷卻期，避免每筆即時 candle
+            // 都立刻重送歷史請求，形成 REST 請求風暴。
+            this.lastRecentReconcileAt = Date.now();
+            this.isReconcilingRecent = false;
         }
     }
 
@@ -2320,6 +2930,7 @@ class FreelancerKChart {
             this.kbarsCache = [];
             this.candleSeries.setData([]);
             this.clearCostLine();
+            this.clearMacd();
             this.updateLegend(null);
             this.showHistoryStatus(
                 `${this.instrument().name}本交易時段歷史資料未補齊，已隔離舊資料並先顯示即時價`,
@@ -2336,6 +2947,7 @@ class FreelancerKChart {
             this.kbarsCache.push(firstBar);
             this.candleSeries.setData(this.kbarsCache);
             this.updateCostLineForBar(firstBar);
+            this.updateMacdForLatestBar();
             this.updateLegend(firstBar);
             this.updateCountdown();
             return;
@@ -2352,6 +2964,7 @@ class FreelancerKChart {
             this.kbarsCache.push(newBar);
             this.candleSeries.update(newBar);
             this.updateCostLineForBar(newBar);
+            this.updateMacdForLatestBar();
             this.updateLegend(newBar);
             this.updateCountdown();
             // 使用者正在看左側歷史時，不因新的一分鐘／五分鐘棒而跳回最右側。
@@ -2365,6 +2978,7 @@ class FreelancerKChart {
         last.low = Math.min(last.low, price);
         this.candleSeries.update(last);
         this.updateCostLineForBar(last);
+        this.updateMacdForLatestBar();
         this.updateLegend(last);
         this.updateCountdown();
     }
@@ -2646,6 +3260,7 @@ class FreelancerKChart {
 
     resize() {
         const mainEl = document.getElementById('fl-chart-main');
+        const macdEl = document.getElementById('fl-chart-macd');
         if (!mainEl || !this.chart) return;
         const width = mainEl.clientWidth;
         const height = mainEl.clientHeight;
@@ -2653,6 +3268,13 @@ class FreelancerKChart {
             this.chart.resize(width, height);
             this.renderDrawings();
             this.updateCountdown();
+        }
+        if (macdEl && this.macdChart) {
+            const macdWidth = macdEl.clientWidth;
+            const macdHeight = macdEl.clientHeight;
+            if (macdWidth > 0 && macdHeight > 0) {
+                this.macdChart.resize(macdWidth, macdHeight);
+            }
         }
     }
 }
@@ -2702,7 +3324,8 @@ class FreelancerWeightedStocksPane {
             crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
             rightPriceScale: {
                 borderVisible: false,
-                scaleMargins: { top: 0.08, bottom: 0.28 }
+                scaleMargins: { top: 0.08, bottom: 0.28 },
+                minimumWidth: 70
             },
             timeScale: {
                 borderColor: '#333',
@@ -2720,10 +3343,21 @@ class FreelancerWeightedStocksPane {
                     return `${hh}:${mm}`;
                 }
             },
-            handleScroll: { mouseWheel: false, pressedMouseMove: true },
-            handleScale: { axisPressedMouseMove: false, mouseWheel: false, pinch: true }
+            handleScroll: { mouseWheel: false, pressedMouseMove: false },
+            handleScale: { axisPressedMouseMove: false, mouseWheel: false, pinch: false }
         });
 
+        // Lightweight Charts 的時間軸是依「資料點數」等距排列，不是依時間差。
+        // 用整個 09:00～13:30 的每分鐘空白點建立固定骨架，實際走勢才不會
+        // 因為目前只到 09:40，就被自動拉伸填滿整張圖。
+        const timeAnchorSeries = chart.addLineSeries({
+            color: 'rgba(0,0,0,0)',
+            lineWidth: 1,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+            priceScaleId: ''
+        });
         const priceSeries = chart.addAreaSeries({
             lineColor: FREELANCER_MARKET_COLORS.flat,
             topColor: FREELANCER_MARKET_COLORS.flatTop,
@@ -2759,10 +3393,53 @@ class FreelancerWeightedStocksPane {
             priceSeries,
             avgSeries,
             volumeSeries,
+            timeAnchorSeries,
             openPriceLine: null,
-            hourAxis
+            hourAxis,
+            sessionStart: null,
+            sessionEnd: null
         };
         this.resizeOne(code);
+    }
+
+    weightedSessionBounds(timestamp) {
+        const stamp = Number(timestamp);
+        if (!Number.isFinite(stamp) || stamp <= 0) return null;
+        const wall = new Date((stamp + 28800) * 1000);
+        const year = wall.getUTCFullYear();
+        const month = wall.getUTCMonth();
+        const day = wall.getUTCDate();
+        const start = Date.UTC(year, month, day, 9, 0, 0) / 1000 - 28800;
+        const end = Date.UTC(year, month, day, 13, 30, 0) / 1000 - 28800;
+        return { start, end };
+    }
+
+    ensureFixedSessionTimeline(code, timestamp) {
+        const parts = this.charts[code];
+        const bounds = this.weightedSessionBounds(timestamp);
+        if (!parts || !bounds) return null;
+        if (
+            parts.sessionStart === bounds.start
+            && parts.sessionEnd === bounds.end
+        ) return bounds;
+
+        const timeline = [];
+        for (let time = bounds.start; time <= bounds.end; time += 60) {
+            timeline.push({ time });
+        }
+        parts.timeAnchorSeries.setData(timeline);
+        parts.sessionStart = bounds.start;
+        parts.sessionEnd = bounds.end;
+        parts.chart.timeScale().fitContent();
+        return bounds;
+    }
+
+    resetStockSeries(code) {
+        const parts = this.charts[code];
+        if (!parts) return;
+        parts.priceSeries.setData([]);
+        parts.avgSeries.setData([]);
+        parts.volumeSeries.setData([]);
     }
 
     attachResizeObserver() {
@@ -2823,25 +3500,42 @@ class FreelancerWeightedStocksPane {
             return;
         }
 
-        const priceData = bars.map(b => ({ time: Number(b.time), value: Number(b.price) }));
-        const avgData = bars.map(b => ({ time: Number(b.time), value: Number(b.avg) || Number(b.price) }));
-        const volData = bars.map(b => ({ time: Number(b.time), value: Number(b.volume) || 0, color: '#0e91df' }));
+        const session = this.ensureFixedSessionTimeline(code, bars[bars.length - 1].time);
+        const sessionBars = session
+            ? bars.filter(b => {
+                const time = Number(b.time);
+                return time >= session.start && time <= session.end;
+            })
+            : bars;
+        if (sessionBars.length === 0) {
+            if (valueEl) {
+                valueEl.textContent = '無盤中資料';
+                valueEl.style.color = '#858c9a';
+            }
+            this.updateHourAxis(code);
+            return;
+        }
+        const priceData = sessionBars.map(b => ({ time: Number(b.time), value: Number(b.price) }));
+        const avgData = sessionBars.map(b => ({ time: Number(b.time), value: Number(b.avg) || Number(b.price) }));
+        const volData = sessionBars.map(b => ({ time: Number(b.time), value: Number(b.volume) || 0, color: '#0e91df' }));
         const change = Number(stock.change) || 0;
         const changePct = Number(stock.change_pct) || 0;
-        const lastBar = bars[bars.length - 1];
+        const lastBar = sessionBars[sessionBars.length - 1];
         const lastPrice = Number(stock.last) || Number(lastBar.price);
         const reference = Number(stock.reference)
             || (Number.isFinite(lastPrice - change) && (lastPrice - change) > 0 ? lastPrice - change : 0)
             || Number(stock.open)
-            || Number(bars[0].price);
+            || Number(sessionBars[0].price);
 
         this.stockState[code] = {
             lastTime: Number(lastBar.time),
             last: lastPrice,
             avg: Number(lastBar.avg) || lastPrice,
             currentVolume: Number(lastBar.volume) || 0,
-            open: Number(stock.open) || Number(bars[0].price),
-            reference
+            open: Number(stock.open) || Number(sessionBars[0].price),
+            reference,
+            sessionStart: session?.start || 0,
+            sessionEnd: session?.end || 0
         };
 
         this.applyTrend(code, change, changePct);
@@ -2859,35 +3553,23 @@ class FreelancerWeightedStocksPane {
         this.resizeOne(code);
     }
 
-    updateHourAxis(code, lastTime = this.stockState[code]?.lastTime) {
-        const hourAxis = this.charts[code]?.hourAxis;
-        if (!hourAxis) return;
+    updateHourAxis(code) {
+        const parts = this.charts[code];
+        const hourAxis = parts?.hourAxis;
+        if (!parts || !hourAxis) return;
         hourAxis.replaceChildren();
 
-        const timestamp = Number(lastTime);
-        if (!Number.isFinite(timestamp) || timestamp <= 0) return;
-
-        const wall = new Date((timestamp + 28800) * 1000);
-        const sessionStartMinute = 9 * 60;
-        const sessionEndMinute = 13 * 60 + 30;
-        const lastMinute = Math.min(
-            sessionEndMinute,
-            Math.max(
-                sessionStartMinute,
-                wall.getUTCHours() * 60 + wall.getUTCMinutes()
-            )
-        );
-        const visibleMinutes = Math.max(1, lastMinute - sessionStartMinute);
+        const sessionStart = Number(parts.sessionStart);
+        if (!Number.isFinite(sessionStart) || sessionStart <= 0) return;
 
         for (let hour = 9; hour <= 13; hour += 1) {
-            const hourMinute = hour * 60;
-            if (hourMinute > lastMinute) break;
+            const hourTime = sessionStart + (hour - 9) * 3600;
+            const coordinate = parts.chart.timeScale().timeToCoordinate(hourTime);
+            if (!Number.isFinite(coordinate)) continue;
             const label = document.createElement('span');
             label.className = 'fl-weighted-hour-label';
             label.textContent = String(hour).padStart(2, '0');
-            label.style.left = `${(
-                (hourMinute - sessionStartMinute) / visibleMinutes
-            ) * 100}%`;
+            label.style.left = `${Math.round(coordinate)}px`;
             hourAxis.appendChild(label);
         }
     }
@@ -2984,18 +3666,28 @@ class FreelancerWeightedStocksPane {
         const eventTime = Number(tick.time);
         if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(eventTime)) return;
 
-        const state = this.stockState[code] || {
+        const session = this.ensureFixedSessionTimeline(code, eventTime);
+        const previousState = this.stockState[code];
+        const isNewSession = !previousState
+            || Number(previousState.sessionStart) !== Number(session?.start);
+        if (isNewSession && previousState) this.resetStockSeries(code);
+        const state = isNewSession ? {
             lastTime: 0,
             last: price,
             avg: price,
             currentVolume: 0,
             open: Number(tick.open) || price,
-            reference: Number(tick.reference) || 0
-        };
+            reference: Number(tick.reference) || 0,
+            sessionStart: session?.start || 0,
+            sessionEnd: session?.end || 0
+        } : previousState;
         const reference = Number(tick.reference) || state.reference || 0;
         const change = reference ? price - reference : Number(tick.change) || 0;
         const changePct = reference ? change / reference * 100 : Number(tick.change_pct) || 0;
-        const minuteCloseTime = Math.floor(eventTime / 60) * 60 + 60;
+        const minuteCloseTime = Math.min(
+            session?.end || Number.POSITIVE_INFINITY,
+            Math.floor(eventTime / 60) * 60 + 60
+        );
 
         if (!state.lastTime || minuteCloseTime >= state.lastTime) {
             const sameMinute = minuteCloseTime === state.lastTime;
@@ -3021,7 +3713,7 @@ class FreelancerWeightedStocksPane {
         this.applyTrend(code, change, changePct);
         this.updateOpenPriceLine(code, state.open, price);
         this.updateValue(code, price, changePct, change);
-        this.updateHourAxis(code, state.lastTime);
+        this.updateHourAxis(code);
     }
 
     updateKbar(kbar) {
@@ -3035,29 +3727,40 @@ class FreelancerWeightedStocksPane {
         const barTime = Number(kbar.time);
         if (!Number.isFinite(close) || close <= 0 || !Number.isFinite(barTime)) return;
 
-        const state = this.stockState[code] || {
+        const session = this.ensureFixedSessionTimeline(code, barTime);
+        const barCloseTime = Math.min(
+            session?.end || Number.POSITIVE_INFINITY,
+            Math.floor(barTime / 60) * 60 + 60
+        );
+        const previousState = this.stockState[code];
+        const isNewSession = !previousState
+            || Number(previousState.sessionStart) !== Number(session?.start);
+        if (isNewSession && previousState) this.resetStockSeries(code);
+        const state = isNewSession ? {
             lastTime: 0,
             last: close,
             avg: close,
             currentVolume: 0,
             open: Number(kbar.open) || close,
-            reference: Number(kbar.reference) || 0
-        };
+            reference: Number(kbar.reference) || 0,
+            sessionStart: session?.start || 0,
+            sessionEnd: session?.end || 0
+        } : previousState;
         const reference = Number(kbar.reference) || state.reference || 0;
         const change = reference ? close - reference : Number(kbar.change) || 0;
         const changePct = reference ? change / reference * 100 : Number(kbar.change_pct) || 0;
 
-        if (!state.lastTime || barTime >= state.lastTime) {
+        if (!state.lastTime || barCloseTime >= state.lastTime) {
             const avg = Number(kbar.avg) || state.avg || close;
             const volume = Math.max(0, Number(kbar.volume) || 0);
-            parts.priceSeries.update({ time: barTime, value: close });
-            parts.avgSeries.update({ time: barTime, value: avg });
+            parts.priceSeries.update({ time: barCloseTime, value: close });
+            parts.avgSeries.update({ time: barCloseTime, value: avg });
             parts.volumeSeries.update({
-                time: barTime,
+                time: barCloseTime,
                 value: volume,
                 color: '#0e91df'
             });
-            state.lastTime = barTime;
+            state.lastTime = barCloseTime;
             state.currentVolume = volume;
             state.avg = avg;
         }
@@ -3069,7 +3772,7 @@ class FreelancerWeightedStocksPane {
         this.applyTrend(code, change, changePct);
         this.updateOpenPriceLine(code, state.open, close);
         this.updateValue(code, close, changePct, change);
-        this.updateHourAxis(code, state.lastTime);
+        this.updateHourAxis(code);
     }
 
     start() {
@@ -3098,6 +3801,9 @@ class FreelancerWeightedStocksPane {
         const height = el.clientHeight;
         if (width > 0 && height > 0) {
             parts.chart.resize(width, height);
+            if (parts.sessionStart && parts.sessionEnd) {
+                parts.chart.timeScale().fitContent();
+            }
             this.updateHourAxis(code);
         }
     }
@@ -5016,15 +5722,24 @@ function scheduleHistoricalChartReload(reason = 'cache') {
             ? (freelancerChartPane ? [freelancerChartPane] : [])
             : (market === 'futures' ? panes.filter(Boolean) : []);
 
-        if (targets.some(pane => pane.isLoading || pane.isLoadingHistory)) {
+        if (targets.some(
+            pane => pane.isLoading || pane.isLoadingHistory || pane.isReconcilingRecent
+        )) {
             scheduleHistoricalChartReload(reason);
             return;
         }
 
         historyReloadTimer = null;
         if (targets.length === 0) return;
-        console.log(`[Kbars] ${reason}，重新載入 ${market} 歷史圖表`);
-        await Promise.all(targets.map(pane => pane.reload()));
+        if (market === 'freelancer') {
+            console.log(`[Kbars] ${reason}，增量校準最近交易時段`);
+            await Promise.all(
+                targets.map(pane => pane.reconcileRecentHistory(reason, true))
+            );
+        } else {
+            console.log(`[Kbars] ${reason}，重新載入 ${market} 歷史圖表`);
+            await Promise.all(targets.map(pane => pane.reload()));
+        }
     }, 500);
 }
 
@@ -5065,6 +5780,16 @@ function connectWebSocket() {
         }
         if (msg.type === 'cache_updated') {
             loadCacheInfo();
+            const market = document.getElementById('market-type-selector')?.value;
+            if (
+                market === 'freelancer'
+                && freelancerChartPane?.hasRecentSessionGap()
+            ) {
+                freelancerChartPane.reconcileRecentHistory(
+                    '偵測到最近 K 棒缺口',
+                    false
+                );
+            }
             return;
         }
         if (msg.type === 'history_cache_updated') {
@@ -5073,7 +5798,11 @@ function connectWebSocket() {
             const freelancerOwnRequest = (
                 market === 'freelancer'
                 && freelancerChartPane
-                && (freelancerChartPane.isLoading || freelancerChartPane.isLoadingHistory)
+                && (
+                    freelancerChartPane.isLoading
+                    || freelancerChartPane.isLoadingHistory
+                    || freelancerChartPane.isReconcilingRecent
+                )
             );
             // 自由人圖表自己的請求會直接合併回傳資料；此時整張 reload
             // 會把剛往左補入的區間重設成最近 30 天。
@@ -5197,7 +5926,9 @@ document.addEventListener('visibilitychange', () => {
         if (panes && panes.length > 0) {
             panes.forEach(p => p.reload());
         }
-        if (freelancerChartPane) freelancerChartPane.reload();
+        if (freelancerChartPane) {
+            freelancerChartPane.reconcileRecentHistory('回到看盤頁面', true);
+        }
     }
 });
 
@@ -5436,6 +6167,10 @@ let _flTodayAmpHigh = null;
 let _flTodayAmpLow = null;
 let _flDailyAmplitudeStats = null;
 let _flTodayTradingDayKey = null;
+let _flBarrierLevels = null;
+let _flBarrierProgressTradingDayKey = null;
+let _flLongBarrierTarget = null;
+let _flShortBarrierTarget = null;
 
 function flSelectTxfTab(tab) {
     document.querySelectorAll('.fl-txf-tab-btn').forEach(btn => btn.classList.remove('active'));
@@ -5499,6 +6234,86 @@ function flSetBarrierValue(id, value) {
     el.textContent = Number.isFinite(numericValue) ? Math.round(numericValue) : '--';
 }
 
+function flFindNextBarrierTargets(sessionHigh, sessionLow, levels) {
+    const high = Number(sessionHigh);
+    const low = Number(sessionLow);
+    if (!Number.isFinite(high) || !Number.isFinite(low) || !levels) {
+        return { long: null, short: null };
+    }
+
+    const longCandidates = (levels.long || [])
+        .map((value, index) => ({ level: index + 1, value: Number(value) }))
+        .filter(item => Number.isFinite(item.value) && item.value >= high)
+        .sort((a, b) => a.value - b.value);
+    const shortCandidates = (levels.short || [])
+        .map((value, index) => ({ level: index + 1, value: Number(value) }))
+        .filter(item => Number.isFinite(item.value) && item.value <= low)
+        .sort((a, b) => b.value - a.value);
+    const longTerminalLevel = (levels.long || []).length || null;
+    const shortTerminalLevel = (levels.short || []).length || null;
+
+    return {
+        long: longCandidates[0]?.level ?? longTerminalLevel,
+        short: shortCandidates[0]?.level ?? shortTerminalLevel,
+    };
+}
+
+function flEnsureBarrierProgressTradingDay(tradingDayKey) {
+    if (!tradingDayKey || tradingDayKey === _flBarrierProgressTradingDayKey) return;
+    _flBarrierProgressTradingDayKey = tradingDayKey;
+    _flLongBarrierTarget = null;
+    _flShortBarrierTarget = null;
+}
+
+function flAdvanceBarrierTarget(currentTarget, calculatedTarget) {
+    if (calculatedTarget === null || calculatedTarget === undefined) {
+        return currentTarget;
+    }
+    if (currentTarget === null || currentTarget === undefined) {
+        return calculatedTarget;
+    }
+    return Math.max(currentTarget, calculatedTarget);
+}
+
+function flUpdateBarrierTargetHighlight() {
+    document.querySelectorAll('.fl-barrier-target-label').forEach(label => {
+        label.classList.remove('is-next-target');
+        label.removeAttribute('aria-current');
+        label.removeAttribute('title');
+    });
+
+    if (!_flBarrierLevels) return;
+    const tradingDayKey = _flTodayTradingDayKey || flFuturesTradingDayKey();
+    flEnsureBarrierProgressTradingDay(tradingDayKey);
+
+    const calculated = flFindNextBarrierTargets(
+        _flTodayAmpHigh,
+        _flTodayAmpLow,
+        _flBarrierLevels
+    );
+    _flLongBarrierTarget = flAdvanceBarrierTarget(
+        _flLongBarrierTarget,
+        calculated.long
+    );
+    _flShortBarrierTarget = flAdvanceBarrierTarget(
+        _flShortBarrierTarget,
+        calculated.short
+    );
+    const targets = {
+        long: _flLongBarrierTarget,
+        short: _flShortBarrierTarget,
+    };
+    for (const side of ['long', 'short']) {
+        const level = targets[side];
+        if (level === null) continue;
+        const label = document.getElementById(`fl-${side}-label-${level}`);
+        if (!label) continue;
+        label.classList.add('is-next-target');
+        label.setAttribute('aria-current', 'true');
+        label.setAttribute('title', '本交易日下一目標（進度只前進）');
+    }
+}
+
 function flUpdateBarrierLevels() {
     flSetBarrierValue('fl-long-low', _flTodayAmpLow);
     flSetBarrierValue('fl-short-high', _flTodayAmpHigh);
@@ -5508,10 +6323,12 @@ function flUpdateBarrierLevels() {
         _flTodayAmpHigh,
         _flDailyAmplitudeStats || {}
     );
+    _flBarrierLevels = levels;
     for (let level = 1; level <= 5; level += 1) {
         flSetBarrierValue(`fl-long-${level}`, levels?.long[level - 1]);
         flSetBarrierValue(`fl-short-${level}`, levels?.short[level - 1]);
     }
+    flUpdateBarrierTargetHighlight();
 }
 
 function flFuturesTradingDayKey(timestamp = Date.now() / 1000) {
@@ -5560,6 +6377,7 @@ function flUpdateTodayAmplitudeFromTick(price, timestamp = Date.now() / 1000) {
     const p = Number(price);
     if (!Number.isFinite(p) || p <= 0) return;
     const tradingDayKey = flFuturesTradingDayKey(timestamp);
+    flEnsureBarrierProgressTradingDay(tradingDayKey);
     if (
         tradingDayKey
         && _flTodayTradingDayKey

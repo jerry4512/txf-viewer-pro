@@ -352,10 +352,92 @@
             min-height: 0;
             background: #11141e;
         }
+        .fl-chart-stack {
+            position: absolute;
+            left: 48px;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            min-height: 0;
+        }
+        .fl-chart-primary {
+            position: relative;
+            flex: 1 1 auto;
+            min-width: 0;
+            min-height: 180px;
+            overflow: hidden;
+        }
         .fl-chart-main {
-            width: calc(100% - 48px);
+            width: 100%;
             height: 100%;
-            margin-left: 48px;
+        }
+        .fl-macd-panel {
+            position: relative;
+            flex: 0 0 165px;
+            min-width: 0;
+            min-height: 118px;
+            overflow: hidden;
+            border-top: 1px solid #303747;
+            background: #0d1018;
+        }
+        .fl-chart-macd {
+            width: 100%;
+            height: 100%;
+        }
+        .fl-chart-crosshair-time {
+            position: absolute;
+            left: 0;
+            bottom: 1px;
+            z-index: 24;
+            display: none;
+            min-width: max-content;
+            padding: 4px 8px 5px;
+            border-radius: 2px;
+            background: #4a4a4a;
+            color: #f3f3f3;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.55);
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 0.72rem;
+            font-weight: 600;
+            font-variant-numeric: tabular-nums;
+            line-height: 1.15;
+            white-space: nowrap;
+            pointer-events: none;
+            transform: translateX(-50%);
+        }
+        .fl-chart-crosshair-time.visible {
+            display: block;
+        }
+        .fl-macd-legend {
+            position: absolute;
+            top: 6px;
+            left: 10px;
+            z-index: 12;
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            color: #929cad;
+            font-size: 0.69rem;
+            font-weight: 650;
+            font-variant-numeric: tabular-nums;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.86);
+            white-space: nowrap;
+            pointer-events: none;
+        }
+        .fl-macd-title {
+            color: #d4dbe7;
+        }
+        .fl-macd-value.macd {
+            color: #2962ff;
+        }
+        .fl-macd-value.signal {
+            color: #ff6d00;
+        }
+        .fl-macd-value.histogram {
+            color: #9aa3b2;
         }
         .fl-draw-toolbar {
             position: absolute;
@@ -413,7 +495,7 @@
         }
         .fl-drawing-overlay {
             position: absolute;
-            left: 48px;
+            left: 0;
             top: 0;
             right: 0;
             bottom: 0;
@@ -427,7 +509,7 @@
         .fl-chart-legend {
             position: absolute;
             top: 12px;
-            left: 64px;
+            left: 16px;
             z-index: 10;
             pointer-events: none;
             color: #dce3ee;
@@ -470,7 +552,7 @@
         }
         .fl-chart-history-status {
             position: absolute;
-            left: 64px;
+            left: 16px;
             bottom: 34px;
             z-index: 17;
             display: inline-flex;
@@ -596,8 +678,8 @@
         }
         .fl-weighted-hour-axis {
             position: absolute;
-            left: 24px;
-            right: 58px;
+            left: 0;
+            right: 0;
             bottom: 1px;
             z-index: 8;
             height: 17px;
@@ -640,6 +722,9 @@
                 width: 100% !important;
                 flex: 0 0 620px !important;
                 min-height: 620px;
+            }
+            .fl-macd-panel {
+                flex-basis: 145px;
             }
             #fl-right-panel {
                 flex: 0 0 560px !important;
@@ -708,6 +793,21 @@
             justify-content: space-between;
             align-items: center;
             padding: 4px 12px;
+        }
+        .fl-barrier-target-label {
+            border: 1px solid transparent;
+            border-radius: 4px;
+            padding: 1px 5px;
+            margin-left: -5px;
+            transition: color 0.18s ease, background 0.18s ease,
+                        border-color 0.18s ease, text-shadow 0.18s ease;
+        }
+        .fl-barrier-target-label.is-next-target {
+            color: #ffe082 !important;
+            background: rgba(255, 193, 7, 0.14);
+            border-color: rgba(255, 213, 79, 0.58);
+            font-weight: 800;
+            text-shadow: 0 0 8px rgba(255, 193, 7, 0.85);
         }
         .fl-amp-row {
             display: flex;
@@ -2159,19 +2259,19 @@
                 </div>
                 <div style="background:#0f0606; font-size:0.78rem;">
                     <div class="fl-barrier-row" style="border-bottom:1px solid #1c0c0c;">
-                        <span style="color:#ff6b6b;">開卡值5</span><span id="fl-long-5" style="color:#ddd; font-family:monospace;">--</span>
+                        <span id="fl-long-label-5" class="fl-barrier-target-label" style="color:#ff6b6b;">開卡值5</span><span id="fl-long-5" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #1c0c0c;">
-                        <span style="color:#ff6b6b;">開卡值4</span><span id="fl-long-4" style="color:#ddd; font-family:monospace;">--</span>
+                        <span id="fl-long-label-4" class="fl-barrier-target-label" style="color:#ff6b6b;">開卡值4</span><span id="fl-long-4" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #1c0c0c;">
-                        <span style="color:#ff6b6b;">開卡值3</span><span id="fl-long-3" style="color:#ddd; font-family:monospace;">--</span>
+                        <span id="fl-long-label-3" class="fl-barrier-target-label" style="color:#ff6b6b;">開卡值3</span><span id="fl-long-3" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #1c0c0c;">
-                        <span style="color:#ff6b6b;">開卡值2</span><span id="fl-long-2" style="color:#ddd; font-family:monospace;">--</span>
+                        <span id="fl-long-label-2" class="fl-barrier-target-label" style="color:#ff6b6b;">開卡值2</span><span id="fl-long-2" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #1c0c0c;">
-                        <span style="color:#ff6b6b;">開卡值1</span><span id="fl-long-1" style="color:#ddd; font-family:monospace;">--</span>
+                        <span id="fl-long-label-1" class="fl-barrier-target-label" style="color:#ff6b6b;">開卡值1</span><span id="fl-long-1" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row">
                         <span style="color:#aaa;">今日最低價</span><span id="fl-long-low" style="color:#ff9a94; font-family:monospace; font-weight:bold;">--</span>
@@ -2187,19 +2287,19 @@
                         <span style="color:#aaa;">今日最高價</span><span id="fl-short-high" style="color:#78e394; font-family:monospace; font-weight:bold;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
-                        <span style="color:#26de81;">開卡值1</span><span id="fl-short-1" style="color:#ddd; font-family:monospace;">--</span>
+                        <span id="fl-short-label-1" class="fl-barrier-target-label" style="color:#26de81;">開卡值1</span><span id="fl-short-1" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
-                        <span style="color:#26de81;">開卡值2</span><span id="fl-short-2" style="color:#ddd; font-family:monospace;">--</span>
+                        <span id="fl-short-label-2" class="fl-barrier-target-label" style="color:#26de81;">開卡值2</span><span id="fl-short-2" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
-                        <span style="color:#26de81;">開卡值3</span><span id="fl-short-3" style="color:#ddd; font-family:monospace;">--</span>
+                        <span id="fl-short-label-3" class="fl-barrier-target-label" style="color:#26de81;">開卡值3</span><span id="fl-short-3" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row" style="border-bottom:1px solid #0c1a0e;">
-                        <span style="color:#26de81;">開卡值4</span><span id="fl-short-4" style="color:#ddd; font-family:monospace;">--</span>
+                        <span id="fl-short-label-4" class="fl-barrier-target-label" style="color:#26de81;">開卡值4</span><span id="fl-short-4" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                     <div class="fl-barrier-row">
-                        <span style="color:#26de81;">開卡值5</span><span id="fl-short-5" style="color:#ddd; font-family:monospace;">--</span>
+                        <span id="fl-short-label-5" class="fl-barrier-target-label" style="color:#26de81;">開卡值5</span><span id="fl-short-5" style="color:#ddd; font-family:monospace;">--</span>
                     </div>
                 </div>
 
@@ -2295,12 +2395,26 @@
                             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 15l8-8a3 3 0 0 1 4.2 0l1.8 1.8a3 3 0 0 1 0 4.2l-6 6H7l-3-3z"/><path d="M10 9l6 6"/><path d="M14 19h6"/></svg>
                         </button>
                     </div>
-                    <div id="fl-chart-legend" class="fl-chart-legend">載入中...</div>
-                    <div id="fl-chart-main" class="fl-chart-main"></div>
-                    <div id="fl-chart-countdown" class="fl-chart-countdown" aria-label="本根 K 棒倒數"></div>
-                    <svg id="fl-drawing-overlay" class="fl-drawing-overlay"></svg>
-                    <div id="fl-chart-history-status" class="fl-chart-history-status" aria-live="polite"></div>
-                    <div id="fl-chart-loading" class="fl-chart-loading">載入 K 線中...</div>
+                    <div class="fl-chart-stack">
+                        <div class="fl-chart-primary">
+                            <div id="fl-chart-legend" class="fl-chart-legend">載入中...</div>
+                            <div id="fl-chart-main" class="fl-chart-main"></div>
+                            <div id="fl-chart-countdown" class="fl-chart-countdown" aria-label="本根 K 棒倒數"></div>
+                            <svg id="fl-drawing-overlay" class="fl-drawing-overlay"></svg>
+                            <div id="fl-chart-history-status" class="fl-chart-history-status" aria-live="polite"></div>
+                            <div id="fl-chart-loading" class="fl-chart-loading">載入 K 線中...</div>
+                        </div>
+                        <div id="fl-chart-macd-panel" class="fl-macd-panel" aria-label="MACD 指標">
+                            <div id="fl-chart-macd-legend" class="fl-macd-legend">
+                                <span class="fl-macd-title">MACD 12 26 close 9</span>
+                                <span id="fl-macd-value" class="fl-macd-value macd">MACD --</span>
+                                <span id="fl-macd-signal" class="fl-macd-value signal">Signal --</span>
+                                <span id="fl-macd-histogram" class="fl-macd-value histogram">Histogram --</span>
+                            </div>
+                            <div id="fl-chart-macd" class="fl-chart-macd"></div>
+                        </div>
+                        <div id="fl-chart-crosshair-time" class="fl-chart-crosshair-time" aria-hidden="true"></div>
+                    </div>
                 </div>
             </div>
 
@@ -2517,7 +2631,7 @@
     <div id="drawer-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998;" onclick="closeStockDrawer()"></div>
 
     <!-- 載入主程式 (加入版本號避免快取問題) -->
-    <script src="app_pro.js?v=weighted-open-overlap-v28"></script>
+    <script src="app_pro.js?v=barrier-progress-lock-v37"></script>
 </body>
 </html>
 

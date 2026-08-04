@@ -77,6 +77,8 @@ main_loop = None
 _kbars_lock = asyncio.Lock()  # 富邦 REST 查詢全局序列化，避免碰觸速率限制
 _kbars_retry_after: dict[tuple[str, str], float] = {}
 _kbars_retry_lock = threading.Lock()
+_kbars_forced_refresh_after: dict[str, float] = {}
+_KBARS_FORCED_REFRESH_COOLDOWN_SECONDS = 45
 _HISTORY_START = datetime(2025, 1, 1)  # 歷史補取目標起點
 
 # 即時 bar 累積（每 1 min flush 進 SQLite，讓歷史圖不需重啟就有今日資料）
@@ -1364,6 +1366,19 @@ def _set_kbars_backoff(contract_code: str, start: datetime, end: datetime, secon
             _kbars_retry_after[(contract_code, day.strftime("%Y-%m-%d"))] = retry_at
             day += timedelta(days=1)
 
+
+def _claim_forced_kbars_refresh(contract_code: str) -> bool:
+    """Throttle recent-session repair across all open browser tabs."""
+    now = time.monotonic()
+    with _kbars_retry_lock:
+        allowed_at = _kbars_forced_refresh_after.get(contract_code, 0.0)
+        if allowed_at > now:
+            return False
+        _kbars_forced_refresh_after[contract_code] = (
+            now + _KBARS_FORCED_REFRESH_COOLDOWN_SECONDS
+        )
+        return True
+
 def _load_from_cache(contract_code: str, start: datetime, end: datetime) -> pd.DataFrame:
     start_ns = _taipei_wallclock_ns(start)
     end_ns = _taipei_wallclock_ns(end + timedelta(days=1))
@@ -1596,8 +1611,16 @@ def _drop_incomplete_recent_futures_dates(
     incomplete_dates = []
     for raw_date, count in counts.items():
         raw_day = datetime.strptime(str(raw_date), "%Y-%m-%d")
+        # 凌晨／日盤重新開啟時，當前交易日的夜盤起點位於前一個日曆日
+        # 15:00。富邦日內 candles 可能只回傳這段夜盤，而沒有同日早上的
+        # 日盤；只要已有足夠連續分鐘，就必須保留來填滿初始畫面。
+        is_current_session_lead = (
+            raw_day.date() == today - timedelta(days=1)
+            and int(count) >= 120
+        )
         if (
             raw_day.date() < today
+            and not is_current_session_lead
             and _recent_cache_date_is_incomplete(raw_day, int(count), today)
         ):
             incomplete_dates.append(str(raw_date))
@@ -1608,7 +1631,12 @@ def _drop_incomplete_recent_futures_dates(
 
 
 @app.get("/api/kbars")
-async def get_kbars(start: str, end: str, period: str = "1min"):
+async def get_kbars(
+    start: str,
+    end: str,
+    period: str = "1min",
+    refresh_recent: bool = False,
+):
     global api, is_logged_in, contract
     now_str = datetime.now().strftime('%H:%M:%S')
 
@@ -1673,14 +1701,27 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
             while d <= source_end_date:
                 date_str = d.strftime('%Y-%m-%d')
                 closed_weekend = d.weekday() == 6 if is_future else d.weekday() >= 5
+                forced_recent_day = (
+                    refresh_recent
+                    and is_future
+                    and today_tw - timedelta(days=1) <= d.date() <= today_tw
+                )
                 incomplete_recent = (
                     is_future
                     and _recent_cache_date_is_incomplete(
                         d, cache_counts.get(date_str, 0), today_tw
                     )
                 )
-                needs_fetch = date_str not in cached_dates or incomplete_recent
-                if needs_fetch and not closed_weekend and not _kbars_date_in_backoff(code, d):
+                needs_fetch = (
+                    date_str not in cached_dates
+                    or incomplete_recent
+                    or forced_recent_day
+                )
+                retry_ready = (
+                    forced_recent_day
+                    or not _kbars_date_in_backoff(code, d)
+                )
+                if needs_fetch and not closed_weekend and retry_ready:
                     uncached.append(d)
                 d += timedelta(days=1)
 
@@ -1716,11 +1757,23 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
                 loop = asyncio.get_running_loop()
                 try:
                     async with _kbars_lock:
+                        force_recent_batch = (
+                            refresh_recent
+                            and is_future
+                            and current_end.date() >= today_tw - timedelta(days=1)
+                            and current_start.date() <= today_tw
+                            and _claim_forced_kbars_refresh(code)
+                        )
                         # 另一個圖表可能剛查過相同空區間；進鎖後再次檢查冷卻。
-                        if _kbars_range_in_backoff(code, current_start, current_end):
+                        if (
+                            not force_recent_batch
+                            and _kbars_range_in_backoff(code, current_start, current_end)
+                        ):
                             print(f"[{now_str}]  ↳ [BACKOFF] 相同區間剛查過，略過重複 API")
                             current_start = current_end + timedelta(days=1)
                             continue
+                        if force_recent_batch:
+                            print(f"[{now_str}]  ↳ [REPAIR] 強制校準最近交易時段")
                         kbars = await loop.run_in_executor(
                             None,
                             lambda c=kbars_contract, s=s_str, e=e_str: api.kbars(
@@ -1757,15 +1810,19 @@ async def get_kbars(start: str, end: str, period: str = "1min"):
                     print(f"[{now_str}]  ↳ [OK] 取得 {len(df_new)} 筆")
                     all_df.append(df_new)
                     saved = _save_to_cache(code, df_new, cacheable_before)
-                    await manager.broadcast(json.dumps({
-                        "type": "history_cache_updated",
-                        "data": {
-                            "contract": code,
-                            "start": s_str,
-                            "end": e_str,
-                            "rows": len(df_new),
-                        },
-                    }))
+                    # 最近交易時段校準由發出 HTTP 請求的圖表直接合併回傳資料。
+                    # 若再廣播 history_cache_updated，其他舊分頁可能把通知當成
+                    # 新的修復要求，形成 REST 自觸發迴圈。
+                    if not refresh_recent:
+                        await manager.broadcast(json.dumps({
+                            "type": "history_cache_updated",
+                            "data": {
+                                "contract": code,
+                                "start": s_str,
+                                "end": e_str,
+                                "rows": len(df_new),
+                            },
+                        }))
                     success_backoff = (
                         300 if current_end.date() >= today_tw else 60
                     )
