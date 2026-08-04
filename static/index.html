@@ -2185,8 +2185,8 @@
                 <!-- 合約 Tab 選擇列 -->
                 <div style="background:#1a1a1a; display:flex; align-items:stretch; border-bottom:1px solid #252525;">
                     <div style="padding:5px 8px; font-size:0.7rem; color:#666; display:flex; align-items:center; flex-shrink:0;">商品:</div>
-                    <button id="fl-txf-tab-day" class="fl-txf-tab-btn" onclick="flSelectTxfTab('day')">台指期(日)</button>
-                    <button id="fl-txf-tab-all" class="fl-txf-tab-btn active" onclick="flSelectTxfTab('all')">台指期(全)</button>
+                    <button id="fl-txf-tab-day" class="fl-txf-tab-btn" aria-pressed="false" onclick="flSelectTxfTab('day')">台指期(日)</button>
+                    <button id="fl-txf-tab-all" class="fl-txf-tab-btn active" aria-pressed="true" onclick="flSelectTxfTab('all')">台指期(全)</button>
                 </div>
 
                 <!-- OHLC + 漲跌 -->
@@ -2631,7 +2631,7 @@
     <div id="drawer-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998;" onclick="closeStockDrawer()"></div>
 
     <!-- 載入主程式 (加入版本號避免快取問題) -->
-    <script src="app_pro.js?v=barrier-progress-lock-v37"></script>
+    <script src="app_pro.js?v=session-aware-left-panel-v39"></script>
 </body>
 </html>
 

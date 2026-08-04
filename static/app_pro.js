@@ -1399,6 +1399,9 @@ const FREELANCER_MACD = Object.freeze({
 class FreelancerKChart {
     constructor() {
         this.currentPeriod = document.getElementById('fl-chart-period')?.value || '5min';
+        this.sessionMode = localStorage.getItem('fl-txf-session-mode') === 'day'
+            ? 'day'
+            : 'all';
         this.chart = null;
         this.candleSeries = null;
         this.dayCostSeries = null;
@@ -1579,6 +1582,7 @@ class FreelancerKChart {
 
         this.resize();
         this.setupProductSwitch();
+        this.syncSessionToolbar();
         this.setupDrawingTools();
         this.reload();
     }
@@ -1744,6 +1748,39 @@ class FreelancerKChart {
         if (!FREELANCER_FUTURES[normalized]) return;
         this.symbol = normalized;
         this.syncProductToolbar();
+    }
+
+    syncSessionToolbar() {
+        const isDay = this.sessionMode === 'day';
+        const dayButton = document.getElementById('fl-txf-tab-day');
+        const allButton = document.getElementById('fl-txf-tab-all');
+        if (dayButton) {
+            dayButton.classList.toggle('active', isDay);
+            dayButton.setAttribute('aria-pressed', isDay ? 'true' : 'false');
+        }
+        if (allButton) {
+            allButton.classList.toggle('active', !isDay);
+            allButton.setAttribute('aria-pressed', isDay ? 'false' : 'true');
+        }
+    }
+
+    async setSessionMode(mode) {
+        const normalized = mode === 'day' ? 'day' : 'all';
+        if (normalized === this.sessionMode) {
+            this.syncSessionToolbar();
+            return;
+        }
+        this.sessionMode = normalized;
+        localStorage.setItem('fl-txf-session-mode', normalized);
+        this.syncSessionToolbar();
+        await this.reload();
+        if (normalized === 'day') {
+            this.showHistoryStatus('目前僅顯示 08:45～13:45 日盤', 'complete', 2800);
+        }
+    }
+
+    sessionQueryParam() {
+        return `&session=${this.sessionMode === 'day' ? 'day' : 'all'}`;
     }
 
     syncProductToolbar() {
@@ -2259,7 +2296,22 @@ class FreelancerKChart {
             && weekday <= 6
             && minuteOfDay < 5 * 60
         );
+        if (this.sessionMode === 'day') return weekdayDaySession;
         return weekdayDaySession || weekdayNightSession || afterMidnightNightSession;
+    }
+
+    isDaySessionTimestamp(epochSeconds) {
+        const seconds = Number(epochSeconds);
+        if (!Number.isFinite(seconds)) return false;
+        const wall = new Date((seconds + 28800) * 1000);
+        const weekday = wall.getUTCDay();
+        const minuteOfDay = wall.getUTCHours() * 60 + wall.getUTCMinutes();
+        return (
+            weekday >= 1
+            && weekday <= 5
+            && minuteOfDay >= 8 * 60 + 45
+            && minuteOfDay <= 13 * 60 + 45
+        );
     }
 
     updateCountdown() {
@@ -2428,6 +2480,7 @@ class FreelancerKChart {
         try {
             const res = await fetch(
                 `/api/kbars?start=${apiStart}&end=${rangeEnd}&period=1min`
+                + this.sessionQueryParam()
             );
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
@@ -2604,6 +2657,7 @@ class FreelancerKChart {
         if (this.currentPeriod === 'D' || this.kbarsCache.length === 0) {
             return minimumFillFallback;
         }
+        if (this.sessionMode === 'day') return minimumFillFallback;
 
         const lastTime = Number(
             this.kbarsCache[this.kbarsCache.length - 1]?.time
@@ -2659,6 +2713,7 @@ class FreelancerKChart {
             const recentParam = refreshRecent ? '&refresh_recent=true' : '';
             const res = await fetch(
                 `/api/kbars?start=${apiStart}&end=${end}&period=1min${recentParam}`
+                + this.sessionQueryParam()
             );
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
@@ -2782,6 +2837,7 @@ class FreelancerKChart {
         try {
             const res = await fetch(
                 `/api/kbars?start=${start}&end=${end}&period=1min${refreshParam}`
+                + this.sessionQueryParam()
             );
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
@@ -2890,6 +2946,7 @@ class FreelancerKChart {
 
         data.forEach(k => {
             const t = Number(k.time);
+            if (this.sessionMode === 'day' && !this.isDaySessionTimestamp(t)) return;
             const bucketT = getKbarBucketTime(t, this.currentPeriod, true);
             if (!currentBar || bucketT !== currentBar.time) {
                 if (currentBar) result.push(currentBar);
@@ -2917,13 +2974,15 @@ class FreelancerKChart {
             || this.isLoading
             || (this.isSwitchingContract && !force)
         ) return;
-        this.lastRealtimeTickAt = Date.now();
         const t = time || Math.floor(Date.now() / 1000);
+        if (this.sessionMode === 'day' && !this.isDaySessionTimestamp(t)) return;
+        this.lastRealtimeTickAt = Date.now();
         const bucketT = getKbarBucketTime(t, this.currentPeriod, false);
 
         const existingLast = this.kbarsCache[this.kbarsCache.length - 1];
         if (
-            existingLast
+            this.sessionMode === 'all'
+            && existingLast
             && hasMissingFuturesSessionGap(existingLast.time, bucketT)
         ) {
             const staleTime = existingLast.time;
@@ -2987,8 +3046,9 @@ class FreelancerKChart {
         const legendEl = document.getElementById('fl-chart-legend');
         if (!legendEl) return;
         const instrument = this.instrument();
+        const sessionLabel = this.sessionMode === 'day' ? '日' : '全';
         if (!bar) {
-            legendEl.innerHTML = `<span style="color:#8c94a3">${instrument.name} · 全</span>`;
+            legendEl.innerHTML = `<span style="color:#8c94a3">${instrument.name} · ${sessionLabel}</span>`;
             return;
         }
 
@@ -3014,7 +3074,7 @@ class FreelancerKChart {
             ? `<span style="color:${FREELANCER_COST_LINE.color}">成本=${Number.isInteger(costValue) ? costValue.toFixed(0) : costValue.toFixed(1)}</span>`
             : '';
         legendEl.innerHTML = `
-            <span style="font-size:1.05rem;color:#f0f3f8;">${instrument.name} · 全 · ${periodLabel}</span>
+            <span style="font-size:1.05rem;color:#f0f3f8;">${instrument.name} · ${sessionLabel} · ${periodLabel}</span>
             <span style="display:inline-block;margin-left:18px;">開=<span style="color:${color}">${bar.open}</span></span>
             <span>高=<span style="color:${color}">${bar.high}</span></span>
             <span>低=<span style="color:${color}">${bar.low}</span></span>
@@ -6171,11 +6231,47 @@ let _flBarrierLevels = null;
 let _flBarrierProgressTradingDayKey = null;
 let _flLongBarrierTarget = null;
 let _flShortBarrierTarget = null;
+let _flAmplitudeRequestId = 0;
+let _flBarrierRequestId = 0;
+
+function flSelectedSessionMode() {
+    return localStorage.getItem('fl-txf-session-mode') === 'day' ? 'day' : 'all';
+}
+
+function flResetSessionCalculations() {
+    _flTodayAmpHigh = null;
+    _flTodayAmpLow = null;
+    _flDailyAmplitudeStats = null;
+    _flTodayTradingDayKey = null;
+    _flBarrierLevels = null;
+    _flBarrierProgressTradingDayKey = null;
+    _flLongBarrierTarget = null;
+    _flShortBarrierTarget = null;
+    flUpdateBarrierLevels();
+    for (const id of [
+        'fl-amp-max', 'fl-amp-large', 'fl-amp-avg',
+        'fl-amp-small', 'fl-amp-min', 'fl-amp-today'
+    ]) {
+        flSetAmpValue(id, null);
+    }
+}
 
 function flSelectTxfTab(tab) {
-    document.querySelectorAll('.fl-txf-tab-btn').forEach(btn => btn.classList.remove('active'));
-    const target = document.getElementById(tab === 'day' ? 'fl-txf-tab-day' : 'fl-txf-tab-all');
-    if (target) target.classList.add('active');
+    const mode = tab === 'day' ? 'day' : 'all';
+    localStorage.setItem('fl-txf-session-mode', mode);
+    flResetSessionCalculations();
+    void flLoadAmplitude(_flAmpPeriod, mode);
+    if (_flAmpPeriod !== 'day') void flLoadBarrierAmplitude(mode);
+    if (freelancerChartPane) {
+        void freelancerChartPane.setSessionMode(mode);
+        return;
+    }
+    document.querySelectorAll('.fl-txf-tab-btn').forEach(btn => {
+        const activeId = mode === 'day' ? 'fl-txf-tab-day' : 'fl-txf-tab-all';
+        const active = btn.id === activeId;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
 }
 
 function flSelectAmpPeriod(period) {
@@ -6351,6 +6447,38 @@ function flFuturesTradingDayKey(timestamp = Date.now() / 1000) {
     return tradingDay.toISOString().slice(0, 10);
 }
 
+function flSessionTradingDayKey(
+    timestamp = Date.now() / 1000,
+    sessionMode = flSelectedSessionMode()
+) {
+    if (sessionMode !== 'day') return flFuturesTradingDayKey(timestamp);
+    const seconds = Number(timestamp);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    const wall = new Date((seconds + 28800) * 1000);
+    return [
+        wall.getUTCFullYear(),
+        String(wall.getUTCMonth() + 1).padStart(2, '0'),
+        String(wall.getUTCDate()).padStart(2, '0'),
+    ].join('-');
+}
+
+function flTickMatchesSelectedSession(timestamp) {
+    if (flSelectedSessionMode() !== 'day') return true;
+    if (freelancerChartPane) {
+        return freelancerChartPane.isDaySessionTimestamp(timestamp);
+    }
+    const seconds = Number(timestamp);
+    if (!Number.isFinite(seconds) || seconds <= 0) return false;
+    const wall = new Date((seconds + 28800) * 1000);
+    const minuteOfDay = wall.getUTCHours() * 60 + wall.getUTCMinutes();
+    return (
+        wall.getUTCDay() >= 1
+        && wall.getUTCDay() <= 5
+        && minuteOfDay >= 8 * 60 + 45
+        && minuteOfDay <= 13 * 60 + 45
+    );
+}
+
 function flSortAmplitudeRows() {
     const section = document.getElementById('fl-amplitude-section');
     if (!section) return;
@@ -6374,9 +6502,10 @@ function flSortAmplitudeRows() {
 
 function flUpdateTodayAmplitudeFromTick(price, timestamp = Date.now() / 1000) {
     if (price === null || price === undefined) return;
+    if (!flTickMatchesSelectedSession(timestamp)) return;
     const p = Number(price);
     if (!Number.isFinite(p) || p <= 0) return;
-    const tradingDayKey = flFuturesTradingDayKey(timestamp);
+    const tradingDayKey = flSessionTradingDayKey(timestamp);
     flEnsureBarrierProgressTradingDay(tradingDayKey);
     if (
         tradingDayKey
@@ -6400,11 +6529,60 @@ function flUpdateTodayAmplitudeFromTick(price, timestamp = Date.now() / 1000) {
     }
 }
 
-async function flLoadAmplitude(period = 'day') {
+function flApplyDailyBarrierData(data) {
+    _flTodayTradingDayKey = data.session_date || flSessionTradingDayKey();
+    _flDailyAmplitudeStats = {
+        amp_min: data.amp_min,
+        amp_small: data.amp_small,
+        amp_avg: data.amp_avg,
+        amp_large: data.amp_large,
+        amp_max: data.amp_max,
+    };
+    _flTodayAmpHigh = (
+        data.amp_today_high !== null && data.amp_today_high !== undefined
+    ) ? Number(data.amp_today_high) : null;
+    _flTodayAmpLow = (
+        data.amp_today_low !== null && data.amp_today_low !== undefined
+    ) ? Number(data.amp_today_low) : null;
+    flUpdateBarrierLevels();
+}
+
+async function flLoadBarrierAmplitude(sessionMode = flSelectedSessionMode()) {
+    const normalizedSession = sessionMode === 'day' ? 'day' : 'all';
+    const requestId = ++_flBarrierRequestId;
     try {
-        const res = await fetch(`/api/txf_amplitude?period=${period}`);
+        const res = await fetch(
+            `/api/txf_amplitude?period=day&session=${normalizedSession}`
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        if (
+            requestId !== _flBarrierRequestId
+            || normalizedSession !== flSelectedSessionMode()
+            || data.error
+        ) return;
+        flApplyDailyBarrierData(data);
+    } catch (error) {
+        console.warn('[FL] 關卡價資料載入失敗:', error);
+    }
+}
+
+async function flLoadAmplitude(
+    period = 'day',
+    sessionMode = flSelectedSessionMode()
+) {
+    const normalizedSession = sessionMode === 'day' ? 'day' : 'all';
+    const requestId = ++_flAmplitudeRequestId;
+    try {
+        const res = await fetch(
+            `/api/txf_amplitude?period=${period}&session=${normalizedSession}`
+        );
         if (!res.ok) return;
         const d = await res.json();
+        if (
+            requestId !== _flAmplitudeRequestId
+            || normalizedSession !== flSelectedSessionMode()
+        ) return;
         if (d.error) return;
 
         const periodLabel = { day: '日', week: '週', month: '月' }[period] || '日';
@@ -6418,7 +6596,8 @@ async function flLoadAmplitude(period = 'day') {
         const sectionHeader = document.querySelector('#fl-amplitude-section .fl-left-section-header');
         if (sectionHeader) {
             const n = d.days || 20;
-            sectionHeader.textContent = `${periodLabel}震幅統計(近${n}${periodLabel})`;
+            const sessionLabel = normalizedSession === 'day' ? '日盤' : '全盤';
+            sectionHeader.textContent = `${periodLabel}震幅統計(${sessionLabel}・近${n}${periodLabel})`;
         }
         // 更新「本日/週/月」標籤
         const todayLabelEl = document.querySelector('#fl-amplitude-section .fl-amp-today-label');
@@ -6431,21 +6610,7 @@ async function flLoadAmplitude(period = 'day') {
         flSetAmpValue('fl-amp-min',   d.amp_min);
         flSetAmpValue('fl-amp-today', d.amp_today);
         if (period === 'day') {
-            _flTodayTradingDayKey = flFuturesTradingDayKey();
-            _flDailyAmplitudeStats = {
-                amp_min: d.amp_min,
-                amp_small: d.amp_small,
-                amp_avg: d.amp_avg,
-                amp_large: d.amp_large,
-                amp_max: d.amp_max,
-            };
-            _flTodayAmpHigh = (
-                d.amp_today_high !== null && d.amp_today_high !== undefined
-            ) ? Number(d.amp_today_high) : null;
-            _flTodayAmpLow = (
-                d.amp_today_low !== null && d.amp_today_low !== undefined
-            ) ? Number(d.amp_today_low) : null;
-            flUpdateBarrierLevels();
+            flApplyDailyBarrierData(d);
         }
         flSortAmplitudeRows();
     } catch (e) {

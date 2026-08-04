@@ -1602,8 +1602,23 @@ def _aggregate_kbars_dataframe(df: pd.DataFrame, period: str) -> pd.DataFrame:
     return grouped
 
 
+def _filter_kbars_session(
+    df: pd.DataFrame, session_mode: str
+) -> pd.DataFrame:
+    """Select the requested Taiwan futures session from wall-clock cache rows."""
+    if session_mode != "day" or df.empty:
+        return df
+    minute_of_day = df.index.hour * 60 + df.index.minute
+    day_mask = (
+        (df.index.weekday < 5)
+        & (minute_of_day >= 8 * 60 + 45)
+        & (minute_of_day <= 13 * 60 + 45)
+    )
+    return df.loc[day_mask]
+
+
 def _drop_incomplete_recent_futures_dates(
-    df: pd.DataFrame, today
+    df: pd.DataFrame, today, session_mode: str = "all"
 ) -> tuple[pd.DataFrame, list[str], int]:
     """Remove obviously fragmented completed raw dates before charting."""
     raw_dates = pd.Series(df.index.strftime("%Y-%m-%d"), index=df.index)
@@ -1611,6 +1626,18 @@ def _drop_incomplete_recent_futures_dates(
     incomplete_dates = []
     for raw_date, count in counts.items():
         raw_day = datetime.strptime(str(raw_date), "%Y-%m-%d")
+        if session_mode == "day":
+            # A normal TXF regular session contains 300 close-stamped 1-min bars.
+            # Keep a substantially complete regular session even when that day's
+            # after-hours cache is absent; otherwise the all-session 850-bar guard
+            # incorrectly removes valid day-session history (for example 07/31).
+            if (
+                raw_day.date() < today
+                and raw_day.weekday() < 5
+                and int(count) < 180
+            ):
+                incomplete_dates.append(str(raw_date))
+            continue
         # 凌晨／日盤重新開啟時，當前交易日的夜盤起點位於前一個日曆日
         # 15:00。富邦日內 candles 可能只回傳這段夜盤，而沒有同日早上的
         # 日盤；只要已有足夠連續分鐘，就必須保留來填滿初始畫面。
@@ -1636,6 +1663,7 @@ async def get_kbars(
     end: str,
     period: str = "1min",
     refresh_recent: bool = False,
+    session: str = "all",
 ):
     global api, is_logged_in, contract
     now_str = datetime.now().strftime('%H:%M:%S')
@@ -1650,6 +1678,10 @@ async def get_kbars(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"日期格式錯誤: {e}")
 
+    session_mode = str(session or "all").strip().lower()
+    if session_mode not in {"all", "day"}:
+        raise HTTPException(status_code=400, detail="session 僅支援 all 或 day")
+
     now_tw = datetime.utcnow() + timedelta(hours=8)  # 轉台灣時間 UTC+8
     today_tw = now_tw.date()
     # DB 延續台灣牆鐘日期；今天 00:00 前的原始日曆日已完整。
@@ -1657,7 +1689,11 @@ async def get_kbars(
 
     try:
         kbars_contracts = _resolve_kbars_contracts(api, contract, start_date, end_date, now_str)
-        print(f"\n[{now_str}] [CHART] 歷史 K 線索取請求 -> 合約: {[c.code for c in kbars_contracts]} | 區間: {start} 至 {end} | 週期: {period}")
+        print(
+            f"\n[{now_str}] [CHART] 歷史 K 線索取請求 -> "
+            f"合約: {[c.code for c in kbars_contracts]} | 區間: {start} 至 {end} "
+            f"| 週期: {period} | 時段: {session_mode}"
+        )
 
         max_days = 365 if period == "D" else 60
         if (end_date - start_date).days > max_days:
@@ -1867,12 +1903,16 @@ async def get_kbars(
         df.set_index('ts', inplace=True)
         df.sort_index(inplace=True)
 
+        df = _filter_kbars_session(df, session_mode)
+
         # 最近已結束日若只剩零散即時暫存列，寧可整日先不畫，
         # 也不要讓殘缺 OHLC 在 5/15/30 分圖上形成漂浮短棒。
         selected_code = str(getattr(contract, "code", ""))
         if selected_code.startswith(("TXF", "MXF", "TMF")):
             df, incomplete_dates, removed_count = (
-                _drop_incomplete_recent_futures_dates(df, today_tw)
+                _drop_incomplete_recent_futures_dates(
+                    df, today_tw, session_mode=session_mode
+                )
             )
             if incomplete_dates:
                 print(
@@ -2158,16 +2198,20 @@ async def get_major_weighted_stocks_intraday():
     }
 
 @app.get("/api/txf_amplitude")
-async def get_txf_amplitude(period: str = "day"):
+async def get_txf_amplitude(period: str = "day", session: str = "all"):
     """
     計算台指期震幅統計（近20個交易日/週/月）。
     period: day | week | month
+    session: day（08:45～13:45）| all（完整交易日）
     回傳: amp_max, amp_large, amp_avg, amp_small, amp_min, amp_today, days
     """
     import numpy as np
 
     import calendar as _cal
     now_tw = datetime.utcnow() + timedelta(hours=8)
+    session_mode = str(session or "all").strip().lower()
+    if session_mode not in {"all", "day"}:
+        raise HTTPException(status_code=400, detail="session 僅支援 all 或 day")
 
     # 依週期決定回查天數
     look_back_days = {"day": 45, "week": 200, "month": 700}.get(period, 45)
@@ -2201,18 +2245,38 @@ async def get_txf_amplitude(period: str = "day"):
     # 快取時間戳為 UTC+8 牆鐘編碼（以 UTC 解析即為台灣時間）
     df_ts = pd.to_datetime(df['ts'], unit='ns', utc=True)
 
-    # 交易日 session 定義：前一日 15:00（夜盤）→ 當日 13:45（日盤）。
-    # 週五夜盤與週六凌晨必須併入下週一，不能獨立算成週六。
-    trading_day = pd.Series(df_ts.dt.normalize(), index=df.index)
-    evening_mask = df_ts.dt.hour >= 15
-    trading_day.loc[evening_mask] = (
-        trading_day.loc[evening_mask] + pd.Timedelta(days=1)
-    )
-    weekday = trading_day.dt.weekday
-    trading_day = trading_day + pd.to_timedelta(
-        weekday.map({5: 2, 6: 1}).fillna(0), unit="D"
-    )
-    df['_date'] = trading_day.dt.date
+    if session_mode == "day":
+        minute_of_day = df_ts.dt.hour * 60 + df_ts.dt.minute
+        day_mask = (
+            (df_ts.dt.weekday < 5)
+            & (minute_of_day >= 8 * 60 + 45)
+            & (minute_of_day <= 13 * 60 + 45)
+        )
+        df = df.loc[day_mask].copy()
+        df_ts = df_ts.loc[day_mask]
+        # 日盤以實際日曆日分組，不納入前一晚 15:00 起的夜盤。
+        df['_date'] = df_ts.dt.date
+    else:
+        # 全盤交易日：前一日 15:00（夜盤）→ 當日 13:45（日盤）。
+        # 週五夜盤與週六凌晨必須併入下週一，不能獨立算成週六。
+        trading_day = pd.Series(df_ts.dt.normalize(), index=df.index)
+        evening_mask = df_ts.dt.hour >= 15
+        trading_day.loc[evening_mask] = (
+            trading_day.loc[evening_mask] + pd.Timedelta(days=1)
+        )
+        weekday = trading_day.dt.weekday
+        trading_day = trading_day + pd.to_timedelta(
+            weekday.map({5: 2, 6: 1}).fillna(0), unit="D"
+        )
+        df['_date'] = trading_day.dt.date
+
+    if df.empty:
+        return {
+            "error": "no_session_data", "amp_max": None,
+            "amp_large": None, "amp_avg": None, "amp_small": None,
+            "amp_min": None, "amp_today": None, "days": 0,
+            "session": session_mode,
+        }
 
     if period == "week":
         df['_group'] = pd.to_datetime(df['_date'].astype(str)).dt.to_period('W')
@@ -2223,9 +2287,12 @@ async def get_txf_amplitude(period: str = "day"):
 
     # 每組振幅 = 最高 - 最低。
     # day 模式依使用者定義：取過去 20 個交易日，每一天的「最高價 - 最低價」。
-    # 「近20個完整交易日」不可把只有日盤、夜盤或零散即時列的日期納入。
-    # 正常 TXF 交易日約 1,140 根 1 分 K；850 可容許少量缺筆，但排除半日殘缺。
-    MIN_BARS = 850 if period == "day" else 1
+    # 「近20個完整交易日」不可把零散即時列納入。全盤正常約 1,140 根，
+    # 日盤正常約 300 根；門檻保留少量缺筆容忍度。
+    MIN_BARS = (
+        (180 if session_mode == "day" else 850)
+        if period == "day" else 1
+    )
     grp = df.groupby('_group').agg(
         grp_high=('High', 'max'), grp_low=('Low', 'min'), bar_count=('ts', 'count')
     )
@@ -2237,9 +2304,15 @@ async def get_txf_amplitude(period: str = "day"):
     if period == "day":
         # 日統計採「前 19 個完整交易日 + 本日即時振幅」共 20 日。
         # 先保留 20 日作為本日尚無資料時的 fallback；取得 amp_today 後再換入。
-        hist = grp[grp.index < today].tail(20)
-        current_period_row = df[df['_group'] == today]
+        if session_mode == "day":
+            # 夜盤期間尚未有下一個日盤，沿用最近一個實際日盤作為目前盤段。
+            current_session_key = max(df['_date'])
+        else:
+            current_session_key = today
+        hist = grp[grp.index < current_session_key].tail(20)
+        current_period_row = df[df['_group'] == current_session_key]
     else:
+        current_session_key = df['_group'].iloc[-1]
         hist = grp.iloc[:-1].tail(20) if len(grp) > 1 else grp
         current_period_row = df[df['_group'] == grp.index[-1]] if len(grp) > 0 else pd.DataFrame()
 
@@ -2255,13 +2328,16 @@ async def get_txf_amplitude(period: str = "day"):
     amp_today_high = None
     amp_today_low = None
     if period == "day":
-        # h>=15→次日 架構下，夜盤時段（h>=15）的K棒歸屬「明日」group
-        now_hour = now_tw.hour
-        if now_hour >= 15:
-            tomorrow = (now_tw + timedelta(days=1)).date()
-            live_session_row = df[df['_group'] == tomorrow]
-        else:
+        if session_mode == "day":
             live_session_row = current_period_row
+        else:
+            # h>=15→次日 架構下，夜盤時段（h>=15）的 K 棒歸屬「明日」。
+            now_hour = now_tw.hour
+            if now_hour >= 15:
+                current_session_key = (now_tw + timedelta(days=1)).date()
+                live_session_row = df[df['_group'] == current_session_key]
+            else:
+                live_session_row = current_period_row
         if not live_session_row.empty:
             amp_today_high = float(live_session_row['High'].max())
             amp_today_low = float(live_session_row['Low'].min())
@@ -2273,7 +2349,15 @@ async def get_txf_amplitude(period: str = "day"):
         cache_amp = amp_today_high - amp_today_low
         amp_today = cache_amp if cache_amp > 0 else None
 
-    if period == "day" and is_logged_in:
+    now_minute = now_tw.hour * 60 + now_tw.minute
+    snapshot_matches_session = (
+        session_mode == "all"
+        or (
+            now_tw.weekday() < 5
+            and 8 * 60 + 45 <= now_minute <= 13 * 60 + 45
+        )
+    )
+    if period == "day" and is_logged_in and snapshot_matches_session:
         with _quote_state_lock:
             snap_high = safe_float(last_snapshot_cache.get("high"), 0)
             snap_low = safe_float(last_snapshot_cache.get("low"), 0)
@@ -2319,6 +2403,8 @@ async def get_txf_amplitude(period: str = "day"):
         "amp_sum":   _round_amp(amp_sum),
         "days":      amp_count,
         "period":    period,
+        "session":   session_mode,
+        "session_date": str(current_session_key),
         "definitions": {
             "amp_max": "日週期為前19個完整交易日加本日即時振幅的最大值；其他週期取近20個完整週期",
             "amp_large": "(平均振幅 + 最大振幅) / 2",
