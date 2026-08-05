@@ -779,6 +779,22 @@
         /* 自由人左側面板 */
         #fl-left-panel {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans TC', sans-serif;
+            min-height: 0;
+            scrollbar-width: thin;
+            scrollbar-color: #454545 #151515;
+        }
+        #fl-left-panel::-webkit-scrollbar {
+            width: 6px;
+        }
+        #fl-left-panel::-webkit-scrollbar-track {
+            background: #151515;
+        }
+        #fl-left-panel::-webkit-scrollbar-thumb {
+            background: #454545;
+            border-radius: 999px;
+        }
+        #fl-left-panel::-webkit-scrollbar-thumb:hover {
+            background: #5c5c5c;
         }
         .fl-left-section-header {
             padding: 5px 10px;
@@ -817,6 +833,45 @@
         }
         .fl-amp-row.today {
             background: #5b4116 !important;
+        }
+        .fl-amplitude-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 4px;
+        }
+        .fl-amplitude-title {
+            min-width: 0;
+            white-space: nowrap;
+        }
+        .fl-amplitude-window-toggle {
+            display: inline-flex;
+            flex-shrink: 0;
+            overflow: hidden;
+            border: 1px solid #463762;
+            border-radius: 4px;
+        }
+        .fl-amplitude-window-toggle[hidden] {
+            display: none;
+        }
+        .fl-amp-window-btn {
+            min-width: 20px;
+            padding: 1px 3px;
+            border: 0;
+            background: transparent;
+            color: #746c86;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.65rem;
+            line-height: 1.35;
+        }
+        .fl-amp-window-btn + .fl-amp-window-btn {
+            border-left: 1px solid #463762;
+        }
+        .fl-amp-window-btn.active {
+            background: #51416f;
+            color: #fff;
+            font-weight: 700;
         }
         .fl-txf-tab-btn {
             flex: 1;
@@ -985,9 +1040,9 @@
                         <option value="amplitude-statistics">📈 震幅統計</option>
                     </select>
                     <select id="contract-selector" style="background: #222; color: #fff; border: 1px solid #4facfe; font-size: 1.1rem; font-weight: bold; padding: 5px 12px; border-radius: 6px; cursor: pointer; outline: none; transition: all 0.3s;">
-                        <option value="TXFR1">台指近月全 (TXF)</option>
-                        <option value="MXFR1">小台近月全 (MXF)</option>
                         <option value="TMFR1">微台近月全 (TMF)</option>
+                        <option value="MXFR1">小台近月全 (MXF)</option>
+                        <option value="TXFR1">台指近月全 (TXF)</option>
                     </select>
                 </div>
                 <div class="global-controls" style="display: flex; gap: 15px; align-items: center;">
@@ -2172,7 +2227,7 @@
         <!-- ─────────────────────────────────────────────
              左側欄 (Left Panel) ~18% width
              ───────────────────────────────────────────── -->
-        <div id="fl-left-panel" style="width:18%; min-width:210px; max-width:260px; display:flex; flex-direction:column; gap:0; flex-shrink:0; background:#111; border-radius:8px; overflow:hidden; border:1px solid #252525;">
+        <div id="fl-left-panel" style="width:18%; min-width:210px; max-width:260px; display:flex; flex-direction:column; gap:0; flex-shrink:0; background:#111; border-radius:8px; overflow-x:hidden; overflow-y:auto; border:1px solid #252525;">
 
             <!-- ── 台指合約相關資訊 ── -->
             <div id="fl-txf-info" style="flex-shrink:0; border-bottom:1px solid #252525;">
@@ -2190,38 +2245,41 @@
                 </div>
 
                 <!-- OHLC + 漲跌 -->
-                <div style="padding:8px 10px 6px; background:#111; display:flex; justify-content:space-between; align-items:flex-start; gap:6px;">
+                <div style="padding:8px 10px 6px; background:#111; display:flex; justify-content:space-between; align-items:stretch; gap:6px;">
                     <!-- 左側: OHLC 資訊 -->
-                    <div style="display:flex; flex-direction:column; gap:5px; font-size:0.78rem;">
+                    <div style="display:grid; grid-template-rows:repeat(4, 1fr); flex:1; align-self:stretch; font-size:0.78rem;">
                         <div style="display:flex; gap:4px; align-items:center;">
                             <span style="color:#777; width:44px; flex-shrink:0;">合約開</span>
-                            <span id="fl-txf-open" style="color:#ddd; font-weight:500; font-family:monospace;">--</span>
+                            <span id="fl-txf-open" style="color:#fff; font-weight:500; font-family:monospace;">--</span>
                         </div>
                         <div style="display:flex; gap:4px; align-items:center;">
                             <span style="color:#777; width:44px; flex-shrink:0;">合約高</span>
-                            <span id="fl-txf-high" style="color:#ff6b6b; font-weight:500; font-family:monospace;">--</span>
+                            <span id="fl-txf-high" style="color:#fff; font-weight:500; font-family:monospace;">--</span>
                         </div>
                         <div style="display:flex; gap:4px; align-items:center;">
                             <span style="color:#777; width:44px; flex-shrink:0;">合約低</span>
-                            <span id="fl-txf-low" style="color:#4ecb71; font-weight:500; font-family:monospace;">--</span>
+                            <span id="fl-txf-low" style="color:#fff; font-weight:500; font-family:monospace;">--</span>
                         </div>
                         <div style="display:flex; gap:4px; align-items:center;">
                             <span style="color:#777; width:44px; flex-shrink:0;">月成本</span>
-                            <span id="fl-txf-cost" style="color:#ddd; font-weight:500; font-family:monospace;">--</span>
+                            <span id="fl-txf-cost" style="color:#fff; font-weight:500; font-family:monospace;">--</span>
                         </div>
                     </div>
                     <!-- 右側: K棒 + 漲跌幅 -->
-                    <div style="display:flex; flex-direction:column; align-items:center; gap:4px; flex-shrink:0;">
+                    <div style="display:flex; flex-direction:column; align-items:center; gap:4px; flex-shrink:0; min-width:92px; margin-right:10px;">
                         <!-- 小K棒示意 -->
-                        <div id="fl-txf-candle-wrap" style="display:flex; flex-direction:column; align-items:center; gap:1px;">
-                            <div style="width:1px; height:5px; background:#ff4444;"></div>
-                            <div id="fl-txf-candle-body" style="width:9px; height:26px; background:#ff4444; border-radius:1px;"></div>
-                            <div style="width:1px; height:5px; background:#ff4444;"></div>
+                        <div id="fl-txf-candle-wrap" style="position:relative; width:22px; height:58px;">
+                            <div id="fl-txf-candle-wick" style="position:absolute; left:10px; top:4px; width:2px; height:50px; background:#aeb6c3;"></div>
+                            <div id="fl-txf-candle-body" style="position:absolute; left:5px; top:20px; width:12px; height:18px; background:#aeb6c3; border-radius:1px;"></div>
                         </div>
                         <!-- 漲跌 & 幅度 -->
-                        <div style="text-align:right;">
-                            <div id="fl-txf-change" style="font-size:0.78rem; font-weight:bold; color:#ff4444; font-family:monospace; white-space:nowrap;">漲跌 --</div>
-                            <div id="fl-txf-change-pct" style="font-size:0.72rem; color:#ff4444; font-family:monospace; white-space:nowrap;">幅度 --%</div>
+                        <div style="display:flex; flex-direction:column; gap:2px; width:100%;">
+                            <div id="fl-txf-change" style="display:grid; grid-template-columns:38px 1fr; column-gap:4px; align-items:baseline; font-size:0.76rem; font-weight:600; color:#aeb6c3; font-family:inherit; font-variant-numeric:tabular-nums; line-height:1.3; white-space:nowrap;">
+                                <span style="text-align:right;">漲跌:</span><span class="fl-txf-metric-value" style="text-align:right;">--</span>
+                            </div>
+                            <div id="fl-txf-change-pct" style="display:grid; grid-template-columns:38px 1fr; column-gap:4px; align-items:baseline; font-size:0.76rem; font-weight:600; color:#aeb6c3; font-family:inherit; font-variant-numeric:tabular-nums; line-height:1.3; white-space:nowrap;">
+                                <span style="text-align:right;">幅度:</span><span class="fl-txf-metric-value" style="text-align:right;">--%</span>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -2243,9 +2301,9 @@
             <!-- ── 振幅週期 + 多空關卡價 ── -->
             <div id="fl-barrier-section" style="flex-shrink:0; border-bottom:1px solid #252525;">
 
-                <!-- 震幅週期 Tab -->
+                <!-- 振幅週期 Tab -->
                 <div style="background:#1a1a1a; display:flex; align-items:center; padding:5px 10px; gap:6px; border-bottom:1px solid #252525;">
-                    <span style="color:#777; font-size:0.7rem; flex-shrink:0;">震幅週期:</span>
+                    <span style="color:#777; font-size:0.7rem; flex-shrink:0;">振幅週期:</span>
                     <div style="display:flex; gap:4px;">
                         <button id="fl-amp-tab-day"   class="fl-amp-period-btn active" onclick="flSelectAmpPeriod('day')">日</button>
                         <button id="fl-amp-tab-week"  class="fl-amp-period-btn"        onclick="flSelectAmpPeriod('week')">週</button>
@@ -2307,32 +2365,37 @@
 
             <!-- ── 日振幅統計 ── -->
             <div id="fl-amplitude-section" style="flex-shrink:0;">
-                <div class="fl-left-section-header" style="background:#160f22; color:#9b8fef; border-bottom:1px solid #231836; text-align:left; padding:5px 10px;">
-                    日震幅統計(近20日)
+                <div class="fl-left-section-header fl-amplitude-header" style="background:#160f22; color:#9b8fef; border-bottom:1px solid #231836; text-align:left; padding:5px 8px;">
+                    <span id="fl-amplitude-title" class="fl-amplitude-title">日振幅統計(近20日)</span>
+                    <span id="fl-amplitude-window-toggle" class="fl-amplitude-window-toggle" hidden aria-label="切換振幅統計時段">
+                        <button id="fl-amp-window-afternoon" type="button" class="fl-amp-window-btn" aria-pressed="false" title="午盤 15:00～21:30" onclick="flSelectAmplitudeWindow('afternoon')">午</button>
+                        <button id="fl-amp-window-night" type="button" class="fl-amp-window-btn" aria-pressed="false" title="夜盤 21:30～隔日05:00" onclick="flSelectAmplitudeWindow('night')">夜</button>
+                        <button id="fl-amp-window-full" type="button" class="fl-amp-window-btn active" aria-pressed="true" title="完整交易日統計" onclick="flSelectAmplitudeWindow('full')">全</button>
+                    </span>
                 </div>
                 <div style="background:#0d0a14; font-size:0.78rem;">
                     <div class="fl-amp-row" style="border-bottom:1px solid #160f22;">
-                        <span style="color:#888;">最大震幅</span>
+                        <span style="color:#888;">最大振幅</span>
                         <span id="fl-amp-max" style="color:#fff; font-family:monospace; font-weight:500;">--</span>
                     </div>
                     <div class="fl-amp-row" style="border-bottom:1px solid #160f22;">
-                        <span style="color:#888;">大大震幅</span>
+                        <span style="color:#888;">大大振幅</span>
                         <span id="fl-amp-large" style="color:#fff; font-family:monospace; font-weight:500;">--</span>
                     </div>
                     <div class="fl-amp-row" style="border-bottom:1px solid #160f22;">
-                        <span style="color:#888;">平均振幅（含本日）</span>
+                        <span style="color:#888;">平均振幅</span>
                         <span id="fl-amp-avg" style="color:#fff; font-family:monospace; font-weight:500;">--</span>
                     </div>
                     <div class="fl-amp-row" style="border-bottom:1px solid #160f22;">
-                        <span style="color:#888;">小小震幅</span>
+                        <span style="color:#888;">小小振幅</span>
                         <span id="fl-amp-small" style="color:#fff; font-family:monospace; font-weight:500;">--</span>
                     </div>
                     <div class="fl-amp-row" style="border-bottom:1px solid #160f22;">
-                        <span style="color:#888;">最小震幅</span>
+                        <span style="color:#888;">最小振幅</span>
                         <span id="fl-amp-min" style="color:#fff; font-family:monospace; font-weight:500;">--</span>
                     </div>
                     <div class="fl-amp-row today">
-                        <span class="fl-amp-today-label" style="color:#ccc; font-weight:bold;">本日震幅（即時）</span>
+                        <span class="fl-amp-today-label" style="color:#ccc; font-weight:bold;">本日振幅</span>
                         <span id="fl-amp-today" style="color:#fff; font-family:monospace; font-weight:bold;">--</span>
                     </div>
                 </div>
@@ -2349,13 +2412,13 @@
             <div id="fl-chart" class="fl-block" style="flex:1;">
                 <div class="fl-chart-toolbar">
                     <div class="fl-chart-instrument" aria-label="目前商品">
-                        <span id="fl-chart-symbol" class="fl-chart-symbol">TXF</span>
+                        <span id="fl-chart-symbol" class="fl-chart-symbol">TMF</span>
                         <span class="fl-chart-contract-kind">近月</span>
                     </div>
                     <div id="fl-chart-products" class="fl-product-switch" role="group" aria-label="切換期貨商品">
-                        <button type="button" class="fl-product-btn active" data-symbol="TXFR1" aria-pressed="true">台指期</button>
+                        <button type="button" class="fl-product-btn active" data-symbol="TMFR1" aria-pressed="true">微型台指</button>
                         <button type="button" class="fl-product-btn" data-symbol="MXFR1" aria-pressed="false">小台</button>
-                        <button type="button" class="fl-product-btn" data-symbol="TMFR1" aria-pressed="false">微型台指</button>
+                        <button type="button" class="fl-product-btn" data-symbol="TXFR1" aria-pressed="false">台指期</button>
                     </div>
                     <div class="fl-chart-toolbar-spacer"></div>
                     <label class="fl-chart-period-control">
@@ -2631,7 +2694,7 @@
     <div id="drawer-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998;" onclick="closeStockDrawer()"></div>
 
     <!-- 載入主程式 (加入版本號避免快取問題) -->
-    <script src="app_pro.js?v=futures-spread-v42"></script>
+    <script src="app_pro.js?v=txf-contract-layout-v52"></script>
 </body>
 </html>
 

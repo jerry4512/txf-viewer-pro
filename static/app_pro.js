@@ -1359,6 +1359,7 @@ const FREELANCER_FUTURES = Object.freeze({
     MXFR1: Object.freeze({ code: 'MXF', name: '小台', fullName: '小型臺指期貨' }),
     TMFR1: Object.freeze({ code: 'TMF', name: '微型台指', fullName: '微型臺指期貨' })
 });
+const FREELANCER_DEFAULT_SYMBOL = 'TMFR1';
 const FREELANCER_HISTORY_FLOOR = '2025-01-01';
 const FREELANCER_HISTORY_CHUNK_DAYS = 30;
 const FREELANCER_HISTORY_EDGE_THRESHOLD = 15;
@@ -1426,7 +1427,7 @@ class FreelancerKChart {
         this.historyRetryAfter = 0;
         this.historyEdgeTimer = null;
         this.historyStatusTimer = null;
-        this.symbol = 'TXFR1';
+        this.symbol = FREELANCER_DEFAULT_SYMBOL;
         this.drawTool = 'cursor';
         this.drawings = [];
         this.pendingDrawPoint = null;
@@ -1438,7 +1439,7 @@ class FreelancerKChart {
         this.lastRecentReconcileAt = 0;
     }
 
-    init(symbol = 'TXFR1') {
+    init(symbol = FREELANCER_DEFAULT_SYMBOL) {
         this.setSymbol(symbol || this.symbol);
         const mainEl = document.getElementById('fl-chart-main');
         if (!mainEl || !window.LightweightCharts) return;
@@ -1740,11 +1741,14 @@ class FreelancerKChart {
     }
 
     instrument(symbol = this.symbol) {
-        return FREELANCER_FUTURES[symbol] || FREELANCER_FUTURES.TXFR1;
+        return FREELANCER_FUTURES[symbol]
+            || FREELANCER_FUTURES[FREELANCER_DEFAULT_SYMBOL];
     }
 
     setSymbol(symbol) {
-        const normalized = String(symbol || 'TXFR1').toUpperCase();
+        const normalized = String(
+            symbol || FREELANCER_DEFAULT_SYMBOL
+        ).toUpperCase();
         if (!FREELANCER_FUTURES[normalized]) return;
         this.symbol = normalized;
         this.syncProductToolbar();
@@ -2368,11 +2372,13 @@ class FreelancerKChart {
             0,
             Math.min(mainEl.clientHeight - badgeHeight, Math.round(coordinate + 12))
         );
-        const chartWidth = Math.floor(mainEl.getBoundingClientRect().width);
+        const chartWidth = mainEl.getBoundingClientRect().width;
         const axisLeft = mainEl.offsetLeft + chartWidth - priceScaleWidth;
-        // Lightweight Charts 的即時價格底色會保留約 8px 的軸右側空白。
-        // 使用相同寬度，讓下方倒數框與上方價格框左右完全對齊。
-        const labelWidth = Math.max(50, Math.round(priceScaleWidth - 8));
+        // Lightweight Charts 的原生價格框只包住價格文字，並不會填滿整個
+        // 右側價格軸。依相同的 13px 字級與價格位數換算框寬；台指目前的
+        // 五位數價格會得到 58px，與 Canvas 實際繪製寬度一致。
+        const priceDigits = String(Math.round(Math.abs(Number(last.close)))).length;
+        const labelWidth = Math.max(50, 18 + priceDigits * 8);
         countdownEl.style.top = `${top}px`;
         countdownEl.style.left = `${Math.round(axisLeft)}px`;
         countdownEl.style.right = 'auto';
@@ -3346,7 +3352,7 @@ class FreelancerKChart {
     }
 }
 
-function ensureFreelancerChart(symbol = 'TXFR1') {
+function ensureFreelancerChart(symbol = FREELANCER_DEFAULT_SYMBOL) {
     if (!freelancerChartPane) {
         freelancerChartPane = new FreelancerKChart();
         freelancerChartPane.init(symbol);
@@ -5063,21 +5069,21 @@ async function startApp(contractCode) {
             }
         } else {
             if (!actualDefault || !actualDefault.includes('F')) {
-                actualDefault = 'TXFR1';
+                actualDefault = FREELANCER_DEFAULT_SYMBOL;
             }
         }
         
         selector.innerHTML = '';
         if (market === 'futures') {
             const opt1 = document.createElement('option');
-            opt1.value = 'TXFR1';
-            opt1.innerText = '台指近月全 (TXF)';
+            opt1.value = 'TMFR1';
+            opt1.innerText = '微台近月全 (TMF)';
             const opt2 = document.createElement('option');
             opt2.value = 'MXFR1';
             opt2.innerText = '小台近月全 (MXF)';
             const opt3 = document.createElement('option');
-            opt3.value = 'TMFR1';
-            opt3.innerText = '微台近月全 (TMF)';
+            opt3.value = 'TXFR1';
+            opt3.innerText = '台指近月全 (TXF)';
             selector.appendChild(opt1);
             selector.appendChild(opt2);
             selector.appendChild(opt3);
@@ -5205,7 +5211,12 @@ async function startApp(contractCode) {
             appContainer.classList.add('market-freelancer');
             if (freelancerContainer) freelancerContainer.style.display = 'flex';
             // stock tabs/placeholder 由 CSS market-freelancer class 隱藏
-            setTimeout(() => ensureFreelancerChart(contractCode || 'TXFR1'), 0);
+            setTimeout(
+                () => ensureFreelancerChart(
+                    contractCode || FREELANCER_DEFAULT_SYMBOL
+                ),
+                0
+            );
             setTimeout(() => ensureFreelancerWeightedStocks(), 0);
             flStartAmplitudeRefresh();
             flStartWeightedSpreadRefresh();
@@ -5908,7 +5919,12 @@ function connectWebSocket() {
                 if (freelancerChartPane) {
                     freelancerChartPane.onTick(msg.data.price, msg.data.time);
                 }
-                flUpdateTodayAmplitudeFromTick(msg.data.price, msg.data.time);
+                if (freelancerChartPane?.symbol === 'TXFR1') {
+                    flUpdateTodayAmplitudeFromTick(
+                        msg.data.price,
+                        msg.data.time
+                    );
+                }
             }
             return;
         }
@@ -6236,6 +6252,9 @@ document.addEventListener('DOMContentLoaded', () => {
 // ── 自由人左側面板 ──────────────────────────────────────────────
 
 let _flAmpPeriod = 'day';
+let _flAmpWindow = ['afternoon', 'night', 'full'].includes(
+    localStorage.getItem('fl-amplitude-window')
+) ? localStorage.getItem('fl-amplitude-window') : 'full';
 let _flTodayAmpHigh = null;
 let _flTodayAmpLow = null;
 let _flDailyAmplitudeStats = null;
@@ -6246,6 +6265,7 @@ let _flLongBarrierTarget = null;
 let _flShortBarrierTarget = null;
 let _flAmplitudeRequestId = 0;
 let _flBarrierRequestId = 0;
+let _flContractStatsRequestId = 0;
 let _flWeightedSpreadTimer = null;
 let _flWeightedSpreadFuturesPrice = null;
 let _flWeightedSpreadFuturesTime = null;
@@ -6254,6 +6274,202 @@ let _flMonthSpread = null;
 
 function flSelectedSessionMode() {
     return localStorage.getItem('fl-txf-session-mode') === 'day' ? 'day' : 'all';
+}
+
+function flSelectedAmplitudeWindow(sessionMode = flSelectedSessionMode()) {
+    return sessionMode === 'all' ? _flAmpWindow : 'full';
+}
+
+function flRenderAmplitudeWindowToggle(sessionMode = flSelectedSessionMode()) {
+    const toggle = document.getElementById('fl-amplitude-window-toggle');
+    if (!toggle) return;
+    const show = sessionMode === 'all';
+    toggle.hidden = !show;
+    const selected = flSelectedAmplitudeWindow(sessionMode);
+    for (const windowMode of ['afternoon', 'night', 'full']) {
+        const button = document.getElementById(`fl-amp-window-${windowMode}`);
+        if (!button) continue;
+        const active = selected === windowMode;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
+}
+
+function flResetAmplitudeValues() {
+    for (const id of [
+        'fl-amp-max', 'fl-amp-large', 'fl-amp-avg',
+        'fl-amp-small', 'fl-amp-min', 'fl-amp-today'
+    ]) {
+        flSetAmpValue(id, null);
+    }
+}
+
+function flFormatContractStat(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '--';
+    return Number.isInteger(number)
+        ? number.toFixed(0)
+        : number.toFixed(1);
+}
+
+function flFormatSignedContractValue(value, maxDigits = 1) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '--';
+    const absolute = Math.abs(number);
+    const text = Number.isInteger(absolute)
+        ? absolute.toFixed(0)
+        : absolute.toFixed(maxDigits).replace(/\.?0+$/, '');
+    return `${number > 0 ? '+' : number < 0 ? '-' : ''}${text}`;
+}
+
+function flSetTxfContractMetric(id, value, color) {
+    const row = document.getElementById(id);
+    if (!row) return;
+    const valueEl = row.querySelector('.fl-txf-metric-value');
+    if (valueEl) valueEl.textContent = value;
+    row.style.color = color;
+}
+
+function flResetTxfContractCandle() {
+    const wick = document.getElementById('fl-txf-candle-wick');
+    const body = document.getElementById('fl-txf-candle-body');
+    if (wick) {
+        wick.style.top = '4px';
+        wick.style.height = '50px';
+        wick.style.background = FREELANCER_MARKET_COLORS.flat;
+    }
+    if (body) {
+        body.style.top = '20px';
+        body.style.height = '18px';
+        body.style.background = FREELANCER_MARKET_COLORS.flat;
+    }
+    flSetTxfContractMetric(
+        'fl-txf-change', '--', FREELANCER_MARKET_COLORS.flat
+    );
+    flSetTxfContractMetric(
+        'fl-txf-change-pct', '--%', FREELANCER_MARKET_COLORS.flat
+    );
+}
+
+function flRenderTxfContractCandle(data) {
+    const open = Number(data?.contract_open);
+    const high = Number(data?.contract_high);
+    const low = Number(data?.contract_low);
+    const close = Number(data?.contract_close);
+    const changeValue = Number(data?.contract_change);
+    const changePctValue = Number(data?.contract_change_pct);
+    if (
+        ![open, high, low, close, changeValue, changePctValue]
+            .every(Number.isFinite)
+        || high < low
+    ) {
+        flResetTxfContractCandle();
+        return;
+    }
+
+    const color = changeValue > 0
+        ? FREELANCER_MARKET_COLORS.up
+        : changeValue < 0
+            ? FREELANCER_MARKET_COLORS.down
+            : FREELANCER_MARKET_COLORS.flat;
+    const wick = document.getElementById('fl-txf-candle-wick');
+    const body = document.getElementById('fl-txf-candle-body');
+    const plotTop = 3;
+    const plotHeight = 52;
+    const range = Math.max(high - low, 1);
+    const yForPrice = price => (
+        plotTop + (high - Math.min(high, Math.max(low, price)))
+            / range * plotHeight
+    );
+    if (wick) {
+        wick.style.top = `${plotTop}px`;
+        wick.style.height = `${plotHeight}px`;
+        wick.style.background = color;
+    }
+    if (body) {
+        const openY = yForPrice(open);
+        const closeY = yForPrice(close);
+        body.style.top = `${Math.min(openY, closeY)}px`;
+        body.style.height = `${Math.max(2, Math.abs(closeY - openY))}px`;
+        body.style.background = color;
+    }
+
+    flSetTxfContractMetric(
+        'fl-txf-change', flFormatSignedContractValue(changeValue), color
+    );
+    flSetTxfContractMetric(
+        'fl-txf-change-pct',
+        `${flFormatSignedContractValue(changePctValue, 2)}%`,
+        color
+    );
+    const wrap = document.getElementById('fl-txf-candle-wrap');
+    if (wrap) {
+        wrap.title = (
+            `開 ${flFormatContractStat(open)}｜高 ${flFormatContractStat(high)}`
+            + `｜低 ${flFormatContractStat(low)}｜收 ${flFormatContractStat(close)}`
+        );
+    }
+}
+
+function flResetTxfContractStats() {
+    for (const id of [
+        'fl-txf-open', 'fl-txf-high', 'fl-txf-low', 'fl-txf-cost'
+    ]) {
+        const el = document.getElementById(id);
+        if (el) {
+            el.textContent = '--';
+            el.style.color = '#fff';
+        }
+    }
+    flResetTxfContractCandle();
+    document.getElementById('fl-txf-candle-wrap')?.removeAttribute('title');
+    document.getElementById('fl-txf-info')?.removeAttribute('title');
+}
+
+async function flLoadTxfContractStats(
+    sessionMode = flSelectedSessionMode()
+) {
+    const normalizedSession = sessionMode === 'day' ? 'day' : 'all';
+    const requestId = ++_flContractStatsRequestId;
+    try {
+        const res = await fetch(
+            `/api/txf_contract_stats?session=${normalizedSession}`
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        if (
+            requestId !== _flContractStatsRequestId
+            || normalizedSession !== flSelectedSessionMode()
+            || data.error
+        ) return;
+        const values = {
+            'fl-txf-open': data.contract_open,
+            'fl-txf-high': data.contract_high,
+            'fl-txf-low': data.contract_low,
+            'fl-txf-cost': data.month_cost,
+        };
+        for (const [id, value] of Object.entries(values)) {
+            const el = document.getElementById(id);
+            if (el) {
+                el.textContent = flFormatContractStat(value);
+                el.style.color = '#fff';
+            }
+        }
+        flRenderTxfContractCandle(data);
+        const info = document.getElementById('fl-txf-info');
+        if (info) {
+            const sessionLabel = normalizedSession === 'day' ? '日盤' : '全盤';
+            info.title = (
+                `${data.contract_code}｜${sessionLabel}\n`
+                + `合約週期：${data.cycle_start} 起\n`
+                + `資料範圍：${data.data_start}～${data.data_end}\n`
+                + `最新收：${flFormatContractStat(data.contract_close)}\n`
+                + '月成本＝（合約高＋合約低）÷2'
+            );
+        }
+    } catch (error) {
+        console.warn('[FL] 台指近月合約統計載入失敗:', error);
+    }
 }
 
 function flResetSessionCalculations() {
@@ -6266,12 +6482,8 @@ function flResetSessionCalculations() {
     _flLongBarrierTarget = null;
     _flShortBarrierTarget = null;
     flUpdateBarrierLevels();
-    for (const id of [
-        'fl-amp-max', 'fl-amp-large', 'fl-amp-avg',
-        'fl-amp-small', 'fl-amp-min', 'fl-amp-today'
-    ]) {
-        flSetAmpValue(id, null);
-    }
+    flResetAmplitudeValues();
+    flResetTxfContractStats();
 }
 
 function flRenderWeightedSpread() {
@@ -6346,8 +6558,8 @@ function flRenderMonthSpread() {
         })
         : '';
     el.title = (
-        `近月 ${nearCode} ${nearPrice.toFixed(2)} − `
-        + `次近月 ${farCode} ${farPrice.toFixed(2)}`
+        `次近月 ${farCode} ${farPrice.toFixed(2)} − `
+        + `近月 ${nearCode} ${nearPrice.toFixed(2)}`
         + (timeLabel ? `\n富邦 ${timeLabel}` : '')
     );
 }
@@ -6422,10 +6634,12 @@ function flStopWeightedSpreadRefresh() {
 function flSelectTxfTab(tab) {
     const mode = tab === 'day' ? 'day' : 'all';
     localStorage.setItem('fl-txf-session-mode', mode);
+    flRenderAmplitudeWindowToggle(mode);
     flResetWeightedSpreadFutures();
     flResetSessionCalculations();
+    void flLoadTxfContractStats(mode);
     void flLoadAmplitude(_flAmpPeriod, mode);
-    if (_flAmpPeriod !== 'day') void flLoadBarrierAmplitude(mode);
+    void flLoadBarrierAmplitude(mode);
     if (freelancerChartPane) {
         void freelancerChartPane.setSessionMode(mode);
         return;
@@ -6436,6 +6650,17 @@ function flSelectTxfTab(tab) {
         btn.classList.toggle('active', active);
         btn.setAttribute('aria-pressed', active ? 'true' : 'false');
     });
+}
+
+function flSelectAmplitudeWindow(windowMode) {
+    if (flSelectedSessionMode() !== 'all') return;
+    _flAmpWindow = ['afternoon', 'night'].includes(windowMode)
+        ? windowMode
+        : 'full';
+    localStorage.setItem('fl-amplitude-window', _flAmpWindow);
+    flRenderAmplitudeWindowToggle('all');
+    flResetAmplitudeValues();
+    void flLoadAmplitude(_flAmpPeriod, 'all');
 }
 
 function flSelectAmpPeriod(period) {
@@ -6685,7 +6910,10 @@ function flUpdateTodayAmplitudeFromTick(price, timestamp = Date.now() / 1000) {
     }
     if (tradingDayKey) _flTodayTradingDayKey = tradingDayKey;
     if (_flTodayAmpHigh !== null && _flTodayAmpLow !== null) {
-        if (_flAmpPeriod === 'day') {
+        if (
+            _flAmpPeriod === 'day'
+            && flSelectedAmplitudeWindow() === 'full'
+        ) {
             flSetAmpValue('fl-amp-today', Math.round(_flTodayAmpHigh - _flTodayAmpLow));
             flSortAmplitudeRows();
         }
@@ -6736,33 +6964,43 @@ async function flLoadAmplitude(
     sessionMode = flSelectedSessionMode()
 ) {
     const normalizedSession = sessionMode === 'day' ? 'day' : 'all';
+    const amplitudeWindow = flSelectedAmplitudeWindow(normalizedSession);
     const requestId = ++_flAmplitudeRequestId;
     try {
         const res = await fetch(
-            `/api/txf_amplitude?period=${period}&session=${normalizedSession}`
+            `/api/txf_amplitude?period=${period}`
+            + `&session=${normalizedSession}&window=${amplitudeWindow}`
         );
         if (!res.ok) return;
         const d = await res.json();
         if (
             requestId !== _flAmplitudeRequestId
             || normalizedSession !== flSelectedSessionMode()
+            || amplitudeWindow !== flSelectedAmplitudeWindow(normalizedSession)
         ) return;
         if (d.error) return;
 
         const periodLabel = { day: '日', week: '週', month: '月' }[period] || '日';
         const todayLabel = {
-            day: '本日震幅（即時）',
-            week: '本週震幅',
-            month: '本月震幅',
-        }[period] || '本日震幅（即時）';
+            day: '本日振幅',
+            week: '本週振幅',
+            month: '本月振幅',
+        }[period] || '本日振幅';
 
         // 更新標題文字以反映週期
-        const sectionHeader = document.querySelector('#fl-amplitude-section .fl-left-section-header');
-        if (sectionHeader) {
+        const sectionTitle = document.getElementById('fl-amplitude-title');
+        if (sectionTitle) {
             const n = d.days || 20;
-            const sessionLabel = normalizedSession === 'day' ? '日盤' : '全盤';
-            sectionHeader.textContent = `${periodLabel}震幅統計(${sessionLabel}・近${n}${periodLabel})`;
+            const sessionLabel = normalizedSession === 'day'
+                ? '日盤'
+                : amplitudeWindow === 'afternoon'
+                    ? '午盤'
+                    : amplitudeWindow === 'night'
+                        ? '夜盤'
+                    : '全盤';
+            sectionTitle.textContent = `${periodLabel}振幅統計(${sessionLabel}・近${n}${periodLabel})`;
         }
+        flRenderAmplitudeWindowToggle(normalizedSession);
         // 更新「本日/週/月」標籤
         const todayLabelEl = document.querySelector('#fl-amplitude-section .fl-amp-today-label');
         if (todayLabelEl) todayLabelEl.textContent = todayLabel;
@@ -6773,9 +7011,6 @@ async function flLoadAmplitude(
         flSetAmpValue('fl-amp-small', d.amp_small);
         flSetAmpValue('fl-amp-min',   d.amp_min);
         flSetAmpValue('fl-amp-today', d.amp_today);
-        if (period === 'day') {
-            flApplyDailyBarrierData(d);
-        }
         flSortAmplitudeRows();
     } catch (e) {
         console.warn('[FL] 震幅統計載入失敗:', e);
@@ -6783,15 +7018,23 @@ async function flLoadAmplitude(
 }
 
 function flInitLeftPanel() {
+    flRenderAmplitudeWindowToggle();
+    flLoadTxfContractStats();
     flLoadAmplitude(_flAmpPeriod);
+    flLoadBarrierAmplitude();
 }
 
 let _flAmpTimer = null;
 function flStartAmplitudeRefresh() {
+    flRenderAmplitudeWindowToggle();
+    flLoadTxfContractStats();
     flLoadAmplitude(_flAmpPeriod);
+    flLoadBarrierAmplitude();
     if (_flAmpTimer) clearInterval(_flAmpTimer);
     _flAmpTimer = setInterval(() => {
+        flLoadTxfContractStats();
         if (_flAmpPeriod === 'day') flLoadAmplitude('day');
+        flLoadBarrierAmplitude();
     }, 10000);
 }
 function flStopAmplitudeRefresh() {

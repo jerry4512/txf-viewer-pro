@@ -1,4 +1,4 @@
-"""Offline tests for TXF near-minus-next-month spread state."""
+"""Offline tests for TXF next-month-minus-near spread state."""
 
 import unittest
 
@@ -27,7 +27,7 @@ class FuturesMonthSpreadTests(unittest.TestCase):
         main.contract = self.previous_contract
         main._reset_futures_month_spread_state()
 
-    def test_spread_is_near_minus_next_month(self):
+    def test_spread_is_next_month_minus_near(self):
         main._update_futures_month_spread_quote({
             "code": "TXFR1",
             "target_code": "TXFH6",
@@ -37,12 +37,12 @@ class FuturesMonthSpreadTests(unittest.TestCase):
         payload = main._update_futures_month_spread_quote({
             "code": "TXFR2",
             "target_code": "TXFJ6",
-            "close": 44220.25,
+            "close": 44420.75,
             "ts": 1785893251,
         }, "test")
 
         self.assertTrue(payload["ready"])
-        self.assertEqual(payload["formula"], "TXFR1-TXFR2")
+        self.assertEqual(payload["formula"], "TXFR2-TXFR1")
         self.assertAlmostEqual(payload["spread"], 100.25)
         self.assertEqual(payload["near"]["target_code"], "TXFH6")
         self.assertEqual(payload["far"]["target_code"], "TXFJ6")

@@ -6,6 +6,7 @@ import calendar
 import sqlite3
 import threading
 import time
+import math
 import urllib.request
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -493,10 +494,10 @@ def _futures_month_spread_payload() -> dict:
         )
     near_price = safe_float(near.get("price"), 0.0)
     far_price = safe_float(far.get("price"), 0.0)
-    spread = near_price - far_price if near_price > 0 and far_price > 0 else None
+    spread = far_price - near_price if near_price > 0 and far_price > 0 else None
     return {
         "provider": "fubon",
-        "formula": "TXFR1-TXFR2",
+        "formula": "TXFR2-TXFR1",
         "near": near,
         "far": far,
         "spread": spread,
@@ -1238,18 +1239,25 @@ async def login(req: LoginRequest):
         )
         print(f"[{now_str}] [SUCCESS] 富邦 API Key 登入成功，Normal Mode 已建立！")
 
-        contract = await loop.run_in_executor(
+        txf_near_contract = await loop.run_in_executor(
             None, lambda: _resolve_market_contract(api, "TXFR1")
         )
-        if not contract:
+        if not txf_near_contract:
             raise RuntimeError("富邦契約清單無法解析 TXFR1 近月合約")
+        contract = await loop.run_in_executor(
+            None, lambda: _resolve_market_contract(api, "TMFR1")
+        )
+        if not contract:
+            raise RuntimeError("富邦契約清單無法解析 TMFR1 近月合約")
         far_month_contract = await loop.run_in_executor(
             None, lambda: _resolve_market_contract(api, "TXFR2")
         )
         if not far_month_contract:
             raise RuntimeError("富邦契約清單無法解析 TXFR2 次近月合約")
         _reset_quote_state(contract)
-        _reset_futures_month_spread_state(contract, far_month_contract)
+        _reset_futures_month_spread_state(
+            txf_near_contract, far_month_contract
+        )
         with _rt_bar_lock:
             _rt_bar.clear()
         _rt_contract_code = contract.code
@@ -1264,9 +1272,11 @@ async def login(req: LoginRequest):
         for alias in ("TXFR1", "TXFR2", "MXFR1", "TMFR1"):
             try:
                 if alias == "TXFR1":
-                    item = contract
+                    item = txf_near_contract
                 elif alias == "TXFR2":
                     item = far_month_contract
+                elif alias == "TMFR1":
+                    item = contract
                 else:
                     item = await loop.run_in_executor(
                         None, lambda a=alias: _resolve_market_contract(api, a)
@@ -1290,7 +1300,10 @@ async def login(req: LoginRequest):
         is_logged_in = True
         try:
             month_snapshots = await loop.run_in_executor(
-                None, lambda: api.snapshots([contract, far_month_contract])
+                None,
+                lambda: api.snapshots([
+                    txf_near_contract, far_month_contract
+                ]),
             )
             for month_snapshot in month_snapshots:
                 _update_futures_month_spread_quote(
@@ -2276,7 +2289,7 @@ async def get_taiex_quote():
 
 @app.get("/api/futures_month_spread")
 async def get_futures_month_spread():
-    """Return TXF near-minus-next-month prices maintained by Fubon WebSocket."""
+    """Return TXF next-month-minus-near prices maintained by Fubon WebSocket."""
     if not is_logged_in:
         raise HTTPException(status_code=401, detail="Not logged in")
     return _futures_month_spread_payload()
@@ -2444,21 +2457,235 @@ async def get_major_weighted_stocks_intraday():
         "stocks": result,
     }
 
+def _calculate_amplitude_levels(historical_values) -> dict:
+    """Build all five levels from completed historical periods only."""
+    historical = [
+        float(value) for value in historical_values
+        if value is not None and math.isfinite(float(value))
+    ]
+    if not historical:
+        return {}
+
+    def rounded(value):
+        return int(float(value) + 0.5)
+
+    amp_sum = float(sum(historical))
+    amp_avg = rounded(amp_sum / len(historical))
+    amp_min = rounded(min(historical))
+    amp_max = rounded(max(historical))
+    return {
+        "amp_max": amp_max,
+        "amp_large": rounded((amp_avg + amp_max) / 2),
+        "amp_avg": amp_avg,
+        "amp_small": rounded((amp_avg + amp_min) / 2),
+        "amp_min": amp_min,
+        "amp_sum": rounded(amp_sum),
+        "days": len(historical),
+    }
+
+
+def _third_wednesday(year: int, month: int) -> datetime:
+    """Return the nominal monthly TXF settlement day at 15:00 Taiwan time."""
+    first = datetime(year, month, 1)
+    first_wednesday = 1 + ((2 - first.weekday()) % 7)
+    return datetime(year, month, first_wednesday + 14, 15, 0)
+
+
+def _txf_contract_cycle_start(delivery_date: str) -> datetime:
+    """Start of the current near-month cycle: prior settlement day's night open."""
+    try:
+        delivery = datetime.strptime(str(delivery_date)[:10], "%Y-%m-%d")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("目前台指近月合約缺少有效交割日") from exc
+    if delivery.month == 1:
+        previous_year, previous_month = delivery.year - 1, 12
+    else:
+        previous_year, previous_month = delivery.year, delivery.month - 1
+    return _third_wednesday(previous_year, previous_month)
+
+
+def _calculate_txf_contract_stats(rows, session_mode: str) -> dict:
+    """Calculate OHLC range for one near-month contract cycle."""
+    if not rows:
+        return {}
+    df = pd.DataFrame(
+        rows, columns=["ts", "Open", "High", "Low", "Close"]
+    )
+    df_ts = pd.to_datetime(df["ts"], unit="ns", utc=True)
+    if session_mode == "day":
+        minute_of_day = df_ts.dt.hour * 60 + df_ts.dt.minute
+        day_mask = (
+            (df_ts.dt.weekday < 5)
+            & (minute_of_day >= 8 * 60 + 45)
+            & (minute_of_day <= 13 * 60 + 45)
+        )
+        df = df.loc[day_mask].copy()
+        df_ts = df_ts.loc[day_mask]
+    if df.empty:
+        return {}
+
+    contract_open = float(df.iloc[0]["Open"])
+    contract_high = float(df["High"].max())
+    contract_low = float(df["Low"].min())
+    contract_close = float(df.iloc[-1]["Close"])
+    contract_change = contract_close - contract_open
+    first_ts = int(df.iloc[0]["ts"])
+    last_ts = int(df.iloc[-1]["ts"])
+    return {
+        "contract_open": contract_open,
+        "contract_high": contract_high,
+        "contract_low": contract_low,
+        "contract_close": contract_close,
+        "contract_change": contract_change,
+        "contract_change_pct": (
+            contract_change / contract_open * 100.0
+            if contract_open else 0.0
+        ),
+        "month_cost": (contract_high + contract_low) / 2.0,
+        "bar_count": int(len(df)),
+        "data_start": pd.to_datetime(
+            first_ts, unit="ns", utc=True
+        ).strftime("%Y-%m-%d %H:%M"),
+        "data_end": pd.to_datetime(
+            last_ts, unit="ns", utc=True
+        ).strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+@app.get("/api/txf_contract_stats")
+async def get_txf_contract_stats(session: str = "all"):
+    """Current actual TXF near-month lifecycle statistics."""
+    if not is_logged_in or not api:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    session_mode = str(session or "all").strip().lower()
+    if session_mode not in {"all", "day"}:
+        raise HTTPException(status_code=400, detail="session 僅支援 all 或 day")
+
+    loop = asyncio.get_running_loop()
+    txf_contract = await loop.run_in_executor(
+        None, lambda: _resolve_market_contract(api, "TXFR1")
+    )
+    if not txf_contract:
+        raise HTTPException(status_code=503, detail="無法解析目前台指近月合約")
+    try:
+        cycle_start = _txf_contract_cycle_start(
+            txf_contract.delivery_date
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    now_tw = datetime.utcnow() + timedelta(hours=8)
+    # 富邦期貨 candles 為日內端點；每 45 秒最多補一次目前日／夜盤，
+    # 合約週期較早的資料沿用本地逐分鐘快取。
+    if _claim_forced_kbars_refresh("TXF_CONTRACT_STATS"):
+        try:
+            async with _kbars_lock:
+                recent = await loop.run_in_executor(
+                    None,
+                    lambda: api.kbars(
+                        contract=txf_contract,
+                        start=cycle_start.strftime("%Y-%m-%d"),
+                        end=now_tw.strftime("%Y-%m-%d"),
+                        timeout=30000,
+                    ),
+                )
+            if recent and recent.ts and len(recent.ts) > 0:
+                _save_to_cache(
+                    "TXFR1",
+                    pd.DataFrame(dict(recent)),
+                    datetime(1970, 1, 1),
+                )
+        except Exception as exc:
+            print(
+                "[CONTRACT_STATS] 當前台指近月日內補取失敗，"
+                f"沿用本地快取 ({type(exc).__name__})"
+            )
+
+    start_ns = _taipei_wallclock_ns(cycle_start)
+    end_ns = _taipei_wallclock_ns(now_tw + timedelta(minutes=1))
+    with sqlite3.connect(_KBARS_CACHE_DB, timeout=10) as conn:
+        rows = conn.execute(
+            "SELECT ts, Open, High, Low, Close FROM kbars1m "
+            "WHERE contract_code='TXFR1' AND ts > ? AND ts <= ? "
+            "ORDER BY ts",
+            (start_ns, end_ns),
+        ).fetchall()
+
+    stats = _calculate_txf_contract_stats(rows, session_mode)
+    if not stats:
+        return {
+            "error": "no_contract_data",
+            "session": session_mode,
+            "contract_code": txf_contract.target_code,
+            "delivery_date": txf_contract.delivery_date,
+            "cycle_start": cycle_start.strftime("%Y-%m-%d %H:%M"),
+        }
+    return {
+        **stats,
+        "session": session_mode,
+        "contract_alias": "TXFR1",
+        "contract_code": txf_contract.target_code,
+        "delivery_date": txf_contract.delivery_date,
+        "cycle_start": cycle_start.strftime("%Y-%m-%d %H:%M"),
+        "formula": "month_cost=(contract_high+contract_low)/2",
+        "source": "fubon_current_contract_plus_local_cache",
+    }
+
+
+def _txf_amplitude_time_mask(df_ts, session_mode: str, window_mode: str):
+    """Return the Taiwan wall-clock rows used by an amplitude window."""
+    minute_of_day = df_ts.dt.hour * 60 + df_ts.dt.minute
+    if session_mode == "day":
+        return (
+            (df_ts.dt.weekday < 5)
+            & (minute_of_day >= 8 * 60 + 45)
+            & (minute_of_day <= 13 * 60 + 45)
+        )
+    if window_mode == "afternoon":
+        # 富邦 1 分 K 使用收盤時間戳：15:01 代表 15:00～15:01，
+        # 因此 15:00～21:30 的交易區間要取 (15:00, 21:30]。
+        return (
+            (minute_of_day > 15 * 60)
+            & (minute_of_day <= 21 * 60 + 30)
+        )
+    if window_mode == "night":
+        # 夜盤 21:30～隔日05:00 對應收盤時間戳
+        # (21:30, 24:00] 與 [00:00, 05:00]。
+        return (
+            (minute_of_day > 21 * 60 + 30)
+            | (minute_of_day <= 5 * 60)
+        )
+    return pd.Series(True, index=df_ts.index, dtype=bool)
+
+
 @app.get("/api/txf_amplitude")
-async def get_txf_amplitude(period: str = "day", session: str = "all"):
+async def get_txf_amplitude(
+    period: str = "day",
+    session: str = "all",
+    window: str = "full",
+):
     """
     計算台指期震幅統計（近20個交易日/週/月）。
     period: day | week | month
     session: day（08:45～13:45）| all（完整交易日）
+    window: full（既有完整交易日）| afternoon（15:00～21:30）
+            | night（21:30～隔日05:00）
     回傳: amp_max, amp_large, amp_avg, amp_small, amp_min, amp_today, days
     """
-    import numpy as np
-
     import calendar as _cal
     now_tw = datetime.utcnow() + timedelta(hours=8)
     session_mode = str(session or "all").strip().lower()
     if session_mode not in {"all", "day"}:
         raise HTTPException(status_code=400, detail="session 僅支援 all 或 day")
+    window_mode = str(window or "full").strip().lower()
+    if window_mode not in {"full", "afternoon", "night"}:
+        raise HTTPException(
+            status_code=400,
+            detail="window 僅支援 full、afternoon 或 night",
+        )
+    if session_mode == "day":
+        # 日盤本身已有固定時段，午／夜切換只適用台指期（全）。
+        window_mode = "full"
 
     # 依週期決定回查天數
     look_back_days = {"day": 45, "week": 200, "month": 700}.get(period, 45)
@@ -2493,17 +2720,22 @@ async def get_txf_amplitude(period: str = "day", session: str = "all"):
     df_ts = pd.to_datetime(df['ts'], unit='ns', utc=True)
 
     if session_mode == "day":
-        minute_of_day = df_ts.dt.hour * 60 + df_ts.dt.minute
-        day_mask = (
-            (df_ts.dt.weekday < 5)
-            & (minute_of_day >= 8 * 60 + 45)
-            & (minute_of_day <= 13 * 60 + 45)
+        day_mask = _txf_amplitude_time_mask(
+            df_ts, session_mode, window_mode
         )
         df = df.loc[day_mask].copy()
         df_ts = df_ts.loc[day_mask]
         # 日盤以實際日曆日分組，不納入前一晚 15:00 起的夜盤。
         df['_date'] = df_ts.dt.date
     else:
+        if window_mode in {"afternoon", "night"}:
+            # 午、夜時段都依富邦收盤時間戳篩選，交易日歸屬仍沿用
+            # 既有 15:00 後歸入下一交易日的規則。
+            window_mask = _txf_amplitude_time_mask(
+                df_ts, session_mode, window_mode
+            )
+            df = df.loc[window_mask].copy()
+            df_ts = df_ts.loc[window_mask]
         # 全盤交易日：前一日 15:00（夜盤）→ 當日 13:45（日盤）。
         # 週五夜盤與週六凌晨必須併入下週一，不能獨立算成週六。
         trading_day = pd.Series(df_ts.dt.normalize(), index=df.index)
@@ -2536,10 +2768,15 @@ async def get_txf_amplitude(period: str = "day", session: str = "all"):
     # day 模式依使用者定義：取過去 20 個交易日，每一天的「最高價 - 最低價」。
     # 「近20個完整交易日」不可把零散即時列納入。全盤正常約 1,140 根，
     # 日盤正常約 300 根；門檻保留少量缺筆容忍度。
-    MIN_BARS = (
-        (180 if session_mode == "day" else 850)
-        if period == "day" else 1
-    )
+    if period == "day":
+        MIN_BARS = (
+            180 if session_mode == "day"
+            else 280 if window_mode == "afternoon"
+            else 330 if window_mode == "night"
+            else 850
+        )
+    else:
+        MIN_BARS = 1
     grp = df.groupby('_group').agg(
         grp_high=('High', 'max'), grp_low=('Low', 'min'), bar_count=('ts', 'count')
     )
@@ -2597,11 +2834,18 @@ async def get_txf_amplitude(period: str = "day", session: str = "all"):
         amp_today = cache_amp if cache_amp > 0 else None
 
     now_minute = now_tw.hour * 60 + now_tw.minute
+    selected_contract_code = str(
+        getattr(contract, "code", "") or ""
+    ).upper()
     snapshot_matches_session = (
-        session_mode == "all"
-        or (
+        window_mode == "full"
+        and selected_contract_code == "TXFR1"
+        and (
+            session_mode == "all"
+            or (
             now_tw.weekday() < 5
             and 8 * 60 + 45 <= now_minute <= 13 * 60 + 45
+            )
         )
     )
     if period == "day" and is_logged_in and snapshot_matches_session:
@@ -2622,44 +2866,46 @@ async def get_txf_amplitude(period: str = "day", session: str = "all"):
             amp_today = amp_today_high - amp_today_low
 
     historical_amps = hist['amplitude'].values.astype(float)
-    if period == "day" and amp_today is not None:
-        # 本日進行中也算在「近 20 日」內，因此換掉最舊的一個完整交易日。
-        amps = np.append(historical_amps[-19:], float(amp_today))
-    else:
-        amps = historical_amps
-
-    amp_sum = float(np.sum(amps))
-    amp_count = len(amps)
-    amp_min = _round_amp(np.min(amps))
-    amp_max = _round_amp(np.max(amps))
-    amp_avg_raw = amp_sum / amp_count if amp_count else 0
-    amp_avg = _round_amp(amp_avg_raw)
-    # 大大震幅 = (平均震幅 + 最大震幅) / 2；小小震幅 = (平均震幅 + 最小震幅) / 2
-    amp_large = _round_amp((amp_avg + amp_max) / 2)
-    amp_small = _round_amp((amp_avg + amp_min) / 2)
+    # 五個振幅統計值都只採最近 20 個完整週期；本日即時振幅另列顯示，
+    # 不可在盤中改變歷史最大值、最小值或平均值。
+    levels = _calculate_amplitude_levels(historical_amps[-20:])
+    if not levels:
+        return {
+            "error": "insufficient_data", "amp_max": None,
+            "amp_large": None, "amp_avg": None, "amp_small": None,
+            "amp_min": None, "amp_today": None, "days": 0,
+        }
 
     return {
-        "amp_max":   amp_max,
-        "amp_large": amp_large,
-        "amp_avg":   amp_avg,
-        "amp_small": amp_small,
-        "amp_min":   amp_min,
+        "amp_max":   levels["amp_max"],
+        "amp_large": levels["amp_large"],
+        "amp_avg":   levels["amp_avg"],
+        "amp_small": levels["amp_small"],
+        "amp_min":   levels["amp_min"],
         "amp_today": _round_amp(amp_today) if amp_today is not None else None,
         "amp_today_high": _round_amp(amp_today_high) if amp_today_high is not None else None,
         "amp_today_low": _round_amp(amp_today_low) if amp_today_low is not None else None,
-        "amp_sum":   _round_amp(amp_sum),
-        "days":      amp_count,
+        "amp_sum":   levels["amp_sum"],
+        "days":      levels["days"],
         "period":    period,
         "session":   session_mode,
+        "window":    window_mode,
         "session_date": str(current_session_key),
         "definitions": {
-            "amp_max": "日週期為前19個完整交易日加本日即時振幅的最大值；其他週期取近20個完整週期",
+            "amp_max": "最近20個完整週期振幅的最大值，不含本日即時振幅",
             "amp_large": "(平均振幅 + 最大振幅) / 2",
-            "amp_avg": "日週期為前19個完整交易日加本日即時振幅後除以20",
-            "amp_sum": "納入統計的20日高低振幅點數加總",
+            "amp_avg": "最近20個完整交易日振幅平均，不含本日即時振幅",
+            "amp_sum": "最近20個完整交易日高低振幅點數加總，不含本日",
             "amp_small": "(平均振幅 + 最小振幅) / 2",
-            "amp_min": "日週期為前19個完整交易日加本日即時振幅的最小值；其他週期取近20個完整週期",
+            "amp_min": "最近20個完整週期振幅的最小值，不含本日即時振幅",
             "amp_today": "目前進行中週期的高低點振幅",
+            "window": (
+                "僅統計15:00至21:30午盤（收盤時間戳15:01至21:30）"
+                if window_mode == "afternoon"
+                else "僅統計21:30至隔日05:00夜盤（收盤時間戳21:31至05:00）"
+                if window_mode == "night"
+                else "沿用既有完整交易日統計"
+            ),
         },
     }
 
