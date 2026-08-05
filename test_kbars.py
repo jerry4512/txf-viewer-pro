@@ -130,6 +130,10 @@ class FubonMarketDataTests(unittest.TestCase):
         self.assertIsNotNone(contract)
         self.assertEqual(contract.code, "TXFR1")
         self.assertEqual(contract.target_code, "TXFH1")
+        next_contract = self.client.resolve_contract("TXFR2")
+        self.assertIsNotNone(next_contract)
+        self.assertEqual(next_contract.code, "TXFR2")
+        self.assertEqual(next_contract.target_code, "TXFJ1")
         self.assertEqual(self.intraday.last_ticker_params["exchange"], "TAIFEX")
 
     def test_day_and_night_candles_are_merged_and_close_stamped(self):

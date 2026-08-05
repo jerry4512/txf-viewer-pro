@@ -109,6 +109,12 @@ _weighted_stock_contracts = {}
 _weighted_stock_stream_state = {}
 _contract_info_lock = threading.Lock()
 _contract_info_cache = {}
+_taiex_quote_lock = threading.Lock()
+_taiex_quote_cache = {}
+_taiex_quote_cached_at = 0.0
+_TAIEX_QUOTE_TTL_SECONDS = 3.0
+_futures_month_spread_lock = threading.Lock()
+_futures_month_spread_state = {}
 
 last_snapshot_cache = {
     "open": 0,
@@ -451,6 +457,90 @@ def _reset_quote_state(contract_obj=None):
         })
 
 
+def _month_spread_leg(alias: str, contract_obj=None) -> dict:
+    return {
+        "alias": alias,
+        "target_code": (
+            str(getattr(contract_obj, "target_code", "") or "") or None
+        ),
+        "delivery_date": (
+            str(getattr(contract_obj, "delivery_date", "") or "") or None
+        ),
+        "price": None,
+        "time": None,
+        "source": "none",
+    }
+
+
+def _reset_futures_month_spread_state(near_contract=None, far_contract=None):
+    global _futures_month_spread_state
+    with _futures_month_spread_lock:
+        _futures_month_spread_state = {
+            "near": _month_spread_leg("TXFR1", near_contract),
+            "far": _month_spread_leg("TXFR2", far_contract),
+        }
+
+
+def _futures_month_spread_payload() -> dict:
+    with _futures_month_spread_lock:
+        near = dict(
+            _futures_month_spread_state.get("near")
+            or _month_spread_leg("TXFR1")
+        )
+        far = dict(
+            _futures_month_spread_state.get("far")
+            or _month_spread_leg("TXFR2")
+        )
+    near_price = safe_float(near.get("price"), 0.0)
+    far_price = safe_float(far.get("price"), 0.0)
+    spread = near_price - far_price if near_price > 0 and far_price > 0 else None
+    return {
+        "provider": "fubon",
+        "formula": "TXFR1-TXFR2",
+        "near": near,
+        "far": far,
+        "spread": spread,
+        "time": max(safe_int(near.get("time"), 0), safe_int(far.get("time"), 0)) or None,
+        "ready": spread is not None,
+    }
+
+
+def _update_futures_month_spread_quote(quote, source: str):
+    code = str(_quote_field(quote, "code", "Code", "symbol") or "")
+    target_code = str(_quote_field(quote, "target_code", "symbol") or "")
+    price = safe_float(
+        _quote_field(quote, "close", "Close", "price", "Price", "closePrice", "lastPrice"),
+        0.0,
+    )
+    if price <= 0 or (not code and not target_code):
+        return None
+    event_time = _quote_timestamp(quote)
+    matched = False
+    with _futures_month_spread_lock:
+        for leg_name in ("near", "far"):
+            leg = _futures_month_spread_state.get(leg_name)
+            if not leg:
+                continue
+            identities = {
+                str(leg.get("alias") or ""),
+                str(leg.get("target_code") or ""),
+            }
+            identities.discard("")
+            if code not in identities and target_code not in identities:
+                continue
+            leg.update({
+                "price": price,
+                "time": event_time,
+                "source": source,
+            })
+            matched = True
+            break
+    return _futures_month_spread_payload() if matched else None
+
+
+_reset_futures_month_spread_state()
+
+
 def _selected_quote_codes() -> set:
     if not contract:
         return set()
@@ -471,9 +561,10 @@ def _quote_matches_selected_contract(quote) -> bool:
     if tick_code in selected_codes:
         return True
     selected_code = str(getattr(contract, "code", ""))
-    # TXFR1/MXFR1/TMFR1 callbacks use the resolved monthly target code.
+    # Rolling aliases are distinct subscriptions.  In particular TXFR2 must
+    # never be treated as the selected TXFR1 merely because both start TXF.
     if selected_code.endswith(("R1", "R2")):
-        return tick_code.startswith(selected_code[:-2])
+        return tick_code == str(getattr(contract, "target_code", "") or "")
     return False
 
 
@@ -609,6 +700,9 @@ def global_fubon_candle_callback(candle):
     close_price = safe_float(_quote_field(candle, "close"), 0)
     if not code.startswith(("TXF", "MXF", "TMF")) or event_time <= 0 or close_price <= 0:
         return
+    spread_payload = _update_futures_month_spread_quote(candle, "fubon_candles")
+    if spread_payload:
+        _stream_callback_broadcast("futures_month_spread", spread_payload)
     bucket_ns = (event_time // 60) * 60 * 1_000_000_000
     _save_rt_bar_to_db(
         code,
@@ -627,8 +721,6 @@ def global_fubon_candle_callback(candle):
 
 def global_fubon_aggregate_callback(aggregate):
     """Refresh session OHLC/reference without double-counting trades."""
-    if not _quote_matches_selected_contract(aggregate):
-        return
     price = safe_float(
         _quote_field(aggregate, "closePrice", "lastPrice", "close"), 0
     )
@@ -649,6 +741,13 @@ def global_fubon_aggregate_callback(aggregate):
         normalized["total_volume"] = total.get(
             "tradeVolume", normalized["total_volume"]
         )
+    spread_payload = _update_futures_month_spread_quote(
+        normalized, "fubon_aggregates"
+    )
+    if spread_payload:
+        _stream_callback_broadcast("futures_month_spread", spread_payload)
+    if not _quote_matches_selected_contract(aggregate):
+        return
     reference = safe_float(normalized.get("reference"), 0)
     if reference > 0 and contract:
         contract.reference = reference
@@ -976,17 +1075,21 @@ def global_quote_callback(*args):
             return
 
         tick_code = str(_quote_field(quote, "code", "Code") or "")
+        price = _quote_field(quote, "close", "Close", "price", "Price")
+        p_val = safe_float(price, 0.0)
+        if p_val <= 0:
+            return
+
+        spread_payload = _update_futures_month_spread_quote(quote, "fubon_trades")
+        if spread_payload:
+            _stream_callback_broadcast("futures_month_spread", spread_payload)
+
         if tick_code in _WEIGHTED_STOCK_CODES:
             _handle_weighted_stock_tick(quote)
             # 四大權值股的額外訂閱不可污染目前選取的期貨報價。
             if not _quote_matches_selected_contract(quote):
                 return
         elif not _quote_matches_selected_contract(quote):
-            return
-
-        price = _quote_field(quote, "close", "Close", "price", "Price")
-        p_val = safe_float(price, 0.0)
-        if p_val <= 0:
             return
 
         event_time = _quote_timestamp(quote)
@@ -1140,7 +1243,13 @@ async def login(req: LoginRequest):
         )
         if not contract:
             raise RuntimeError("富邦契約清單無法解析 TXFR1 近月合約")
+        far_month_contract = await loop.run_in_executor(
+            None, lambda: _resolve_market_contract(api, "TXFR2")
+        )
+        if not far_month_contract:
+            raise RuntimeError("富邦契約清單無法解析 TXFR2 次近月合約")
         _reset_quote_state(contract)
+        _reset_futures_month_spread_state(contract, far_month_contract)
         with _rt_bar_lock:
             _rt_bar.clear()
         _rt_contract_code = contract.code
@@ -1152,20 +1261,46 @@ async def login(req: LoginRequest):
         # 三種商品的日／夜盤 trades、aggregates、candles 全部持續訂閱並存 DB。
         futures_subscribed = []
         futures_errors = {}
-        for alias in ("TXFR1", "MXFR1", "TMFR1"):
+        for alias in ("TXFR1", "TXFR2", "MXFR1", "TMFR1"):
             try:
-                item = contract if alias == "TXFR1" else await loop.run_in_executor(
-                    None, lambda a=alias: _resolve_market_contract(api, a)
-                )
+                if alias == "TXFR1":
+                    item = contract
+                elif alias == "TXFR2":
+                    item = far_month_contract
+                else:
+                    item = await loop.run_in_executor(
+                        None, lambda a=alias: _resolve_market_contract(api, a)
+                    )
                 if not item:
                     raise RuntimeError("找不到近月契約")
-                await loop.run_in_executor(None, lambda c=item: api.subscribe_contract(c))
+                channels = (
+                    ("trades", "aggregates")
+                    if alias == "TXFR2"
+                    else ("trades", "aggregates", "candles")
+                )
+                await loop.run_in_executor(
+                    None,
+                    lambda c=item, ch=channels: api.subscribe_contract(c, channels=ch),
+                )
                 futures_subscribed.append({"code": alias, "target_code": item.target_code})
             except Exception as exc:
                 futures_errors[alias] = type(exc).__name__
                 print(f"[{now_str}] [WS] {alias} 訂閱失敗: {type(exc).__name__}")
 
         is_logged_in = True
+        try:
+            month_snapshots = await loop.run_in_executor(
+                None, lambda: api.snapshots([contract, far_month_contract])
+            )
+            for month_snapshot in month_snapshots:
+                _update_futures_month_spread_quote(
+                    month_snapshot, "fubon_snapshot"
+                )
+        except Exception as month_spread_exc:
+            print(
+                f"[{now_str}] [SPREAD] 近遠月初始報價取得失敗，等待 WebSocket: "
+                f"{type(month_spread_exc).__name__}"
+            )
         _reset_weighted_stock_stream_state()
         weighted_result = _subscribe_weighted_stock_streams()
         print(f"[{now_str}] [WS] 富邦期貨訂閱完成: {futures_subscribed}")
@@ -1208,9 +1343,11 @@ async def login(req: LoginRequest):
             "futures": futures_subscribed,
             "futures_errors": futures_errors,
             "weighted_stocks": weighted_result,
+            "futures_month_spread": _futures_month_spread_payload(),
         }
     except Exception as e:
         is_logged_in = False
+        _reset_futures_month_spread_state()
         try:
             api.logout()
         except Exception:
@@ -1459,6 +1596,95 @@ def _fetch_twse_stock_snapshots(stock_defs: list[tuple[str, str]]) -> dict:
 
     rows = payload.get("msgArray") or []
     return {str(row.get("c") or "").strip(): row for row in rows if row.get("c")}
+
+
+def _twse_taiex_row_to_quote(row: dict) -> dict:
+    """Normalize TWSE MIS t00 into a frontend-safe index quote."""
+    date_raw = str(row.get("d") or row.get("^") or "").strip()
+    quote_time = str(row.get("t") or row.get("%") or "").strip()
+    date_str = (
+        f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+        if len(date_raw) == 8 else None
+    )
+    traded_price = safe_float(row.get("z"), 0)
+    reference = safe_float(row.get("y"), 0)
+    price = traded_price or safe_float(row.get("pz"), 0) or reference
+    if price <= 0:
+        raise RuntimeError("臺灣加權指數沒有有效價格")
+
+    event_time = 0
+    tlong = safe_int(row.get("tlong"), 0)
+    if tlong > 0:
+        event_time = tlong // 1000 if tlong > 10**11 else tlong
+    elif date_str and quote_time:
+        try:
+            wallclock = datetime.strptime(
+                f"{date_str} {quote_time}", "%Y-%m-%d %H:%M:%S"
+            )
+            event_time = calendar.timegm(wallclock.timetuple()) - 28800
+        except ValueError:
+            event_time = 0
+
+    change = price - reference if reference > 0 else 0.0
+    return {
+        "symbol": "TAIEX",
+        "name": str(row.get("n") or "發行量加權股價指數"),
+        "price": price,
+        "open": safe_float(row.get("o"), price),
+        "high": safe_float(row.get("h"), price),
+        "low": safe_float(row.get("l"), price),
+        "reference": reference,
+        "change": change,
+        "change_pct": (change / reference * 100) if reference > 0 else 0.0,
+        "date": date_str,
+        "quote_time": quote_time,
+        "time": event_time or None,
+        "is_live_price": traded_price > 0,
+        "source": "twse_mis_t00",
+        "stale": False,
+    }
+
+
+def _fetch_taiex_quote() -> dict:
+    """Fetch TAIEX from TWSE MIS with a small process-wide throttle/cache."""
+    global _taiex_quote_cache, _taiex_quote_cached_at
+    now_mono = time.monotonic()
+    with _taiex_quote_lock:
+        if (
+            _taiex_quote_cache
+            and now_mono - _taiex_quote_cached_at < _TAIEX_QUOTE_TTL_SECONDS
+        ):
+            return dict(_taiex_quote_cache)
+
+        url = (
+            "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+            "?ex_ch=tse_t00.tw&json=1&delay=0"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://mis.twse.com.tw/stock/index.jsp",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                payload = json.loads(
+                    resp.read().decode("utf-8", errors="ignore")
+                )
+            rows = payload.get("msgArray") or []
+            if not rows:
+                raise RuntimeError("證交所未回傳加權指數")
+            quote = _twse_taiex_row_to_quote(rows[0])
+            _taiex_quote_cache = quote
+            _taiex_quote_cached_at = time.monotonic()
+            return dict(quote)
+        except Exception:
+            if _taiex_quote_cache:
+                fallback = dict(_taiex_quote_cache)
+                fallback["stale"] = True
+                return fallback
+            raise
 
 def _twse_snapshot_to_intraday_payload(code: str, name: str, row: dict) -> dict:
     """Convert a TWSE MIS quote snapshot into a small chartable intraday path."""
@@ -2033,6 +2259,27 @@ async def get_snapshot():
 async def get_quote_health():
     """Report the actual Fubon subscription/Tick health, not only browser WS state."""
     return _quote_health_data()
+
+
+@app.get("/api/taiex_quote")
+async def get_taiex_quote():
+    """Return the official TWSE TAIEX quote used for futures basis display."""
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _fetch_taiex_quote)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"臺灣加權指數暫時無法取得: {exc}",
+        )
+
+
+@app.get("/api/futures_month_spread")
+async def get_futures_month_spread():
+    """Return TXF near-minus-next-month prices maintained by Fubon WebSocket."""
+    if not is_logged_in:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    return _futures_month_spread_payload()
 
 
 @app.get("/api/weighted_stocks_stream_health")

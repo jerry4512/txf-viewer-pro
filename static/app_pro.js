@@ -2728,6 +2728,12 @@ class FreelancerKChart {
             this.rebuildMacd();
             const latestBar = this.kbarsCache[this.kbarsCache.length - 1];
             this.updateLegend(latestBar);
+            if (latestBar) {
+                flUpdateWeightedSpreadFutures(
+                    latestBar.close,
+                    latestBar.time
+                );
+            }
             if (this.kbarsCache.length === 0) {
                 this.showHistoryStatus(
                     `${this.instrument().name}歷史 K 棒暫無回傳，先顯示即時資料`,
@@ -2976,6 +2982,7 @@ class FreelancerKChart {
         ) return;
         const t = time || Math.floor(Date.now() / 1000);
         if (this.sessionMode === 'day' && !this.isDaySessionTimestamp(t)) return;
+        flUpdateWeightedSpreadFutures(price, t);
         this.lastRealtimeTickAt = Date.now();
         const bucketT = getKbarBucketTime(t, this.currentPeriod, false);
 
@@ -5148,6 +5155,7 @@ async function startApp(contractCode) {
         // 停止震幅統計自動更新
         stopAmplitudeStatisticsAutoRefresh();
         flStopMajorWeightedStocksRefresh();
+        flStopWeightedSpreadRefresh();
 
         if (market === 'stocks') {
             appContainer.classList.add('market-stocks');
@@ -5200,6 +5208,7 @@ async function startApp(contractCode) {
             setTimeout(() => ensureFreelancerChart(contractCode || 'TXFR1'), 0);
             setTimeout(() => ensureFreelancerWeightedStocks(), 0);
             flStartAmplitudeRefresh();
+            flStartWeightedSpreadRefresh();
         } else if (market === 'amplitude-statistics') {
             // ── 震幅統計：動態注入 <style> 來隱藏 panes-container ──
             // CSS style.css 有 `#panes-container { display: grid !important }`，
@@ -5875,6 +5884,10 @@ function connectWebSocket() {
             updateQuoteStatus(msg.data);
             return;
         }
+        if (msg.type === 'futures_month_spread') {
+            flUpdateMonthSpread(msg.data);
+            return;
+        }
         if (msg.type === 'weighted_stock_tick') {
             if (freelancerWeightedStocksPane) {
                 freelancerWeightedStocksPane.updateTick(msg.data);
@@ -6233,6 +6246,11 @@ let _flLongBarrierTarget = null;
 let _flShortBarrierTarget = null;
 let _flAmplitudeRequestId = 0;
 let _flBarrierRequestId = 0;
+let _flWeightedSpreadTimer = null;
+let _flWeightedSpreadFuturesPrice = null;
+let _flWeightedSpreadFuturesTime = null;
+let _flWeightedSpreadTaiex = null;
+let _flMonthSpread = null;
 
 function flSelectedSessionMode() {
     return localStorage.getItem('fl-txf-session-mode') === 'day' ? 'day' : 'all';
@@ -6256,9 +6274,155 @@ function flResetSessionCalculations() {
     }
 }
 
+function flRenderWeightedSpread() {
+    const el = document.getElementById('fl-txf-spread-weighted');
+    if (!el) return;
+    const futuresPrice = Number(_flWeightedSpreadFuturesPrice);
+    const taiexPrice = Number(_flWeightedSpreadTaiex?.price);
+    if (
+        !Number.isFinite(futuresPrice)
+        || futuresPrice <= 0
+        || !Number.isFinite(taiexPrice)
+        || taiexPrice <= 0
+    ) {
+        el.textContent = '--';
+        el.style.color = '#4facfe';
+        el.removeAttribute('title');
+        return;
+    }
+
+    const spread = futuresPrice - taiexPrice;
+    const prefix = spread > 0 ? '+' : '';
+    el.textContent = `${prefix}${spread.toFixed(2)}`;
+    el.style.color = spread > 0
+        ? FREELANCER_MARKET_COLORS.up
+        : spread < 0
+            ? FREELANCER_MARKET_COLORS.down
+            : FREELANCER_MARKET_COLORS.flat;
+    const quoteDate = _flWeightedSpreadTaiex?.date || '';
+    const quoteTime = _flWeightedSpreadTaiex?.quote_time || '';
+    const staleLabel = _flWeightedSpreadTaiex?.stale ? '（快取）' : '';
+    const productName = freelancerChartPane?.instrument()?.name || '台指期';
+    el.title = (
+        `${productName} ${futuresPrice.toFixed(0)} − `
+        + `加權指數 ${taiexPrice.toFixed(2)}\n`
+        + `證交所 ${quoteDate} ${quoteTime} ${staleLabel}`
+    ).trim();
+}
+
+function flRenderMonthSpread() {
+    const el = document.getElementById('fl-txf-spread-months');
+    if (!el) return;
+    const spread = Number(_flMonthSpread?.spread);
+    const nearPrice = Number(_flMonthSpread?.near?.price);
+    const farPrice = Number(_flMonthSpread?.far?.price);
+    if (
+        !Number.isFinite(spread)
+        || !Number.isFinite(nearPrice)
+        || nearPrice <= 0
+        || !Number.isFinite(farPrice)
+        || farPrice <= 0
+    ) {
+        el.textContent = '--';
+        el.style.color = '#4facfe';
+        el.removeAttribute('title');
+        return;
+    }
+
+    const prefix = spread > 0 ? '+' : '';
+    el.textContent = `${prefix}${spread.toFixed(2)}`;
+    el.style.color = spread > 0
+        ? FREELANCER_MARKET_COLORS.up
+        : spread < 0
+            ? FREELANCER_MARKET_COLORS.down
+            : FREELANCER_MARKET_COLORS.flat;
+    const nearCode = _flMonthSpread?.near?.target_code || 'TXFR1';
+    const farCode = _flMonthSpread?.far?.target_code || 'TXFR2';
+    const eventTime = Number(_flMonthSpread?.time);
+    const timeLabel = Number.isFinite(eventTime) && eventTime > 0
+        ? new Date(eventTime * 1000).toLocaleString('zh-TW', {
+            timeZone: 'Asia/Taipei',
+            hour12: false,
+        })
+        : '';
+    el.title = (
+        `近月 ${nearCode} ${nearPrice.toFixed(2)} − `
+        + `次近月 ${farCode} ${farPrice.toFixed(2)}`
+        + (timeLabel ? `\n富邦 ${timeLabel}` : '')
+    );
+}
+
+function flUpdateMonthSpread(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    _flMonthSpread = payload;
+    flRenderMonthSpread();
+}
+
+function flUpdateWeightedSpreadFutures(price, timestamp = null) {
+    const numericPrice = Number(price);
+    if (!Number.isFinite(numericPrice) || numericPrice <= 0) return;
+    if (
+        timestamp !== null
+        && timestamp !== undefined
+        && !flTickMatchesSelectedSession(timestamp)
+    ) return;
+    _flWeightedSpreadFuturesPrice = numericPrice;
+    _flWeightedSpreadFuturesTime = Number(timestamp) || null;
+    flRenderWeightedSpread();
+}
+
+function flResetWeightedSpreadFutures() {
+    _flWeightedSpreadFuturesPrice = null;
+    _flWeightedSpreadFuturesTime = null;
+    flRenderWeightedSpread();
+}
+
+async function flLoadWeightedSpread() {
+    try {
+        const res = await fetch('/api/taiex_quote');
+        if (!res.ok) return;
+        const quote = await res.json();
+        if (Number(quote?.price) > 0) {
+            _flWeightedSpreadTaiex = quote;
+            flRenderWeightedSpread();
+        }
+    } catch (error) {
+        console.warn('[FL] 加權指數載入失敗:', error);
+    }
+}
+
+async function flLoadMonthSpread() {
+    try {
+        const res = await fetch('/api/futures_month_spread');
+        if (!res.ok) return;
+        flUpdateMonthSpread(await res.json());
+    } catch (error) {
+        console.warn('[FL] 近遠月價差載入失敗:', error);
+    }
+}
+
+function flLoadSpreadQuotes() {
+    void flLoadWeightedSpread();
+    void flLoadMonthSpread();
+}
+
+function flStartWeightedSpreadRefresh() {
+    flLoadSpreadQuotes();
+    if (_flWeightedSpreadTimer) clearInterval(_flWeightedSpreadTimer);
+    _flWeightedSpreadTimer = setInterval(flLoadSpreadQuotes, 5000);
+}
+
+function flStopWeightedSpreadRefresh() {
+    if (_flWeightedSpreadTimer) {
+        clearInterval(_flWeightedSpreadTimer);
+        _flWeightedSpreadTimer = null;
+    }
+}
+
 function flSelectTxfTab(tab) {
     const mode = tab === 'day' ? 'day' : 'all';
     localStorage.setItem('fl-txf-session-mode', mode);
+    flResetWeightedSpreadFutures();
     flResetSessionCalculations();
     void flLoadAmplitude(_flAmpPeriod, mode);
     if (_flAmpPeriod !== 'day') void flLoadBarrierAmplitude(mode);
