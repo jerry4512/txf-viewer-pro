@@ -3,7 +3,11 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from main import _twse_taiex_row_to_quote
+from main import (
+    _twse_snapshot_to_intraday_payload,
+    _twse_taiex_row_to_quote,
+    _weighted_stock_reference,
+)
 
 
 class TaiexQuoteTests(unittest.TestCase):
@@ -46,6 +50,32 @@ class TaiexQuoteTests(unittest.TestCase):
     def test_missing_price_is_rejected(self):
         with self.assertRaises(RuntimeError):
             _twse_taiex_row_to_quote({"d": "20260805", "z": "-"})
+
+    def test_twse_stock_reference_overrides_stale_broker_value(self):
+        reference = _weighted_stock_reference(
+            "2330",
+            {"2330": {"y": "2405.0000"}},
+            2320,
+        )
+        self.assertEqual(reference, 2405.0)
+
+    def test_weighted_stock_payload_keeps_official_reference(self):
+        payload = _twse_snapshot_to_intraday_payload(
+            "2330",
+            "台積電",
+            {
+                "d": "20260806",
+                "t": "09:27:55",
+                "o": "2395.0000",
+                "h": "2395.0000",
+                "l": "2370.0000",
+                "z": "2375.0000",
+                "y": "2405.0000",
+                "v": "6223",
+            },
+        )
+        self.assertEqual(payload["reference"], 2405.0)
+        self.assertAlmostEqual(payload["change_pct"], -1.2474012474)
 
 
 if __name__ == "__main__":

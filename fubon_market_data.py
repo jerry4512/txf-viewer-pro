@@ -971,7 +971,7 @@ class FubonMarketDataClient:
         if price <= 0:
             return {}
         reference = _safe_float(
-            raw.get("referencePrice") or raw.get("previousClose"),
+            raw.get("previousClose") or raw.get("referencePrice"),
             contract.reference,
         )
         if reference > 0:

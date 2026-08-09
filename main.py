@@ -213,6 +213,23 @@ def _reset_weighted_stock_stream_state():
 _reset_weighted_stock_stream_state()
 
 
+def _weighted_stock_reference(
+    code: str,
+    twse_snapshots=None,
+    *fallback_values,
+) -> float:
+    """Prefer the TWSE trading-day reference over stale broker metadata."""
+    row = (twse_snapshots or {}).get(str(code)) or {}
+    official_reference = safe_float(row.get("y"), 0)
+    if official_reference > 0:
+        return official_reference
+    for value in fallback_values:
+        reference = safe_float(value, 0)
+        if reference > 0:
+            return reference
+    return 0.0
+
+
 def _weighted_stock_health_data() -> dict:
     now = int(time.time())
     with _weighted_stock_state_lock:
@@ -288,7 +305,7 @@ def _handle_weighted_stock_tick(quote):
     )
     avg_price = safe_float(_quote_field(quote, "avg_price", "AvgPrice"), 0)
     open_price = safe_float(_quote_field(quote, "open", "Open"), 0)
-    reference = safe_float(
+    quoted_reference = safe_float(
         _quote_field(quote, "reference", "Reference", "yesterday_price"), 0
     )
 
@@ -299,8 +316,12 @@ def _handle_weighted_stock_tick(quote):
                 code, dict(_WEIGHTED_STOCK_DEFS).get(code, code)
             ),
         )
-        if reference <= 0:
-            reference = safe_float(state.get("reference"), 0)
+        reference = _weighted_stock_reference(
+            code,
+            None,
+            state.get("reference"),
+            quoted_reference,
+        )
         if open_price <= 0:
             open_price = safe_float(state.get("open"), 0) or price
         if avg_price <= 0:
@@ -825,6 +846,9 @@ def _subscribe_weighted_stock_streams(unsubscribe_first=False) -> dict:
     del unsubscribe_first
     subscribed = []
     errors = {}
+    twse_snapshots = _fetch_twse_stock_snapshots(
+        list(_WEIGHTED_STOCK_DEFS)
+    )
     for code, name in _WEIGHTED_STOCK_DEFS:
         try:
             stock_contract = _resolve_stock_contract(api, code)
@@ -839,9 +863,15 @@ def _subscribe_weighted_stock_streams(unsubscribe_first=False) -> dict:
             except Exception:
                 snapshot = None
 
-            reference = (
+            broker_reference = (
                 safe_float(getattr(snapshot, "reference", 0), 0)
                 if snapshot else _contract_reference(stock_contract)
+            )
+            reference = _weighted_stock_reference(
+                code,
+                twse_snapshots,
+                broker_reference,
+                _contract_reference(stock_contract),
             )
             open_price = safe_float(getattr(snapshot, "open", 0), 0) if snapshot else 0
             avg_price = safe_float(getattr(snapshot, "avg_price", 0), 0) if snapshot else 0
@@ -1763,6 +1793,7 @@ def _twse_snapshot_to_intraday_payload(code: str, name: str, row: dict) -> dict:
         "is_today": date_str == (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d"),
         "source": "twse_snapshot",
         "open": open_p,
+        "reference": prev_p,
         "last": last_p,
         "change": last_p - prev_p if prev_p else last_p - open_p,
         "change_pct": ((last_p - prev_p) / prev_p * 100) if prev_p else ((last_p - open_p) / open_p * 100 if open_p else 0),
@@ -2327,13 +2358,14 @@ async def get_major_weighted_stocks_intraday():
     ]
     loop = asyncio.get_running_loop()
     result = []
-    twse_snapshots = None
+    twse_snapshots = await loop.run_in_executor(
+        None,
+        lambda: _fetch_twse_stock_snapshots(stock_defs),
+    )
 
     for code, name in stock_defs:
         stock_contract = _resolve_stock_contract(api, code)
         if not stock_contract:
-            if twse_snapshots is None:
-                twse_snapshots = _fetch_twse_stock_snapshots(stock_defs)
             result.append(_twse_snapshot_to_intraday_payload(code, name, twse_snapshots.get(code, {})))
             continue
 
@@ -2357,8 +2389,6 @@ async def get_major_weighted_stocks_intraday():
                 continue
 
         if not used_date:
-            if twse_snapshots is None:
-                twse_snapshots = _fetch_twse_stock_snapshots(stock_defs)
             payload = _twse_snapshot_to_intraday_payload(code, name, twse_snapshots.get(code, {}))
             if last_error and not payload.get("bars"):
                 payload["error"] = last_error
@@ -2367,8 +2397,6 @@ async def get_major_weighted_stocks_intraday():
 
         df = pd.DataFrame(dict(kbars))
         if df.empty:
-            if twse_snapshots is None:
-                twse_snapshots = _fetch_twse_stock_snapshots(stock_defs)
             result.append(_twse_snapshot_to_intraday_payload(code, name, twse_snapshots.get(code, {})))
             continue
 
@@ -2400,7 +2428,17 @@ async def get_major_weighted_stocks_intraday():
             else first_price
         )
         last_price = safe_float(df["price"].iloc[-1], 0)
-        reference = _contract_reference(stock_contract)
+        with _weighted_stock_state_lock:
+            stream_reference = safe_float(
+                _weighted_stock_stream_state.get(code, {}).get("reference"),
+                0,
+            )
+        reference = _weighted_stock_reference(
+            code,
+            twse_snapshots,
+            stream_reference,
+            _contract_reference(stock_contract),
+        )
         change_base = reference or open_price or first_price
         bars = []
         for row in df[["time", "price", "avg", "volume"]].itertuples(index=False):

@@ -78,6 +78,7 @@ class FakeStockIntraday:
             "symbol": params["symbol"],
             "name": "台積電",
             "referencePrice": 1000,
+            "previousClose": 1005,
             "openPrice": 1010,
             "highPrice": 1020,
             "lowPrice": 1005,
@@ -212,6 +213,8 @@ class FubonMarketDataTests(unittest.TestCase):
         snapshots = self.client.snapshots([contract])
         self.assertEqual(len(snapshots), 1)
         self.assertEqual(snapshots[0].close, 1015.0)
+        self.assertEqual(snapshots[0].reference, 1005.0)
+        self.assertEqual(contract.reference, 1005.0)
         self.assertEqual(snapshots[0].avg_price, 1012.5)
         self.assertEqual(snapshots[0].total_volume, 12345)
 
