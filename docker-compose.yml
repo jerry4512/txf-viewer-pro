@@ -1,0 +1,30 @@
+# 啟動：docker compose up -d --build
+# 本機瀏覽：http://127.0.0.1:8000
+# 其他裝置瀏覽：http://<執行 Docker 主機的 IP>:8000
+# 停止：docker compose down
+services:
+  txfviewer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: txf-pro-viewer:latest
+    container_name: txfviewer
+    # 富邦官方 SDK 只有 linux x86_64 wheel，ARM 主機需以模擬方式執行
+    platform: linux/amd64
+    # 容器內綁 0.0.0.0；此處綁所有網卡，區網／外部機器可用瀏覽器連 http://<主機IP>:8000
+    ports:
+      - "8000:8000"
+    # .env 內含 FUBON_API_KEY / TELEGRAM_BOT_TOKEN / ANTHROPIC_API_KEY 等
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Taipei
+    volumes:
+      # 以原始碼目錄覆蓋 /app：改檔免重建，且 kbars_cache.db、stock_cache.db、
+      # institutional_cache.json 等執行期產物直接落在主機專案目錄（同本機直跑）。
+      # 依賴安裝在 /opt/venv，不受此 mount 影響。
+      - ./:/app
+      # 憑證若放在專案外，可另外掛載（唯讀），並讓 .env 的 FUBON_CERT_PATH 指向它
+      # - /Users/yourname/Downloads/fubon_cert.pfx:/certs/fubon_cert.pfx:ro
+    restart: unless-stopped
+    stop_grace_period: 10s
