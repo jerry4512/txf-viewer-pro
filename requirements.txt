@@ -6,6 +6,7 @@ websockets
 certifi
 apscheduler
 anthropic
+pytest>=8,<9
 urllib3<2; python_version < "3.10" and sys_platform == "darwin"
 
 # 富邦新一代 API 是官方平台專用 binary，請執行：

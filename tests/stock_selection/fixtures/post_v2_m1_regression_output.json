@@ -1,0 +1,39 @@
+{
+  "implementation": "V2 Milestone 1 working tree",
+  "captured_at": "2026-08-10",
+  "production_as_of_2026_08_10": {
+    "strategy_valid": false,
+    "as_of_date": "2026-08-10",
+    "stock_kbar_date": "2026-07-31",
+    "market_data_date": "2026-08-10",
+    "data_errors": [
+      "個股日K最新日期 2026-07-31 ≠ as_of_date 2026-08-10"
+    ],
+    "summary": {
+      "total_analyzed": 0,
+      "buy_count": 0,
+      "high_priority_watch_count": 0,
+      "wait_pullback_count": 0,
+      "other_watch_count": 0,
+      "excluded_count": 0
+    }
+  },
+  "point_in_time_control_as_of_2026_07_31": {
+    "strategy_valid": true,
+    "market_regime": "bear_break60",
+    "summary": {
+      "total_analyzed": 922,
+      "buy_count": 0,
+      "high_priority_watch_count": 8,
+      "wait_pullback_count": 8,
+      "other_watch_count": 0,
+      "excluded_count": 906
+    },
+    "high_priority_watch_ids": [
+      "3362", "2542", "2615", "2027", "2610", "2881", "2006", "3441"
+    ],
+    "wait_pullback_ids": [
+      "2540", "2882", "5880", "2892", "2886", "2884", "2880", "2867"
+    ]
+  }
+}

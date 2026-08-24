@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TXF Pro Viewer</title>
-    <link rel="stylesheet" href="style.css?v=trend11">
+    <link rel="stylesheet" href="style.css?v=weekly-volume-filter-v16">
     <!-- TradingView Lightweight Charts v4.1.1 -->
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <script>
@@ -123,6 +123,17 @@
             display: none !important;
         }
 
+        /* 🔍 股票篩選模式：只保留頂部分類選單，內容區先全部留空 */
+        #app-container.market-stock-screener #contract-selector,
+        #app-container.market-stock-screener .global-controls,
+        #app-container.market-stock-screener .quote-row,
+        #app-container.market-stock-screener .grid-row,
+        #app-container.market-stock-screener #panes-container,
+        #app-container.market-stock-screener #stock-tabs-bar,
+        #app-container.market-stock-screener #stock-container-placeholder {
+            display: none !important;
+        }
+
         /* 🧑‍💻 自由人模式下：隱藏期貨相關控制項 */
         #app-container.market-freelancer #contract-selector,
         #app-container.market-freelancer .global-controls,
@@ -132,6 +143,354 @@
         #app-container.market-freelancer #stock-tabs-bar,
         #app-container.market-freelancer #stock-container-placeholder {
             display: none !important;
+        }
+
+        /* 🩺 交易醫生模式：獨立工作區，不顯示行情與其他分頁內容 */
+        #app-container.market-trading-doctor #contract-selector,
+        #app-container.market-trading-doctor .global-controls,
+        #app-container.market-trading-doctor .quote-row,
+        #app-container.market-trading-doctor .grid-row,
+        #app-container.market-trading-doctor #panes-container,
+        #app-container.market-trading-doctor #stock-tabs-bar,
+        #app-container.market-trading-doctor #stock-container-placeholder {
+            display: none !important;
+        }
+
+        .trading-doctor-shell {
+            width: min(1120px, calc(100% - 32px));
+            min-height: 360px;
+            margin: 0 auto;
+            padding: 28px;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            gap: 22px;
+            border: 1px solid #273142;
+            border-radius: 16px;
+            background:
+                radial-gradient(circle at 50% 0%, rgba(63, 166, 255, 0.10), transparent 48%),
+                linear-gradient(180deg, rgba(24, 29, 40, 0.98), rgba(14, 18, 26, 0.98));
+            box-shadow: 0 20px 55px rgba(0, 0, 0, 0.32);
+        }
+
+        .trading-doctor-icon {
+            width: 58px;
+            height: 58px;
+            flex: 0 0 58px;
+            display: grid;
+            place-items: center;
+            border: 1px solid rgba(75, 185, 255, 0.38);
+            border-radius: 17px;
+            background: rgba(35, 125, 194, 0.16);
+            color: #62c3ff;
+            font-size: 1.65rem;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+        }
+
+        .trading-doctor-heading {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .trading-doctor-query {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: end;
+            gap: 12px;
+            padding: 16px;
+            border: 1px solid #293449;
+            border-radius: 12px;
+            background: rgba(8, 12, 19, 0.62);
+        }
+
+        .trading-doctor-field {
+            min-width: 210px;
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+        }
+
+        .trading-doctor-field label {
+            color: #8d9ab0;
+            font-size: 0.76rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+        }
+
+        #trading-doctor-date,
+        .trading-doctor-contract-summary {
+            min-height: 42px;
+            padding: 8px 12px;
+            box-sizing: border-box;
+            border: 1px solid #354158;
+            border-radius: 8px;
+            outline: none;
+            background: #111722;
+            color: #f1f5fb;
+            color-scheme: dark;
+            font: inherit;
+        }
+
+        .trading-doctor-contract-summary {
+            display: flex;
+            align-items: center;
+            color: #cfe9ff;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        #trading-doctor-date:focus {
+            border-color: #4facfe;
+            box-shadow: 0 0 0 3px rgba(79, 172, 254, 0.12);
+        }
+
+        #trading-doctor-fetch-btn,
+        #trading-doctor-taifex-fetch-btn,
+        #trading-doctor-taifex-night-fetch-btn {
+            width: auto;
+            min-height: 42px;
+            margin: 0;
+            padding: 8px 18px;
+            border: 1px solid #348bd1;
+            border-radius: 8px;
+            background: linear-gradient(180deg, #2589d8, #1768a8);
+            color: #fff;
+            font-size: 0.86rem;
+            font-weight: 800;
+            cursor: pointer;
+        }
+
+        #trading-doctor-taifex-fetch-btn {
+            border-color: #447fbd;
+            background: linear-gradient(180deg, #356fae, #24527e);
+        }
+
+        #trading-doctor-taifex-night-fetch-btn {
+            border-color: #7b62c4;
+            background: linear-gradient(180deg, #6953aa, #49377e);
+        }
+
+        #trading-doctor-fetch-btn:disabled,
+        #trading-doctor-taifex-fetch-btn:disabled,
+        #trading-doctor-taifex-night-fetch-btn:disabled {
+            opacity: 0.58;
+            cursor: wait;
+        }
+
+        .trading-doctor-status {
+            min-height: 22px;
+            color: #7e8ba0;
+            font-size: 0.8rem;
+        }
+
+        .trading-doctor-status.is-loading { color: #62c3ff; }
+        .trading-doctor-status.is-success { color: #38d99b; }
+        .trading-doctor-status.is-error { color: #ff6961; }
+
+        .trading-doctor-result {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+
+        .trading-doctor-result-head {
+            display: flex;
+            align-items: end;
+            justify-content: space-between;
+            gap: 16px;
+        }
+
+        .trading-doctor-source-link {
+            color: #62c3ff;
+            font-size: 0.76rem;
+            text-decoration: none;
+        }
+
+        .trading-doctor-table-wrap {
+            overflow-x: auto;
+            border: 1px solid #2a3446;
+            border-radius: 10px;
+            background: #0b1018;
+        }
+
+        .trading-doctor-table {
+            width: 100%;
+            min-width: 720px;
+            border-collapse: collapse;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .trading-doctor-table th,
+        .trading-doctor-table td {
+            padding: 13px 16px;
+            border-bottom: 1px solid #202a39;
+            text-align: right;
+            white-space: nowrap;
+        }
+
+        .trading-doctor-table th {
+            background: #151c28;
+            color: #8f9bb0;
+            font-size: 0.76rem;
+            letter-spacing: 0.04em;
+        }
+
+        .trading-doctor-table th:first-child,
+        .trading-doctor-table td:first-child {
+            text-align: left;
+        }
+
+        .trading-doctor-table td {
+            color: #e7ebf2;
+            font-size: 0.84rem;
+        }
+
+        .trading-doctor-table.is-summary-table tr:last-child td {
+            border-bottom: 0;
+            background: rgba(79, 172, 254, 0.06);
+            font-weight: 800;
+        }
+
+        .trading-doctor-table.is-taifex-table {
+            min-width: 2150px;
+        }
+
+        .trading-doctor-table.is-taifex-table th:nth-child(-n+3),
+        .trading-doctor-table.is-taifex-table td:nth-child(-n+3) {
+            text-align: left;
+        }
+
+        .trading-doctor-table.is-taifex-night-table {
+            min-width: 1350px;
+        }
+
+        .trading-doctor-table.is-taifex-night-table th:nth-child(-n+3),
+        .trading-doctor-table.is-taifex-night-table td:nth-child(-n+3) {
+            text-align: left;
+        }
+
+        .trading-doctor-oi-summary {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            overflow: hidden;
+            border: 1px solid #d96c00;
+            border-radius: 10px;
+            background: #f58200;
+            box-shadow: 0 10px 28px rgba(245, 130, 0, 0.16);
+        }
+
+        .trading-doctor-oi-card {
+            min-width: 0;
+            padding: 14px 16px 16px;
+            border-right: 1px solid rgba(135, 65, 0, 0.32);
+            text-align: center;
+        }
+
+        .trading-doctor-oi-card:last-child {
+            border-right: 0;
+            background: #ed7900;
+        }
+
+        .trading-doctor-oi-label {
+            color: #fff;
+            font-size: 0.9rem;
+            font-weight: 900;
+            line-height: 1.3;
+            white-space: nowrap;
+        }
+
+        .trading-doctor-oi-value {
+            margin-top: 8px;
+            color: #fff;
+            font-size: clamp(1.18rem, 2vw, 1.72rem);
+            font-weight: 900;
+            line-height: 1;
+            letter-spacing: 0.02em;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .trading-doctor-oi-caption {
+            margin-top: 7px;
+            color: rgba(255, 255, 255, 0.78);
+            font-size: 0.66rem;
+            white-space: nowrap;
+        }
+
+        .trading-doctor-oi-history {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .trading-doctor-oi-history-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .trading-doctor-oi-history-count {
+            color: #7e8ba0;
+            font-size: 0.74rem;
+        }
+
+        .trading-doctor-table.is-oi-history {
+            min-width: 940px;
+        }
+
+        .trading-doctor-table.is-oi-history th,
+        .trading-doctor-table.is-oi-history td {
+            text-align: right;
+        }
+
+        .trading-doctor-table.is-oi-history th:first-child,
+        .trading-doctor-table.is-oi-history td:first-child {
+            text-align: left;
+        }
+
+        .trading-doctor-table.is-oi-history th:last-child,
+        .trading-doctor-table.is-oi-history td:last-child {
+            background: rgba(245, 130, 0, 0.08);
+            font-weight: 800;
+        }
+
+        .trading-doctor-oi-history-empty {
+            color: #6f7b8e !important;
+            text-align: center !important;
+        }
+
+        .trading-doctor-value-positive { color: #ff6159 !important; }
+        .trading-doctor-value-negative { color: #32c99a !important; }
+
+        .trading-doctor-notes {
+            margin: 0;
+            padding: 14px 18px 14px 36px;
+            border: 1px solid #242e3e;
+            border-radius: 10px;
+            background: rgba(7, 10, 16, 0.42);
+            color: #7f8a9c;
+            font-size: 0.73rem;
+            line-height: 1.75;
+        }
+
+        @media (max-width: 680px) {
+            .trading-doctor-shell {
+                width: 100%;
+                padding: 18px;
+            }
+            .trading-doctor-query,
+            .trading-doctor-result-head {
+                align-items: stretch;
+                flex-direction: column;
+            }
+            .trading-doctor-field { min-width: 0; }
+            #trading-doctor-fetch-btn,
+            #trading-doctor-taifex-fetch-btn,
+            #trading-doctor-taifex-night-fetch-btn { width: 100%; }
+            .trading-doctor-oi-summary { grid-template-columns: 1fr 1fr; }
+            .trading-doctor-oi-card:nth-child(2) { border-right: 0; }
+            .trading-doctor-oi-card:nth-child(-n+2) { border-bottom: 1px solid rgba(135, 65, 0, 0.32); }
         }
 
         /* 自由人容器共用樣式 */
@@ -1037,6 +1396,8 @@
                         <option value="stocks">📊 股票</option>
                         <option value="futures">📈 期貨</option>
                         <option value="freelancer">🧑‍💻 自由人</option>
+                        <option value="trading-doctor">🩺 交易醫生</option>
+                        <option value="stock-screener">🔍 股票篩選</option>
                         <option value="amplitude-statistics">📈 震幅統計</option>
                     </select>
                     <select id="contract-selector" style="background: #222; color: #fff; border: 1px solid #4facfe; font-size: 1.1rem; font-weight: bold; padding: 5px 12px; border-radius: 6px; cursor: pointer; outline: none; transition: all 0.3s;">
@@ -2219,6 +2580,116 @@
         </div>
 
         <!-- ================================================================
+             🔍 股票篩選：全市場週 K 技術條件
+             ================================================================ -->
+        <div id="stock-kd-screener-container" class="weekly-kd-screen" style="display:none;">
+            <div class="weekly-kd-shell">
+                <section class="weekly-kd-hero">
+                    <div>
+                        <h1 class="weekly-kd-title">🔍 週 K 技術條件篩選</h1>
+                        <div class="weekly-kd-subtitle">
+                            查詢台灣上市櫃 4 碼普通股，排除 KY 與 DR；可分別查詢 KD 低檔鈍化交叉或週 MACD 底背離。
+                        </div>
+                    </div>
+                    <button id="weekly-kd-run-btn" type="button">查詢 KD 低檔訊號</button>
+                </section>
+
+                <div class="weekly-screener-mode" role="group" aria-label="查詢選項">
+                    <button class="weekly-screener-mode-btn active" type="button" data-mode="kd" aria-pressed="true">
+                        KD 低檔鈍化＋交叉
+                    </button>
+                    <button class="weekly-screener-mode-btn" type="button" data-mode="macd" aria-pressed="false">
+                        週 K MACD 底背離
+                    </button>
+                </div>
+
+                <label class="weekly-volume-filter-toggle" for="weekly-volume-filter-checkbox">
+                    <input id="weekly-volume-filter-checkbox" type="checkbox">
+                    <span>
+                        <strong>成交量篩選</strong>
+                        只顯示 20 日平均成交量 &gt; 500 張
+                    </span>
+                </label>
+
+                <div id="weekly-kd-criteria" class="weekly-kd-criteria" aria-label="KD 篩選條件">
+                    <span class="weekly-kd-chip">9 週 RSV</span>
+                    <span class="weekly-kd-chip">K、D 各採 1/3 平滑</span>
+                    <span class="weekly-kd-chip">連續 3 週 K、D ≤ 20</span>
+                    <span class="weekly-kd-chip">最新週 K 由下向上穿越 D</span>
+                    <span class="weekly-kd-chip">不含 ETF、ETN、權證、KY、DR</span>
+                </div>
+
+                <div id="weekly-macd-criteria" class="weekly-kd-criteria" aria-label="MACD 篩選條件" style="display:none;">
+                    <span class="weekly-kd-chip">週 MACD（12、26、9）</span>
+                    <span class="weekly-kd-chip">OSC =（DIF − MACD）× 2</span>
+                    <span class="weekly-kd-chip">價格後低至少再低 1%</span>
+                    <span class="weekly-kd-chip">負值 OSC 低點反而抬高</span>
+                    <span class="weekly-kd-chip">最近低點在近 3 週內</span>
+                    <span class="weekly-kd-chip">不含 ETF、ETN、權證、KY、DR</span>
+                </div>
+
+                <div id="weekly-kd-status" class="weekly-kd-status" role="status">
+                    請選擇條件後開始查詢。
+                </div>
+
+                <div id="weekly-screener-warning" class="weekly-screener-warning" role="note" style="display:none;"></div>
+
+                <div id="weekly-kd-summary" class="weekly-kd-summary" style="display:none;">
+                    <div class="weekly-kd-stat">
+                        <div class="weekly-kd-stat-label">資料截止日</div>
+                        <div id="weekly-kd-as-of" class="weekly-kd-stat-value">--</div>
+                    </div>
+                    <div class="weekly-kd-stat">
+                        <div class="weekly-kd-stat-label">全市場普通股</div>
+                        <div id="weekly-kd-universe-count" class="weekly-kd-stat-value">--</div>
+                    </div>
+                    <div class="weekly-kd-stat">
+                        <div class="weekly-kd-stat-label">歷史足夠已分析</div>
+                        <div id="weekly-kd-analyzed-count" class="weekly-kd-stat-value">--</div>
+                    </div>
+                    <div class="weekly-kd-stat">
+                        <div class="weekly-kd-stat-label">歷史不足／過期</div>
+                        <div id="weekly-kd-skipped-count" class="weekly-kd-stat-value">--</div>
+                    </div>
+                    <div class="weekly-kd-stat">
+                        <div class="weekly-kd-stat-label">符合條件</div>
+                        <div id="weekly-kd-matched-count" class="weekly-kd-stat-value" style="color:#37d899;">--</div>
+                    </div>
+                </div>
+
+                <section class="weekly-kd-result-card">
+                    <div class="weekly-kd-result-head">
+                        <div id="weekly-kd-result-title" class="weekly-kd-result-title">篩選結果</div>
+                        <div class="weekly-kd-result-note">技術訊號僅供觀察，不代表買進建議</div>
+                    </div>
+                    <div class="weekly-kd-table-wrap">
+                        <table class="weekly-kd-table">
+                            <thead id="weekly-kd-results-head">
+                                <tr>
+                                    <th>#</th>
+                                    <th>代號</th>
+                                    <th>股名</th>
+                                    <th>產業</th>
+                                    <th>資料日</th>
+                                    <th>收盤</th>
+                                    <th>20 日均量</th>
+                                    <th>週漲跌</th>
+                                    <th>K</th>
+                                    <th>D</th>
+                                    <th>交叉</th>
+                                    <th>低檔週數</th>
+                                </tr>
+                            </thead>
+                            <tbody id="weekly-kd-results-body">
+                                <tr><td colspan="12" class="weekly-kd-empty">尚未執行篩選</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+        </div>
+
+        <!-- ================================================================
              🧑‍💻 自由人模式主容器
              三欄式版面：左側資料欄 | 中央主圖 | 右側輔助欄
              ================================================================ -->
@@ -2530,6 +3001,144 @@
 
         </div><!-- /#freelancer-container -->
 
+        <!-- ================================================================
+             🩺 交易醫生模式主容器
+             ================================================================ -->
+        <div id="trading-doctor-container" style="display:none; flex:1; min-height:0; overflow:auto; padding:16px; background:#0a0d13; color:#fff;">
+            <section class="trading-doctor-shell" aria-labelledby="trading-doctor-title">
+                <div class="trading-doctor-heading">
+                    <div class="trading-doctor-icon" aria-hidden="true">🩺</div>
+                    <div>
+                        <h1 id="trading-doctor-title" style="margin:0; color:#f2f6fc; font-size:1.55rem; letter-spacing:0.04em;">交易醫生</h1>
+                        <p style="margin:7px 0 0; color:#8995a8; font-size:0.86rem; line-height:1.6;">證交所現貨資金流＋期交所分契約三大法人部位</p>
+                    </div>
+                </div>
+
+                <div class="trading-doctor-query">
+                    <div class="trading-doctor-field">
+                        <label for="trading-doctor-date">查詢日期</label>
+                        <input id="trading-doctor-date" type="date">
+                    </div>
+                    <button id="trading-doctor-fetch-btn" type="button">查詢證交所資料</button>
+                    <div class="trading-doctor-field">
+                        <label>期貨商品</label>
+                        <div class="trading-doctor-contract-summary">台指期・小台・微型台指</div>
+                    </div>
+                    <button id="trading-doctor-taifex-fetch-btn" type="button">查詢三項期貨資料</button>
+                    <button id="trading-doctor-taifex-night-fetch-btn" type="button">查詢三項夜盤資料</button>
+                </div>
+
+                <div id="trading-doctor-status" class="trading-doctor-status" role="status">證交所：請選擇日期後查詢。</div>
+
+                <div id="trading-doctor-result" class="trading-doctor-result" style="display:none;">
+                    <div class="trading-doctor-result-head">
+                        <div>
+                            <h2 id="trading-doctor-result-title" style="margin:0; color:#edf2f8; font-size:1.05rem;"></h2>
+                            <div id="trading-doctor-result-hint" style="margin-top:6px; color:#768397; font-size:0.76rem;"></div>
+                        </div>
+                        <a id="trading-doctor-source-link" class="trading-doctor-source-link" href="#" target="_blank" rel="noopener noreferrer">開啟證交所原始資料 ↗</a>
+                    </div>
+
+                    <div class="trading-doctor-table-wrap">
+                        <table class="trading-doctor-table is-summary-table">
+                            <thead id="trading-doctor-table-head"></thead>
+                            <tbody id="trading-doctor-table-body"></tbody>
+                        </table>
+                    </div>
+
+                    <ol id="trading-doctor-notes" class="trading-doctor-notes"></ol>
+                </div>
+
+                <div id="trading-doctor-taifex-status" class="trading-doctor-status" role="status">期交所：請選擇日期後查詢台指期、小台與微型台指。</div>
+                <div id="trading-doctor-taifex-night-status" class="trading-doctor-status" role="status">期交所夜盤：請選擇日期後查詢。</div>
+
+                <section class="trading-doctor-oi-history" aria-labelledby="trading-doctor-oi-history-title">
+                    <div class="trading-doctor-oi-history-head">
+                        <h2 id="trading-doctor-oi-history-title" style="margin:0; color:#edf2f8; font-size:1.05rem;">外資未平倉淨額近 14 日紀錄</h2>
+                        <span id="trading-doctor-oi-history-count" class="trading-doctor-oi-history-count">讀取中…</span>
+                    </div>
+                    <div class="trading-doctor-table-wrap">
+                        <table class="trading-doctor-table is-oi-history">
+                            <thead>
+                                <tr>
+                                    <th>日期</th>
+                                    <th>大台全日買賣超</th>
+                                    <th>小台全日買賣超</th>
+                                    <th>微台全日買賣超</th>
+                                    <th>官方約當淨 OI</th>
+                                    <th>純日盤變化量</th>
+                                </tr>
+                            </thead>
+                            <tbody id="trading-doctor-oi-history-body">
+                                <tr><td class="trading-doctor-oi-history-empty" colspan="6">尚無紀錄</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <div id="trading-doctor-taifex-result" class="trading-doctor-result" style="display:none;">
+                    <div class="trading-doctor-result-head">
+                        <div>
+                            <h2 id="trading-doctor-taifex-result-title" style="margin:0; color:#edf2f8; font-size:1.05rem;"></h2>
+                            <div id="trading-doctor-taifex-result-hint" style="margin-top:6px; color:#768397; font-size:0.76rem;"></div>
+                        </div>
+                        <a id="trading-doctor-taifex-source-link" class="trading-doctor-source-link" href="#" target="_blank" rel="noopener noreferrer">開啟期交所原始資料 ↗</a>
+                    </div>
+
+                    <div id="trading-doctor-oi-summary" class="trading-doctor-oi-summary" aria-label="外資未平倉淨額摘要">
+                        <div class="trading-doctor-oi-card">
+                            <div class="trading-doctor-oi-label">大台全日買賣超</div>
+                            <div id="trading-doctor-txf-net-oi" class="trading-doctor-oi-value">--</div>
+                            <div class="trading-doctor-oi-caption">外資未平倉多空淨額・口</div>
+                        </div>
+                        <div class="trading-doctor-oi-card">
+                            <div class="trading-doctor-oi-label">小台全日買賣超</div>
+                            <div id="trading-doctor-mxf-net-oi" class="trading-doctor-oi-value">--</div>
+                            <div class="trading-doctor-oi-caption">外資未平倉多空淨額・口</div>
+                        </div>
+                        <div class="trading-doctor-oi-card">
+                            <div class="trading-doctor-oi-label">微台全日買賣超</div>
+                            <div id="trading-doctor-tmf-net-oi" class="trading-doctor-oi-value">--</div>
+                            <div class="trading-doctor-oi-caption">外資未平倉多空淨額・口</div>
+                        </div>
+                        <div class="trading-doctor-oi-card">
+                            <div class="trading-doctor-oi-label">今日官方約當淨 OI</div>
+                            <div id="trading-doctor-equivalent-net-oi" class="trading-doctor-oi-value">--</div>
+                            <div class="trading-doctor-oi-caption">大台＋小台÷4＋微台÷20</div>
+                        </div>
+                    </div>
+
+                    <div class="trading-doctor-table-wrap">
+                        <table class="trading-doctor-table is-taifex-table">
+                            <thead id="trading-doctor-taifex-table-head"></thead>
+                            <tbody id="trading-doctor-taifex-table-body"></tbody>
+                        </table>
+                    </div>
+
+                    <ol id="trading-doctor-taifex-notes" class="trading-doctor-notes"></ol>
+                </div>
+
+                <div id="trading-doctor-taifex-night-result" class="trading-doctor-result" style="display:none;">
+                    <div class="trading-doctor-result-head">
+                        <div>
+                            <h2 id="trading-doctor-taifex-night-result-title" style="margin:0; color:#edf2f8; font-size:1.05rem;"></h2>
+                            <div id="trading-doctor-taifex-night-result-hint" style="margin-top:6px; color:#768397; font-size:0.76rem;"></div>
+                        </div>
+                        <a id="trading-doctor-taifex-night-source-link" class="trading-doctor-source-link" href="#" target="_blank" rel="noopener noreferrer">開啟期交所夜盤原始資料 ↗</a>
+                    </div>
+
+                    <div class="trading-doctor-table-wrap">
+                        <table class="trading-doctor-table is-taifex-night-table">
+                            <thead id="trading-doctor-taifex-night-table-head"></thead>
+                            <tbody id="trading-doctor-taifex-night-table-body"></tbody>
+                        </table>
+                    </div>
+
+                    <ol id="trading-doctor-taifex-night-notes" class="trading-doctor-notes"></ol>
+                </div>
+            </section>
+        </div><!-- /#trading-doctor-container -->
+
         <!-- 震幅統計分頁 (預設隱藏) -->
         <div id="amplitude-statistics-container" style="display:none; flex:1; flex-direction:column; background:#0a0a0a; overflow:hidden; padding:12px; min-height:0; color:#fff; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft JhengHei', 'PingFang TC', 'Noto Sans TC', sans-serif;">
 
@@ -2694,7 +3303,7 @@
     <div id="drawer-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998;" onclick="closeStockDrawer()"></div>
 
     <!-- 載入主程式 (加入版本號避免快取問題) -->
-    <script src="app_pro.js?v=txf-contract-layout-v52"></script>
+    <script src="app_pro.js?v=weekly-volume-filter-v66"></script>
 </body>
 </html>
 

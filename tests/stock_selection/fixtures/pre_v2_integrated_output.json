@@ -1,0 +1,46 @@
+{
+  "baseline_commit": "55036b328d84fb61ea62196764956d5f541f41cc",
+  "captured_at": "2026-08-10",
+  "purpose": "Normalized regression snapshot of the pre-V2 integrated API output",
+  "data_date": "2026-07-31",
+  "requested_effective_date": "2026-08-10",
+  "market_data_date": "2026-08-10",
+  "institution_data_date": "2026-08-06",
+  "data_validation": {
+    "critical_ok": false,
+    "warnings": ["法人資料日 2026-08-06 ≠ 選股基準日 2026-07-31"],
+    "errors": ["大盤資料日期 2026-08-10 ≠ 選股資料日期 2026-07-31"]
+  },
+  "summary": {
+    "total_analyzed": 922,
+    "buy_count": 10,
+    "high_priority_watch_count": 6,
+    "wait_pullback_count": 8,
+    "other_watch_count": 24,
+    "excluded_count": 874
+  },
+  "buy_candidates": [
+    {"stock_id": "2542", "stock_name": "興富發", "final_score": 66, "risk_reward": 2.07},
+    {"stock_id": "2882", "stock_name": "國泰金", "final_score": 62, "risk_reward": 1.78},
+    {"stock_id": "2610", "stock_name": "華航", "final_score": 62, "risk_reward": 2.04},
+    {"stock_id": "5880", "stock_name": "合庫金", "final_score": 56, "risk_reward": null},
+    {"stock_id": "2006", "stock_name": "東和鋼鐵", "final_score": 52, "risk_reward": null},
+    {"stock_id": "2884", "stock_name": "玉山金", "final_score": 51, "risk_reward": null},
+    {"stock_id": "2867", "stock_name": "三商壽", "final_score": 46, "risk_reward": null},
+    {"stock_id": "2892", "stock_name": "第一金", "final_score": 46, "risk_reward": null},
+    {"stock_id": "2886", "stock_name": "兆豐金", "final_score": 46, "risk_reward": null},
+    {"stock_id": "2540", "stock_name": "愛山林", "final_score": 42, "risk_reward": null}
+  ],
+  "high_priority_watch_ids": ["3362", "2615", "2027", "2881", "2480", "4976"],
+  "wait_pullback_ids": ["2883", "2885", "3029", "2357", "3231", "2347", "2059", "2330"],
+  "other_watch_ids": [
+    "2646", "2633", "2618", "6277", "2889", "2880", "3441", "2890",
+    "3005", "2887", "6214", "5876", "5490", "2425", "4904", "2891",
+    "1101", "1402", "5434", "2377", "1303", "4536", "2101", "2527"
+  ],
+  "known_pre_v2_behavior": [
+    "The API emitted candidates even though critical_ok was false.",
+    "Seven of ten buy candidates had risk_reward=null.",
+    "Institutional rows after the stock data date could affect scores."
+  ]
+}

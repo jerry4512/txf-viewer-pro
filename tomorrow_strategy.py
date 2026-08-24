@@ -18,9 +18,13 @@ tomorrow_strategy.py
 import os
 import sqlite3
 import pandas as pd
-from datetime import datetime
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple
 from market_status import TAIEX_SYMBOL
+from stock_selection_schema import (
+    classification_from_master,
+    ensure_stock_selection_schema,
+    load_security_master,
+)
 
 # ── 路徑 ──────────────────────────────────────────────────────────────────────
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -60,6 +64,7 @@ REGIME_HEALTHY_PB   = "healthy_pullback"
 REGIME_OVERHEATED   = "high_overheated"
 REGIME_WEAK_BOUNCE  = "weak_bounce"
 REGIME_BEAR_BREAK60 = "bear_break60"
+REGIME_DATA_INVALID = "data_invalid"
 
 _REGIME_META = {
     REGIME_STRONG_BULL:  ("強多延伸",  "#26de81"),
@@ -67,6 +72,7 @@ _REGIME_META = {
     REGIME_OVERHEATED:   ("高檔過熱",  "#ff9f43"),
     REGIME_WEAK_BOUNCE:  ("弱勢反彈",  "#ffd233"),
     REGIME_BEAR_BREAK60: ("空頭破60",  "#ff4444"),
+    REGIME_DATA_INVALID: ("資料無效",   "#ff4444"),
 }
 
 _REGIME_STRATEGY = {
@@ -100,6 +106,12 @@ _REGIME_STRATEGY = {
         "forbidden": "大多數股票",
         "position":  "空倉",
     },
+    REGIME_DATA_INVALID: {
+        "strategy":  "資料日期或必要資料不一致，停止產生選股訊號",
+        "can_buy":   "無",
+        "forbidden": "所有新進場與 Telegram 精選",
+        "position":  "不產生訊號",
+    },
 }
 
 
@@ -111,12 +123,18 @@ def _get_conn():
         conn.execute("PRAGMA journal_mode=WAL;")
     except Exception:
         pass
+    ensure_stock_selection_schema(conn)
     return conn
 
 
 # ── 商品類型分類 ──────────────────────────────────────────────────────────────
 
-def classify_instrument(symbol: str, name: str, industry: str) -> Tuple[str, bool]:
+def classify_instrument(
+    symbol: str,
+    name: str,
+    industry: str,
+    security_record: Optional[Mapping] = None,
+) -> Tuple[str, bool]:
     """
     判斷商品類型與是否為 KY 股。
     Returns (instrument_type, is_ky)
@@ -124,46 +142,9 @@ def classify_instrument(symbol: str, name: str, industry: str) -> Tuple[str, boo
     instrument_type:
         common_stock | etf | reverse_etf | leveraged_etf | etn | warrant | preferred_stock | other
     """
-    sym = str(symbol   or "").strip()
-    nm  = str(name     or "").strip()
-    ind = str(industry or "").strip()
-
-    is_ky     = "KY" in nm
-    nm_upper  = nm.upper()
-    ind_upper = ind.upper()
-
-    # ETN
-    if "ETN" in nm_upper or "ETN" in ind_upper:
-        return "etn", is_ky
-
-    # 權證：名稱包含購 / 售 / 權證
-    if any(kw in nm for kw in ["購", "售", "權證"]):
-        return "warrant", is_ky
-
-    # 特別股：名稱以甲特/乙特/丙特結尾，或含「特別股」，或最後一字是「特」
-    if (nm.endswith("甲特") or nm.endswith("乙特") or nm.endswith("丙特")
-            or "特別股" in nm
-            or (len(nm) >= 2
-                and nm[-1] == "特"
-                and not nm.endswith("特化")
-                and not nm.endswith("特材"))):
-        return "preferred_stock", is_ky
-
-    # ETF 判斷：代號以「00」開頭且長度 ≤ 7，或名稱/產業含「ETF」
-    is_etf_by_sym  = sym.startswith("00") and len(sym) <= 7
-    is_etf_by_name = "ETF" in nm_upper or "ETF" in ind_upper
-
-    if is_etf_by_sym or is_etf_by_name:
-        # 反向 ETF：名稱含反向關鍵字，或代號以 R 結尾
-        if (any(kw in nm for kw in ["反向", "反1", "放空", "空方"])
-                or sym.upper().endswith("R")):
-            return "reverse_etf", is_ky
-        # 槓桿 ETF：名稱含正向放大相關關鍵字
-        if any(kw in nm for kw in ["正2", "2倍", "槓桿", "2X", "正向2", "兩倍"]):
-            return "leveraged_etf", is_ky
-        return "etf", is_ky
-
-    return "common_stock", is_ky
+    return classification_from_master(
+        security_record, symbol=symbol, name=name, industry=industry
+    )
 
 
 # ── 技術指標工具 ──────────────────────────────────────────────────────────────
@@ -184,6 +165,129 @@ def _compute_macd(closes: pd.Series):
     dea   = dif.ewm(span=9, adjust=False).mean()
     hist  = dif - dea
     return dif, dea, hist
+
+
+def _classify_grade(
+    close: float,
+    cost20: float,
+    cost60: float,
+    cost20_slope: float,
+    down_vol: bool,
+    macd_neg_expanding: bool,
+) -> Tuple[str, str, str]:
+    """Existing A/B1/B2/C definition, extracted for regression testing."""
+    above_c20 = close > cost20
+    above_c60 = close > cost60
+    is_b2 = (
+        above_c60
+        and not above_c20
+        and cost20_slope < 0
+        and (down_vol or macd_neg_expanding)
+    )
+    if above_c20 and above_c60 and cost20 > cost60:
+        return "A", "A級強勢股", "#26de81"
+    if is_b2:
+        return "B2", "B2弱反彈", "#ff9f43"
+    if above_c60:
+        return "B1", "B1守60整理", "#4facfe"
+    return "C", "C級跌破60", "#ff4444"
+
+
+def _classify_liquidity(volume_ma20: float, amount_ma20: float) -> str:
+    """Preserved Milestone-1 liquidity thresholds."""
+    if volume_ma20 >= _LIQ_HIGH_VOL and amount_ma20 >= _LIQ_HIGH_AMOUNT:
+        return "high"
+    if volume_ma20 >= _LIQ_NORM_VOL and amount_ma20 >= _LIQ_NORM_AMOUNT:
+        return "normal"
+    if volume_ma20 < _LIQ_NORM_VOL and amount_ma20 >= _LIQ_NORM_AMOUNT:
+        return "low_amount_pass"
+    return "low"
+
+
+def _calculate_rr_metrics(
+    signal_entry: float,
+    stop_price: float,
+    previous_60d_high: Optional[float],
+    current_60d_high: Optional[float],
+) -> dict:
+    """Calculate point-in-time-safe RR using only the prior 60-day high."""
+    target = float(previous_60d_high) if previous_60d_high is not None else None
+    current_high = float(current_60d_high) if current_60d_high is not None else None
+    risk = signal_entry - stop_price
+
+    if target is None or pd.isna(target) or target <= 0:
+        target_status = "target_unavailable"
+        rr = None
+    elif signal_entry >= target:
+        target_status = "breakout_no_defined_target"
+        rr = None
+    elif risk <= 0 or pd.isna(risk):
+        target_status = "invalid_risk"
+        rr = None
+    else:
+        reward = target - signal_entry
+        if reward <= 0 or pd.isna(reward):
+            target_status = "invalid_reward"
+            rr = None
+        else:
+            target_status = "defined"
+            rr = round(reward / risk, 2)
+
+    rr_valid = rr is not None
+    rr_buyable = bool(rr_valid and rr >= _RR_THRESHOLD)
+    max_entry_rr15 = (
+        round((target + _RR_THRESHOLD * stop_price) / (1.0 + _RR_THRESHOLD), 2)
+        if target_status == "defined" else None
+    )
+    return {
+        "signal_entry": round(signal_entry, 2),
+        "signal_close": round(signal_entry, 2),
+        "stop_price": round(stop_price, 2),
+        "target_price": round(target, 2) if target is not None and not pd.isna(target) else None,
+        "previous_60d_high": round(target, 2) if target is not None and not pd.isna(target) else None,
+        "current_60d_high": round(current_high, 2) if current_high is not None and not pd.isna(current_high) else None,
+        "target_status": target_status,
+        "risk_reward": rr,
+        "signal_rr": rr,
+        "rr_valid": rr_valid,
+        "rr_buyable": rr_buyable,
+        "max_entry_rr15": max_entry_rr15,
+        "actual_entry": None,
+        "skip_trade": None,
+    }
+
+
+def evaluate_actual_entry(actual_entry: Optional[float], max_entry_rr15: Optional[float]) -> Optional[bool]:
+    """Return whether an observed next-day entry must be skipped."""
+    if actual_entry is None:
+        return None
+    if max_entry_rr15 is None:
+        return True
+    return float(actual_entry) > float(max_entry_rr15)
+
+
+def _liquidity_rank_maps(df_all: pd.DataFrame) -> Tuple[dict, dict]:
+    """Cross-sectional percentile ranks for shadow-only liquidity metrics."""
+    values = []
+    for code, grp in df_all.groupby("code"):
+        grp = grp.sort_values("date")
+        if len(grp) < 20:
+            continue
+        close = grp["close"].astype(float)
+        volume = grp["volume"].astype(float)
+        amount20 = float((close * volume * 1000).rolling(20).mean().iloc[-1])
+        volume20 = float(volume.rolling(20).mean().iloc[-1])
+        if not pd.isna(amount20) and not pd.isna(volume20):
+            values.append((str(code), amount20, volume20))
+    if not values:
+        return {}, {}
+    frame = pd.DataFrame(values, columns=["code", "amount", "volume"])
+    frame["amount_rank"] = frame["amount"].rank(pct=True, method="average") * 100
+    frame["volume_rank"] = frame["volume"].rank(pct=True, method="average") * 100
+    return (
+        {row.code: round(float(row.amount_rank), 2) for row in frame.itertuples()},
+        {row.code: round(float(row.volume_rank), 2) for row in frame.itertuples()},
+    )
 
 
 def _macd_status(hist: pd.Series) -> str:
@@ -208,16 +312,17 @@ def _macd_status(hist: pd.Series) -> str:
 
 # ── 大盤狀態判斷 ──────────────────────────────────────────────────────────────
 
-def calculate_market_regime(taiex_df: Optional[pd.DataFrame], data_date: Optional[str] = None) -> dict:
+def calculate_market_regime(taiex_df: Optional[pd.DataFrame], as_of_date: Optional[str] = None) -> dict:
     """
     從加權指數日 K DataFrame 判斷大盤五狀態。
     taiex_df：columns = date, open, high, low, close, volume
-    data_date：若傳入，則過濾至該日期並驗證最後一筆必須等於 data_date。
+    as_of_date：若傳入，則過濾至該日期並驗證最後一筆必須等於 as_of_date。
     """
 
     def _build(status: str, basis: str, metrics: dict) -> dict:
         label, color = _REGIME_META[status]
         strat = _REGIME_STRATEGY[status]
+        strategy_valid = status != REGIME_DATA_INVALID and metrics.get("data_available", True)
         return {
             "status":    status,
             "label":     label,
@@ -228,37 +333,38 @@ def calculate_market_regime(taiex_df: Optional[pd.DataFrame], data_date: Optiona
             "position":  strat["position"],
             "basis":     basis,
             "metrics":   metrics,
+            "strategy_valid": strategy_valid,
         }
 
-    _no_data = {"data_available": False}
+    def _invalid(basis: str, **metrics) -> dict:
+        return _build(
+            REGIME_DATA_INVALID,
+            basis,
+            {"data_available": False, "regime_error": True, **metrics},
+        )
 
     if taiex_df is None or len(taiex_df) < _MIN_BARS:
         n = len(taiex_df) if taiex_df is not None else 0
-        return _build(
-            REGIME_HEALTHY_PB,
-            f"大盤 K 線不足（{n} 根），使用預設健康回測狀態",
-            _no_data,
-        )
+        return _invalid(f"大盤 K 線不足（{n} 根），策略停止", bars=n)
 
     df = taiex_df.copy().sort_values("date").reset_index(drop=True)
 
-    # data_date 驗證：過濾到指定日期，並確認最後一筆 == data_date
-    if data_date is not None:
-        df = df[df["date"] <= data_date].reset_index(drop=True)
+    # as_of_date 驗證：過濾到指定日期，並確認最後一筆 == as_of_date
+    if as_of_date is not None:
+        df = df[df["date"] <= as_of_date].reset_index(drop=True)
         actual_last = str(df.iloc[-1]["date"]) if not df.empty else "無資料"
-        if actual_last != data_date:
-            print(f"[大盤計算] market_data_date={actual_last} ≠ data_date={data_date}，拒絕使用舊大盤狀態")
-            return _build(
-                REGIME_HEALTHY_PB,
-                f"大盤資料日期 {actual_last} ≠ 要求日期 {data_date}，拒絕使用舊大盤狀態",
-                {"data_available": False, "regime_error": True,
-                 "actual_data_date": actual_last, "expected_data_date": data_date},
+        if actual_last != as_of_date:
+            print(f"[大盤計算] market_data_date={actual_last} ≠ as_of_date={as_of_date}，拒絕使用舊大盤狀態")
+            return _invalid(
+                f"大盤資料日期 {actual_last} ≠ 要求日期 {as_of_date}，拒絕使用舊大盤狀態",
+                actual_data_date=actual_last,
+                expected_data_date=as_of_date,
             )
         if len(df) < _MIN_BARS:
-            return _build(
-                REGIME_HEALTHY_PB,
-                f"過濾至 data_date={data_date} 後 K 線不足（{len(df)} 根），使用預設狀態",
-                _no_data,
+            return _invalid(
+                f"過濾至 as_of_date={as_of_date} 後 K 線不足（{len(df)} 根），策略停止",
+                bars=len(df), actual_data_date=actual_last,
+                expected_data_date=as_of_date,
             )
 
     closes  = df["close"].astype(float)
@@ -274,7 +380,7 @@ def calculate_market_regime(taiex_df: Optional[pd.DataFrame], data_date: Optiona
     c60 = float(cost60_s.iloc[-1])
 
     if pd.isna(c20) or pd.isna(c60) or c20 <= 0 or c60 <= 0:
-        return _build(REGIME_HEALTHY_PB, "成本線計算失敗，使用預設狀態", _no_data)
+        return _invalid("大盤成本線計算失敗，策略停止")
 
     # MACD
     try:
@@ -283,6 +389,8 @@ def calculate_market_regime(taiex_df: Optional[pd.DataFrame], data_date: Optiona
     except Exception:
         hist_s  = pd.Series(dtype=float)
         macd_ok = False
+    if not macd_ok:
+        return _invalid("大盤 MACD 計算失敗，策略停止")
 
     close    = float(closes.iloc[-1])
     open_    = float(opens.iloc[-1])
@@ -454,8 +562,11 @@ def _analyze_stock(code: str, name: str, industry: str, sub_df: pd.DataFrame) ->
     vol_now  = float(volumes.iloc[-1])
     vol_ma20 = float(volumes.rolling(20).mean().iloc[-1]) if len(volumes) >= 20 else vol_now
 
-    # 成交金額估算（volume 單位：張；1 張 = 1000 股）
-    amount_ma20 = close * vol_ma20 * 1000
+    # 每日成交額後再取平均（volume 單位：張；1 張 = 1000 股）。
+    daily_amount = closes * volumes * 1000
+    amount_ma5 = float(daily_amount.rolling(5).mean().iloc[-1])
+    amount_ma20 = float(daily_amount.rolling(20).mean().iloc[-1])
+    liquidity_trend = amount_ma5 / amount_ma20 if amount_ma20 > 0 else None
 
     # cost20 五日斜率
     cost20_slope = (
@@ -499,50 +610,40 @@ def _analyze_stock(code: str, name: str, industry: str, sub_df: pd.DataFrame) ->
     else:
         volume_status = "量平"
 
-    # 近 60 日最高（壓力基礎）
-    high60           = float(highs.rolling(60).max().iloc[-1])
-    is_near_60d_high = close >= high60 * 0.98
-    is_new_60d_high  = close >= high60
-    resistance_status = "接近60日高點，壓力未知" if is_near_60d_high else "正常"
+    # current high 只供顯示；RR/near-high 使用訊號日前 previous 60d high。
+    current_60d_high = float(highs.rolling(60).max().iloc[-1])
+    previous_60d_high_raw = highs.shift(1).rolling(60).max().iloc[-1]
+    previous_60d_high = (
+        float(previous_60d_high_raw) if not pd.isna(previous_60d_high_raw) else None
+    )
+    is_near_60d_high = bool(
+        previous_60d_high is not None and close >= previous_60d_high * 0.98
+    )
+    is_new_60d_high = bool(
+        previous_60d_high is not None and close >= previous_60d_high
+    )
 
     # 停損 = 近 3 日最低
     recent_lows = lows.iloc[-3:]
     stop_price  = float(recent_lows.min()) if len(recent_lows) >= 3 else low_val
 
-    # 風報比（接近60日高點時標記為無效）
-    if is_near_60d_high:
-        risk_reward = None
-        rr_valid    = False
+    rr_metrics = _calculate_rr_metrics(
+        signal_entry=close,
+        stop_price=stop_price,
+        previous_60d_high=previous_60d_high,
+        current_60d_high=current_60d_high,
+    )
+    if rr_metrics["target_status"] == "breakout_no_defined_target":
+        resistance_status = "突破前60日高點，尚無已定義目標"
+    elif is_near_60d_high:
+        resistance_status = "接近前60日高點，壓力區"
     else:
-        risk   = close - stop_price
-        reward = high60 - close
-        if risk <= 0 or pd.isna(risk):
-            risk_reward = None
-            rr_valid    = False
-        else:
-            risk_reward = round(reward / risk, 2)
-            rr_valid    = True
+        resistance_status = "正常"
 
     # ── 個股分級 ────────────────────────────────────────────────────────
-    above_c20     = close > c20
-    above_c60     = close > c60
-    c20_above_c60 = c20 > c60
-
-    is_b2 = (
-        above_c60
-        and not above_c20
-        and cost20_slope < 0
-        and (down_vol or macd_neg_expand)
+    grade, grade_label, grade_color = _classify_grade(
+        close, c20, c60, cost20_slope, down_vol, macd_neg_expand
     )
-
-    if above_c20 and above_c60 and c20_above_c60:
-        grade = "A";  grade_label = "A級強勢股"; grade_color = "#26de81"
-    elif is_b2:
-        grade = "B2"; grade_label = "B2弱反彈";  grade_color = "#ff9f43"
-    elif above_c60:
-        grade = "B1"; grade_label = "B1守60整理"; grade_color = "#4facfe"
-    else:
-        grade = "C";  grade_label = "C級跌破60"; grade_color = "#ff4444"
 
     return {
         "symbol":                 code,
@@ -570,15 +671,28 @@ def _analyze_stock(code: str, name: str, industry: str, sub_df: pd.DataFrame) ->
         "down_vol":               down_vol,
         "high_vol_upper_shadow":  high_vol_upper_shad,
         "volume_ma20":            round(vol_ma20, 1),
+        "amount_ma5":             round(amount_ma5, 0),
         "amount_ma20":            round(amount_ma20, 0),
+        "liquidity_trend":         round(liquidity_trend, 4) if liquidity_trend is not None else None,
         "volume_unit_assumption": "lot",
-        "stop_price":             round(stop_price, 2),
-        "resistance_price":       round(high60, 2),
+        "stop_price":             rr_metrics["stop_price"],
+        "resistance_price":       rr_metrics["target_price"],
+        "target_price":           rr_metrics["target_price"],
+        "previous_60d_high":      rr_metrics["previous_60d_high"],
+        "current_60d_high":       rr_metrics["current_60d_high"],
+        "target_status":          rr_metrics["target_status"],
         "resistance_status":      resistance_status,
         "is_near_60d_high":       is_near_60d_high,
         "is_new_60d_high":        is_new_60d_high,
-        "risk_reward":            risk_reward,
-        "rr_valid":               rr_valid,
+        "risk_reward":            rr_metrics["risk_reward"],
+        "signal_rr":              rr_metrics["signal_rr"],
+        "rr_valid":               rr_metrics["rr_valid"],
+        "rr_buyable":             rr_metrics["rr_buyable"],
+        "signal_entry":           rr_metrics["signal_entry"],
+        "signal_close":           rr_metrics["signal_close"],
+        "max_entry_rr15":         rr_metrics["max_entry_rr15"],
+        "actual_entry":           rr_metrics["actual_entry"],
+        "skip_trade":             rr_metrics["skip_trade"],
         "today_is_red_up":        today_is_red_up,
         "today_above_prev_high":  today_above_prev_high,
         "cost20_bounce":          cost20_bounce,
@@ -722,15 +836,9 @@ def _classify_candidate(s: dict, regime: dict):
     near_cost20   = abs(s["dist_cost20_pct"]) <= _DIST_MAX_BUY
     very_near_20  = abs(s["dist_cost20_pct"]) <= _DIST_MAX_BUY_SB
     macd_ok       = s["macd_neg_converging"] or s["macd_pos_expanding"]
-    rr_ok         = (
-        not s["rr_valid"]
-        or (s["risk_reward"] is not None and s["risk_reward"] >= _RR_THRESHOLD)
-    )
-    sb_rr_ok      = (
-        s["rr_valid"]
-        and s["risk_reward"] is not None
-        and s["risk_reward"] >= _RR_THRESHOLD
-    )
+    # Milestone 1 correctness gate: RR=None/invalid can never enter buy.
+    rr_ok = bool(s.get("rr_buyable", False))
+    sb_rr_ok = rr_ok
 
     can_buy    = False
     buy_method = ""
@@ -827,8 +935,13 @@ def _classify_candidate(s: dict, regime: dict):
                 f"MACD尚未收斂（目前{s['macd_status']}），"
                 f"等待轉為負柱收斂或正柱放大"
             )
-        elif not rr_ok and s["risk_reward"] is not None:
-            watch_cond = f"風報比不足（{s['risk_reward']:.2f}），等待回檔改善"
+        elif not rr_ok:
+            if s["risk_reward"] is not None:
+                watch_cond = f"風報比不足（{s['risk_reward']:.2f}），等待回檔改善"
+            elif s.get("target_status") == "breakout_no_defined_target":
+                watch_cond = "已突破前60日高點，尚無已定義目標，不能以無效RR進入可買"
+            else:
+                watch_cond = "風報比無效或目標無法合理定義，不能進入可買"
         elif hard_excl:
             watch_cond = f"暫時觀察：{excl[0]}"
         else:
@@ -875,11 +988,27 @@ def _build_excluded_entry(stock_info: dict, exclude_reasons: list) -> dict:
         "macd_status":      stock_info.get("macd_status", ""),
         "volume_status":    stock_info.get("volume_status", ""),
         "volume_ma20":      stock_info.get("volume_ma20"),
+        "amount_ma5":       stock_info.get("amount_ma5"),
         "amount_ma20":      stock_info.get("amount_ma20"),
+        "liquidity_trend":   stock_info.get("liquidity_trend"),
+        "amount_rank":       stock_info.get("amount_rank"),
+        "volume_rank":       stock_info.get("volume_rank"),
         "stop_price":       stock_info.get("stop_price"),
         "resistance_price": stock_info.get("resistance_price"),
+        "target_price":      stock_info.get("target_price"),
+        "previous_60d_high": stock_info.get("previous_60d_high"),
+        "current_60d_high":  stock_info.get("current_60d_high"),
+        "target_status":     stock_info.get("target_status"),
         "resistance_status":stock_info.get("resistance_status", ""),
         "risk_reward":      stock_info.get("risk_reward"),
+        "signal_rr":        stock_info.get("signal_rr"),
+        "rr_valid":         stock_info.get("rr_valid", False),
+        "rr_buyable":       stock_info.get("rr_buyable", False),
+        "signal_entry":     stock_info.get("signal_entry"),
+        "signal_close":     stock_info.get("signal_close"),
+        "max_entry_rr15":   stock_info.get("max_entry_rr15"),
+        "actual_entry":     stock_info.get("actual_entry"),
+        "skip_trade":       stock_info.get("skip_trade"),
         "exclude_reasons":  exclude_reasons,
     }
 
@@ -892,7 +1021,42 @@ _GRADE_SORT = {"A": 0, "B1": 1, "B2": 2, "C": 3}
 
 # ── 主函式 ────────────────────────────────────────────────────────────────────
 
-def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
+def _invalid_strategy_result(
+    as_of_date: str,
+    market_regime: dict,
+    errors: list[str],
+    stock_kbar_date: str = "",
+) -> dict:
+    """Fail-closed result: never emits a candidate or Telegram-eligible row."""
+    return {
+        "status": "invalid_data",
+        "strategy_valid": False,
+        "as_of_date": as_of_date,
+        "data_date": as_of_date,
+        "stock_kbar_date": stock_kbar_date,
+        "market_regime": market_regime,
+        "buy_candidates": [],
+        "etf_candidates": [],
+        "high_priority_watch": [],
+        "other_watch": [],
+        "excluded": [],
+        "data_errors": list(errors),
+        "stats": {
+            "total_analyzed": 0,
+            "buy_count": 0,
+            "etf_count": 0,
+            "high_priority_watch_count": 0,
+            "other_watch_count": 0,
+            "excluded_count": 0,
+            "error": "；".join(errors),
+        },
+    }
+
+
+def run_tomorrow_strategy(
+    as_of_date: Optional[str] = None,
+    data_date: Optional[str] = None,
+) -> dict:
     """
     主入口。回傳：
     {
@@ -906,7 +1070,54 @@ def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
         "stats":                  {...},
     }
     """
-    # 1. 加權指數資料
+    # ``data_date`` is a backwards-compatible alias only.  All internal logic
+    # uses the single point-in-time boundary ``as_of_date``.
+    if data_date is not None:
+        if as_of_date is not None and str(as_of_date) != str(data_date):
+            invalid_regime = calculate_market_regime(None, as_of_date=str(as_of_date))
+            return _invalid_strategy_result(
+                str(as_of_date), invalid_regime,
+                [f"as_of_date {as_of_date} 與 legacy data_date {data_date} 不一致"],
+            )
+        as_of_date = str(data_date)
+
+    # 1. 個股資料。SQL 層先套 date <= as_of_date，禁止 future rows 進記憶體。
+    conn = _get_conn()
+    try:
+        if as_of_date:
+            df_all = pd.read_sql_query(
+                "SELECT code, date, open, high, low, close, volume "
+                "FROM daily_kbars WHERE date <= ? ORDER BY code, date ASC",
+                conn, params=[str(as_of_date)],
+            )
+        else:
+            df_all = pd.read_sql_query(
+                "SELECT code, date, open, high, low, close, volume "
+                "FROM daily_kbars ORDER BY code, date ASC",
+                conn,
+            )
+        df_names = pd.read_sql_query(
+            "SELECT code, name, category FROM stock_names", conn
+        )
+        security_map = load_security_master(conn)
+    except Exception as e:
+        print(f"[TomorrowStrategy] 讀取個股資料失敗: {e}")
+        invalid_regime = calculate_market_regime(None, as_of_date=as_of_date)
+        return _invalid_strategy_result(
+            str(as_of_date or ""), invalid_regime,
+            [f"個股必要資料讀取失敗：{e}"],
+        )
+    finally:
+        conn.close()
+
+    stock_kbar_date = ""
+    if not df_all.empty:
+        stock_kbar_date = str(df_all["date"].max())
+    if not as_of_date:
+        as_of_date = stock_kbar_date
+    as_of_date = str(as_of_date or "")
+
+    # 2. 加權指數資料，亦只允許 calculate_market_regime 使用 <= as_of_date。
     try:
         from market_status import fetch_market_index_daily
         taiex_df = fetch_market_index_daily()
@@ -914,14 +1125,14 @@ def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
         taiex_df = None
         print(f"[TomorrowStrategy] TAIEX 資料取得失敗: {e}")
 
-    market_regime = calculate_market_regime(taiex_df, data_date=data_date)
+    market_regime = calculate_market_regime(taiex_df, as_of_date=as_of_date)
 
     # 大盤資料最後日期 — 寫入 market_regime 供日期驗證使用
     if taiex_df is not None and not taiex_df.empty:
         try:
             _tmp_df = taiex_df.copy().sort_values("date")
-            if data_date:
-                _tmp_df = _tmp_df[_tmp_df["date"] <= data_date]
+            if as_of_date:
+                _tmp_df = _tmp_df[_tmp_df["date"] <= as_of_date]
             taiex_last_date = str(_tmp_df.iloc[-1]["date"]) if not _tmp_df.empty else ""
             if taiex_last_date:
                 market_regime["data_date"] = taiex_last_date
@@ -931,33 +1142,6 @@ def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
           f"market_close={market_regime.get('metrics', {}).get('index_close', 0)}, "
           f"market_regime={market_regime.get('status', '未知')}")
 
-    # 2. 個股資料
-    conn = _get_conn()
-    try:
-        df_all   = pd.read_sql_query(
-            "SELECT code, date, open, high, low, close, volume "
-            "FROM daily_kbars ORDER BY code, date ASC",
-            conn,
-        )
-        df_names = pd.read_sql_query(
-            "SELECT code, name, category FROM stock_names", conn
-        )
-    except Exception as e:
-        print(f"[TomorrowStrategy] 讀取個股資料失敗: {e}")
-        conn.close()
-        return {
-            "data_date":              datetime.now().strftime("%Y-%m-%d"),
-            "market_regime":          market_regime,
-            "buy_candidates":         [],
-            "etf_candidates":         [],
-            "high_priority_watch":    [],
-            "other_watch":            [],
-            "excluded":               [],
-            "stats":                  {"error": str(e)},
-        }
-    finally:
-        conn.close()
-
     name_map = {}
     cat_map  = {}
     if not df_names.empty:
@@ -965,13 +1149,24 @@ def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
             name_map[r["code"]] = r["name"]
             cat_map[r["code"]]  = r["category"]
 
-    # ── 資料日期：全市場最新交易日（用於新鮮度硬排除）──────────────────────
-    data_date = ""
-    if not df_all.empty:
-        try:
-            data_date = str(df_all.groupby("code")["date"].max().max())
-        except Exception:
-            pass
+    # 全域必要資料日期不一致時 fail closed；不再改寫 as_of_date 或 fallback。
+    date_errors = []
+    if not as_of_date:
+        date_errors.append("as_of_date 缺失")
+    if not stock_kbar_date:
+        date_errors.append("個股日K無可用資料")
+    elif stock_kbar_date != as_of_date:
+        date_errors.append(
+            f"個股日K最新日期 {stock_kbar_date} ≠ as_of_date {as_of_date}"
+        )
+    if not market_regime.get("strategy_valid", False):
+        date_errors.append(market_regime.get("basis") or "大盤必要資料無效")
+    if date_errors:
+        return _invalid_strategy_result(
+            as_of_date, market_regime, date_errors, stock_kbar_date=stock_kbar_date
+        )
+
+    amount_rank_map, volume_rank_map = _liquidity_rank_maps(df_all)
 
     buy_candidates  = []
     etf_candidates  = []
@@ -986,9 +1181,14 @@ def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
             "instrument_type": itype, "grade": "—", "grade_label": "—",
             "score": 0, "close": None, "cost20": None, "cost60": None,
             "dist_cost20_pct": None, "macd_status": "", "volume_status": "",
-            "volume_ma20": None, "amount_ma20": None,
+            "volume_ma20": None, "amount_ma5": None, "amount_ma20": None,
+            "liquidity_trend": None, "amount_rank": None, "volume_rank": None,
             "stop_price": None, "resistance_price": None, "resistance_status": "",
-            "risk_reward": None, "exclude_reasons": reasons,
+            "target_price": None, "previous_60d_high": None, "current_60d_high": None,
+            "target_status": "target_unavailable", "risk_reward": None,
+            "signal_rr": None, "rr_valid": False, "rr_buyable": False,
+            "signal_entry": None, "signal_close": None, "max_entry_rr15": None,
+            "actual_entry": None, "skip_trade": None, "exclude_reasons": reasons,
         })
 
     for code, grp in df_all.groupby("code"):
@@ -999,7 +1199,9 @@ def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
         industry = cat_map.get(code, "")
 
         # 商品類型判斷
-        inst_type, is_ky = classify_instrument(code_str, name, industry)
+        inst_type, is_ky = classify_instrument(
+            code_str, name, industry, security_map.get(code_str)
+        )
 
         # ── 快速排除：不支援的商品類型 ────────────────────────────────────
         if inst_type == "reverse_etf":
@@ -1025,9 +1227,9 @@ def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
 
         # ── 資料新鮮度硬排除 ──────────────────────────────────────────────
         last_kbar_date = str(sub_df.iloc[-1]["date"]) if not sub_df.empty else ""
-        if data_date and last_kbar_date != data_date:
+        if as_of_date and last_kbar_date != as_of_date:
             _quick_exclude(code_str, name, industry, inst_type, [
-                f"資料未同步：最後K線日期 {last_kbar_date}，不等於 data_date {data_date}"
+                f"資料未同步：最後K線日期 {last_kbar_date}，不等於 as_of_date {as_of_date}"
             ])
             continue
 
@@ -1045,6 +1247,8 @@ def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
 
         stock_info["instrument_type"]      = inst_type
         stock_info["is_ky"]               = is_ky
+        stock_info["amount_rank"]          = amount_rank_map.get(code_str)
+        stock_info["volume_rank"]          = volume_rank_map.get(code_str)
         stock_info["score"]               = _calculate_score(stock_info)
         stock_info["last_kbar_date"]      = last_kbar_date
         stock_info["data_freshness_status"] = "同步"
@@ -1052,14 +1256,7 @@ def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
         # ── 流動性分層 ────────────────────────────────────────────────────
         _vol = stock_info["volume_ma20"]
         _amt = stock_info["amount_ma20"]
-        if _vol >= _LIQ_HIGH_VOL and _amt >= _LIQ_HIGH_AMOUNT:
-            liquidity_level = "high"
-        elif _vol >= _LIQ_NORM_VOL and _amt >= _LIQ_NORM_AMOUNT:
-            liquidity_level = "normal"
-        elif _vol < _LIQ_NORM_VOL and _amt >= _LIQ_NORM_AMOUNT:
-            liquidity_level = "low_amount_pass"
-        else:
-            liquidity_level = "low"
+        liquidity_level = _classify_liquidity(_vol, _amt)
         stock_info["liquidity_level"] = liquidity_level
 
         # ── ETF 路徑 ──────────────────────────────────────────────────────
@@ -1177,7 +1374,11 @@ def run_tomorrow_strategy(data_date: Optional[str] = None) -> dict:
     for i, s in enumerate(other_watch,     1): s["rank"] = i
 
     return {
-        "data_date":              data_date or datetime.now().strftime("%Y-%m-%d"),
+        "status":                 "success",
+        "strategy_valid":         True,
+        "as_of_date":             as_of_date,
+        "data_date":              as_of_date,
+        "stock_kbar_date":        stock_kbar_date,
         "market_regime":          market_regime,
         "buy_candidates":         buy_candidates,
         "etf_candidates":         etf_candidates,

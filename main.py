@@ -4,11 +4,16 @@ import html as _html_mod
 import asyncio
 import calendar
 import sqlite3
+import socket
 import threading
 import time
 import math
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
+from html.parser import HTMLParser
+from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -20,6 +25,8 @@ from apscheduler.triggers.cron import CronTrigger
 import screener            # 引入我們的選股大腦
 import tomorrow_strategy  # 大盤狀態 × 明日策略選股
 import integrated_strategy  # 整合選股（主決策＋籌碼輔助）
+import weekly_kd_screener  # 全市場週 KD 低檔鈍化黃金交叉篩選
+import weekly_macd_screener  # 全市場週 MACD 底背離篩選
 import broker_analysis  # key broker analysis tab
 import broker_fetcher  # official on-demand broker data fetcher
 import moneydj_fetcher  # MoneyDJ Fubon broker period summary fetcher
@@ -1729,6 +1736,521 @@ def _fetch_taiex_quote() -> dict:
                 return fallback
             raise
 
+
+def _fetch_twse_bfi82u(day_date: str) -> dict:
+    """Fetch TWSE BFI82U daily institutional trading-value summary."""
+    query = urllib.parse.urlencode({
+        "type": "day",
+        "dayDate": day_date,
+        "response": "json",
+    })
+    source_url = f"https://www.twse.com.tw/rwd/zh/fund/BFI82U?{query}"
+    request = urllib.request.Request(
+        source_url,
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.twse.com.tw/",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    payload["source_url"] = source_url
+    return payload
+
+
+_TAIFEX_FUTURES_CONTRACTS = {
+    "TAIWAN_INDEX": "台指／小台／微型台指",
+    "TXF": "臺股期貨",
+    "MXF": "小型臺指期貨",
+    "TMF": "微型臺指期貨",
+}
+
+
+_TAIFEX_FUTURES_FIELDS = [
+    "日期",
+    "商品名稱",
+    "身份別",
+    "多方交易口數",
+    "多方交易契約金額(千元)",
+    "空方交易口數",
+    "空方交易契約金額(千元)",
+    "多空交易口數淨額",
+    "多空交易契約金額淨額(千元)",
+    "多方未平倉口數",
+    "多方未平倉契約金額(千元)",
+    "空方未平倉口數",
+    "空方未平倉契約金額(千元)",
+    "多空未平倉口數淨額",
+    "多空未平倉契約金額淨額(千元)",
+]
+
+_TAIFEX_AFTER_HOURS_FIELDS = [
+    "日期",
+    "商品名稱",
+    "身份別",
+    "多方交易口數",
+    "多方交易契約金額(千元)",
+    "空方交易口數",
+    "空方交易契約金額(千元)",
+    "多空交易口數淨額",
+    "多空交易契約金額淨額(千元)",
+]
+
+_TAIFEX_OI_HISTORY_TABLE = "trading_doctor_taifex_oi_history"
+_TAIFEX_OI_HISTORY_START = "20260810"
+_TAIFEX_OI_HISTORY_LIMIT = 14
+_TAIFEX_OI_HISTORY_DB_LOCK = threading.RLock()
+_TAIFEX_OI_HISTORY_SYNC_LOCK = threading.Lock()
+
+
+class _TaifexInstitutionalTableParser(HTMLParser):
+    """Extract body cells from the TAIFEX institutional-result table."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.in_target_table = False
+        self.in_body = False
+        self.current_row = None
+        self.current_cell = None
+        self.rows = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        if tag == "table" and not self.in_target_table:
+            classes = str(attrs_dict.get("class") or "").split()
+            if "table_f" in classes:
+                self.in_target_table = True
+        elif self.in_target_table and tag == "tbody":
+            self.in_body = True
+        elif self.in_body and tag == "tr":
+            self.current_row = []
+        elif self.current_row is not None and tag == "td":
+            self.current_cell = []
+
+    def handle_data(self, data):
+        if self.current_cell is not None:
+            self.current_cell.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "td" and self.current_cell is not None:
+            value = " ".join("".join(self.current_cell).split())
+            self.current_row.append(value)
+            self.current_cell = None
+        elif tag == "tr" and self.current_row is not None:
+            if self.current_row:
+                self.rows.append(self.current_row)
+            self.current_row = None
+            self.current_cell = None
+        elif tag == "tbody" and self.in_target_table:
+            self.in_body = False
+        elif tag == "table" and self.in_target_table:
+            self.in_target_table = False
+
+
+def _fetch_taifex_futures_institutional(
+    day_date: str,
+    commodity_id: str,
+    after_hours: bool = False,
+) -> dict:
+    """Submit the TAIFEX date query and parse its institutional table."""
+    display_date = datetime.strptime(day_date, "%Y%m%d").strftime("%Y/%m/%d")
+    query_url = (
+        "https://www.taifex.com.tw/cht/3/futContractsDateAh"
+        if after_hours
+        else "https://www.taifex.com.tw/cht/3/futContractsDate"
+    )
+    source_commodity_id = "" if commodity_id == "TAIWAN_INDEX" else commodity_id
+    form_data = urllib.parse.urlencode({
+        "queryType": "1",
+        "goDay": "",
+        "doQuery": "1",
+        "dateaddcnt": "",
+        "queryDate": display_date,
+        "commodityId": source_commodity_id,
+    }).encode("ascii")
+    request = urllib.request.Request(
+        query_url,
+        data=form_data,
+        headers={
+            "Accept": "text/html,application/xhtml+xml,*/*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": query_url,
+        },
+        method="POST",
+    )
+    raw_content = b""
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                raw_content = response.read()
+            break
+        except urllib.error.HTTPError as exc:
+            if attempt > 0 or exc.code < 500:
+                raise
+        except (urllib.error.URLError, socket.timeout):
+            if attempt > 0:
+                raise
+        time.sleep(0.4)
+
+    html_text = raw_content.decode("utf-8")
+    parser = _TaifexInstitutionalTableParser()
+    parser.feed(html_text)
+    rows = []
+    current_contract = ""
+    wanted_contracts = (
+        {"臺股期貨", "小型臺指期貨", "微型臺指期貨"}
+        if commodity_id == "TAIWAN_INDEX"
+        else None
+    )
+    full_row_length = 9 if after_hours else 15
+    continuation_row_length = 7 if after_hours else 13
+    for source_row in parser.rows:
+        if len(source_row) == full_row_length:
+            current_contract = source_row[1]
+            normalized_row = [display_date, current_contract, *source_row[2:]]
+        elif len(source_row) == continuation_row_length and current_contract:
+            normalized_row = [display_date, current_contract, *source_row]
+        else:
+            current_contract = ""
+            continue
+        if normalized_row[2] not in {"自營商", "投信", "外資", "外資及陸資"}:
+            continue
+        if wanted_contracts is not None and normalized_row[1] not in wanted_contracts:
+            continue
+        rows.append([
+            value if index < 3 else value.replace(",", "")
+            for index, value in enumerate(normalized_row)
+        ])
+
+    if not parser.rows and "查無資料" not in html_text:
+        raise ValueError("期交所未回傳預期的查詢表格。")
+
+    return {
+        "date": day_date,
+        "fields": list(
+            _TAIFEX_AFTER_HOURS_FIELDS
+            if after_hours
+            else _TAIFEX_FUTURES_FIELDS
+        ),
+        "data": rows,
+        "source_url": query_url,
+    }
+
+
+def _build_taifex_foreign_oi_summary(fields: list, rows: list) -> dict:
+    """Build foreign-investor net OI for TXF/MXF/TMF and TXF equivalents."""
+    normalized_fields = [str(field or "").replace(" ", "") for field in fields]
+    try:
+        contract_index = normalized_fields.index("商品名稱")
+        item_index = normalized_fields.index("身份別")
+        net_oi_index = normalized_fields.index("多空未平倉口數淨額")
+    except ValueError as exc:
+        raise ValueError("期交所資料缺少外資未平倉淨額必要欄位。") from exc
+
+    contract_names = {
+        "txf": "臺股期貨",
+        "mxf": "小型臺指期貨",
+        "tmf": "微型臺指期貨",
+    }
+    values = {}
+    for key, contract_name in contract_names.items():
+        matching_row = next((
+            row for row in rows
+            if len(row) > net_oi_index
+            and str(row[contract_index]).strip() == contract_name
+            and str(row[item_index]).strip() in {"外資", "外資及陸資"}
+        ), None)
+        if matching_row is None:
+            raise ValueError(f"期交所資料缺少{contract_name}外資未平倉淨額。")
+        try:
+            values[key] = int(str(matching_row[net_oi_index]).replace(",", ""))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{contract_name}外資未平倉淨額格式錯誤。") from exc
+
+    equivalent_net_oi = values["txf"] + values["mxf"] / 4 + values["tmf"] / 20
+    return {
+        "txf_foreign_net_oi": values["txf"],
+        "mxf_foreign_net_oi": values["mxf"],
+        "tmf_foreign_net_oi": values["tmf"],
+        "equivalent_net_oi": round(equivalent_net_oi, 2),
+        "formula": "TXF + MXF / 4 + TMF / 20",
+    }
+
+
+def _open_taifex_oi_history_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def _recalculate_taifex_oi_history_changes(conn: sqlite3.Connection) -> None:
+    """Update each row's day-session change from the preceding recorded day."""
+    rows = conn.execute(
+        f"""
+        SELECT trade_date, equivalent_net_oi, day_session_change
+        FROM {_TAIFEX_OI_HISTORY_TABLE}
+        ORDER BY trade_date ASC
+        """
+    ).fetchall()
+    previous_equivalent = None
+    for index, row in enumerate(rows):
+        if index == 0:
+            change = (
+                None
+                if row["trade_date"] == _TAIFEX_OI_HISTORY_START
+                else row["day_session_change"]
+            )
+        else:
+            # 先依畫面整數規則四捨五入，再與前一交易日相減。
+            current_rounded = math.floor(float(row["equivalent_net_oi"]) + 0.5)
+            previous_rounded = math.floor(previous_equivalent + 0.5)
+            change = current_rounded - previous_rounded
+        if change != row["day_session_change"]:
+            conn.execute(
+                f"""
+                UPDATE {_TAIFEX_OI_HISTORY_TABLE}
+                SET day_session_change = ?
+                WHERE trade_date = ?
+                """,
+                (change, row["trade_date"]),
+            )
+        previous_equivalent = float(row["equivalent_net_oi"])
+
+
+def _init_taifex_oi_history_table() -> None:
+    """Create the Trading Doctor OI history store if it does not exist."""
+    with _TAIFEX_OI_HISTORY_DB_LOCK:
+        conn = _open_taifex_oi_history_db()
+        try:
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {_TAIFEX_OI_HISTORY_TABLE} (
+                    trade_date TEXT PRIMARY KEY,
+                    txf_foreign_net_oi INTEGER NOT NULL,
+                    mxf_foreign_net_oi INTEGER NOT NULL,
+                    tmf_foreign_net_oi INTEGER NOT NULL,
+                    equivalent_net_oi REAL NOT NULL,
+                    day_session_change INTEGER,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            columns = {
+                row["name"]
+                for row in conn.execute(
+                    f"PRAGMA table_info({_TAIFEX_OI_HISTORY_TABLE})"
+                ).fetchall()
+            }
+            if "day_session_change" not in columns:
+                conn.execute(
+                    f"""
+                    ALTER TABLE {_TAIFEX_OI_HISTORY_TABLE}
+                    ADD COLUMN day_session_change INTEGER
+                    """
+                )
+            _recalculate_taifex_oi_history_changes(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _save_taifex_oi_history(day_date: str, summary: dict) -> bool:
+    """Upsert one date and retain only the newest 14 recorded trading days."""
+    parsed_date = datetime.strptime(day_date, "%Y%m%d")
+    if day_date < _TAIFEX_OI_HISTORY_START:
+        return False
+
+    values = (
+        int(summary["txf_foreign_net_oi"]),
+        int(summary["mxf_foreign_net_oi"]),
+        int(summary["tmf_foreign_net_oi"]),
+        float(summary["equivalent_net_oi"]),
+    )
+    updated_at = (datetime.utcnow() + timedelta(hours=8)).isoformat(timespec="seconds")
+
+    with _TAIFEX_OI_HISTORY_DB_LOCK:
+        _init_taifex_oi_history_table()
+        conn = _open_taifex_oi_history_db()
+        try:
+            conn.execute(
+                f"""
+                INSERT INTO {_TAIFEX_OI_HISTORY_TABLE} (
+                    trade_date,
+                    txf_foreign_net_oi,
+                    mxf_foreign_net_oi,
+                    tmf_foreign_net_oi,
+                    equivalent_net_oi,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date) DO UPDATE SET
+                    txf_foreign_net_oi = excluded.txf_foreign_net_oi,
+                    mxf_foreign_net_oi = excluded.mxf_foreign_net_oi,
+                    tmf_foreign_net_oi = excluded.tmf_foreign_net_oi,
+                    equivalent_net_oi = excluded.equivalent_net_oi,
+                    updated_at = excluded.updated_at
+                """,
+                (day_date, *values, updated_at),
+            )
+            _recalculate_taifex_oi_history_changes(conn)
+            conn.execute(
+                f"""
+                DELETE FROM {_TAIFEX_OI_HISTORY_TABLE}
+                WHERE trade_date NOT IN (
+                    SELECT trade_date
+                    FROM {_TAIFEX_OI_HISTORY_TABLE}
+                    ORDER BY trade_date DESC
+                    LIMIT ?
+                )
+                """,
+                (_TAIFEX_OI_HISTORY_LIMIT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return parsed_date.strftime("%Y%m%d") == day_date
+
+
+def _load_taifex_oi_history(limit: int = _TAIFEX_OI_HISTORY_LIMIT) -> list:
+    """Return persisted OI rows newest first."""
+    safe_limit = max(1, min(int(limit), _TAIFEX_OI_HISTORY_LIMIT))
+    with _TAIFEX_OI_HISTORY_DB_LOCK:
+        _init_taifex_oi_history_table()
+        conn = _open_taifex_oi_history_db()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT trade_date,
+                       txf_foreign_net_oi,
+                       mxf_foreign_net_oi,
+                       tmf_foreign_net_oi,
+                       equivalent_net_oi,
+                       day_session_change,
+                       updated_at
+                FROM {_TAIFEX_OI_HISTORY_TABLE}
+                ORDER BY trade_date DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    return [
+        {
+            "date": row["trade_date"],
+            "display_date": datetime.strptime(
+                row["trade_date"], "%Y%m%d"
+            ).strftime("%Y/%m/%d"),
+            "txf_foreign_net_oi": row["txf_foreign_net_oi"],
+            "mxf_foreign_net_oi": row["mxf_foreign_net_oi"],
+            "tmf_foreign_net_oi": row["tmf_foreign_net_oi"],
+            "equivalent_net_oi": row["equivalent_net_oi"],
+            "equivalent_net_oi_rounded": math.floor(
+                float(row["equivalent_net_oi"]) + 0.5
+            ),
+            "day_session_change": row["day_session_change"],
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
+def _sync_taifex_oi_history(
+    start_day_date=None,
+    end_day_date=None,
+) -> dict:
+    """Fill missing TAIFEX OI dates without blocking the application's event loop."""
+    if not _TAIFEX_OI_HISTORY_SYNC_LOCK.acquire(blocking=False):
+        return {"saved": 0, "skipped": 0, "status": "already_running"}
+
+    try:
+        _init_taifex_oi_history_table()
+        taipei_today = (datetime.utcnow() + timedelta(hours=8)).date()
+        end_date = (
+            datetime.strptime(end_day_date, "%Y%m%d").date()
+            if end_day_date
+            else taipei_today
+        )
+
+        existing_rows = _load_taifex_oi_history()
+        if start_day_date:
+            start_date = datetime.strptime(start_day_date, "%Y%m%d").date()
+        elif existing_rows:
+            newest_date = datetime.strptime(existing_rows[0]["date"], "%Y%m%d").date()
+            start_date = newest_date + timedelta(days=1)
+        else:
+            fixed_start = datetime.strptime(_TAIFEX_OI_HISTORY_START, "%Y%m%d").date()
+            start_date = max(fixed_start, end_date - timedelta(days=35))
+
+        fixed_start = datetime.strptime(_TAIFEX_OI_HISTORY_START, "%Y%m%d").date()
+        start_date = max(start_date, fixed_start)
+        if start_date > end_date:
+            return {"saved": 0, "skipped": 0, "status": "up_to_date"}
+
+        existing_dates = {row["date"] for row in existing_rows}
+        saved = 0
+        skipped = 0
+        errors = []
+        cursor = start_date
+        while cursor <= end_date:
+            day_date = cursor.strftime("%Y%m%d")
+            if cursor.weekday() >= 5 or day_date in existing_dates:
+                skipped += 1
+                cursor += timedelta(days=1)
+                continue
+            try:
+                payload = _fetch_taifex_futures_institutional(
+                    day_date,
+                    "TAIWAN_INDEX",
+                )
+                rows = payload.get("data") or []
+                if not rows:
+                    skipped += 1
+                else:
+                    summary = _build_taifex_foreign_oi_summary(
+                        payload.get("fields") or [],
+                        rows,
+                    )
+                    _save_taifex_oi_history(day_date, summary)
+                    saved += 1
+            except Exception as exc:
+                errors.append(f"{day_date}: {exc}")
+            cursor += timedelta(days=1)
+
+        return {
+            "saved": saved,
+            "skipped": skipped,
+            "errors": errors,
+            "status": "completed",
+        }
+    finally:
+        _TAIFEX_OI_HISTORY_SYNC_LOCK.release()
+
+
+async def _scheduled_trading_doctor_oi_sync() -> None:
+    """Fetch and retain the latest official OI rows after TAIFEX publication."""
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _sync_taifex_oi_history)
+        print(
+            "[TradingDoctor] 期交所 OI 紀錄同步完成 "
+            f"saved={result.get('saved', 0)} skipped={result.get('skipped', 0)}"
+        )
+        for error in result.get("errors", []):
+            print(f"[TradingDoctor] OI 同步略過：{error}")
+    except Exception as exc:
+        print(f"[TradingDoctor] 期交所 OI 紀錄同步失敗：{exc}")
+
 def _twse_snapshot_to_intraday_payload(code: str, name: str, row: dict) -> dict:
     """Convert a TWSE MIS quote snapshot into a small chartable intraday path."""
     date_raw = str(row.get("d") or row.get("^") or "").strip()
@@ -2316,6 +2838,276 @@ async def get_taiex_quote():
             status_code=503,
             detail=f"臺灣加權指數暫時無法取得: {exc}",
         )
+
+
+@app.get("/api/trading-doctor/bfi82u")
+async def get_trading_doctor_bfi82u(day_date: str):
+    """Proxy the official TWSE BFI82U report for one calendar date."""
+    try:
+        parsed_date = datetime.strptime(day_date, "%Y%m%d")
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="日期格式錯誤，請使用 YYYYMMDD。",
+        )
+
+    if parsed_date.strftime("%Y%m%d") != day_date:
+        raise HTTPException(
+            status_code=400,
+            detail="日期格式錯誤，請使用 YYYYMMDD。",
+        )
+
+    try:
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(
+            None,
+            lambda: _fetch_twse_bfi82u(day_date),
+        )
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        socket.timeout,
+        TimeoutError,
+    ) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"證交所資料暫時無法取得：{exc}",
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"證交所回傳格式無法解析：{exc}",
+        )
+
+    stat = str(payload.get("stat") or "").strip()
+    fields = payload.get("fields") or []
+    rows = payload.get("data") or []
+    if stat != "OK" or not fields or not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=stat or "該日期查無三大法人買賣金額資料。",
+        )
+
+    return {
+        "success": True,
+        "source": "TWSE BFI82U",
+        "source_url": payload.get("source_url"),
+        "stat": stat,
+        "date": str(payload.get("date") or day_date),
+        "title": str(payload.get("title") or "三大法人買賣金額統計表"),
+        "hints": str(payload.get("hints") or ""),
+        "fields": fields,
+        "data": rows,
+        "notes": payload.get("notes") or [],
+    }
+
+
+@app.get("/api/trading-doctor/taifex-futures")
+async def get_trading_doctor_taifex_futures(
+    day_date: str,
+    commodity_id: str = "TAIWAN_INDEX",
+):
+    """Proxy TAIFEX institutional futures data for one date and contract."""
+    try:
+        parsed_date = datetime.strptime(day_date, "%Y%m%d")
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="日期格式錯誤，請使用 YYYYMMDD。",
+        )
+
+    if parsed_date.strftime("%Y%m%d") != day_date:
+        raise HTTPException(
+            status_code=400,
+            detail="日期格式錯誤，請使用 YYYYMMDD。",
+        )
+
+    commodity_id = str(commodity_id or "").strip().upper()
+    if commodity_id not in _TAIFEX_FUTURES_CONTRACTS:
+        raise HTTPException(
+            status_code=400,
+            detail="不支援的期貨契約代碼。",
+        )
+
+    try:
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(
+            None,
+            lambda: _fetch_taifex_futures_institutional(
+                day_date,
+                commodity_id,
+            ),
+        )
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        socket.timeout,
+        TimeoutError,
+    ) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"期交所資料暫時無法取得：{exc}",
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"期交所回傳格式無法解析：{exc}",
+        )
+
+    fields = payload.get("fields") or []
+    rows = payload.get("data") or []
+    if not fields or not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="該日期查無期交所三大法人期貨資料。",
+        )
+
+    foreign_oi_summary = None
+    oi_history = []
+    if commodity_id == "TAIWAN_INDEX":
+        try:
+            foreign_oi_summary = _build_taifex_foreign_oi_summary(fields, rows)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"期交所回傳資料無法彙整：{exc}",
+            )
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: _save_taifex_oi_history(day_date, foreign_oi_summary),
+            )
+            oi_history = await loop.run_in_executor(
+                None,
+                _load_taifex_oi_history,
+            )
+        except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"期交所 OI 紀錄無法儲存：{exc}",
+            )
+
+    contract_name = _TAIFEX_FUTURES_CONTRACTS[commodity_id]
+    return {
+        "success": True,
+        "source": "TAIFEX 三大法人",
+        "source_url": payload.get("source_url"),
+        "date": str(payload.get("date") or day_date),
+        "commodity_id": commodity_id,
+        "commodity_name": contract_name,
+        "title": f"{parsed_date.strftime('%Y/%m/%d')} {contract_name}三大法人部位",
+        "hints": "單位：口數；契約金額為千元",
+        "fields": fields,
+        "data": rows,
+        "foreign_oi_summary": foreign_oi_summary,
+        "oi_history": oi_history,
+        "history_limit": _TAIFEX_OI_HISTORY_LIMIT,
+        "notes": [
+            "多方代表買進期貨，空方代表賣出期貨。",
+            "資料包含自營商、投信、外資及陸資；淨額為各類法人機構合計互抵結果。",
+            "本表資料由臺灣期貨交易所『區分各期貨契約－依日期』查詢服務提供。",
+        ],
+    }
+
+
+@app.get("/api/trading-doctor/taifex-oi-history")
+async def get_trading_doctor_taifex_oi_history():
+    """Return up to 14 persisted daily foreign-investor OI summaries."""
+    try:
+        loop = asyncio.get_running_loop()
+        rows = await loop.run_in_executor(None, _load_taifex_oi_history)
+    except (sqlite3.Error, ValueError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"期交所 OI 歷史紀錄無法讀取：{exc}",
+        )
+    return {
+        "success": True,
+        "start_date": _TAIFEX_OI_HISTORY_START,
+        "max_records": _TAIFEX_OI_HISTORY_LIMIT,
+        "count": len(rows),
+        "data": rows,
+    }
+
+
+@app.get("/api/trading-doctor/taifex-futures-after-hours")
+async def get_trading_doctor_taifex_futures_after_hours(
+    day_date: str,
+    commodity_id: str = "TAIWAN_INDEX",
+):
+    """Proxy TAIFEX institutional after-hours futures transactions."""
+    try:
+        parsed_date = datetime.strptime(day_date, "%Y%m%d")
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="日期格式錯誤，請使用 YYYYMMDD。",
+        )
+    if parsed_date.strftime("%Y%m%d") != day_date:
+        raise HTTPException(
+            status_code=400,
+            detail="日期格式錯誤，請使用 YYYYMMDD。",
+        )
+
+    commodity_id = str(commodity_id or "").strip().upper()
+    if commodity_id not in _TAIFEX_FUTURES_CONTRACTS:
+        raise HTTPException(
+            status_code=400,
+            detail="不支援的期貨契約代碼。",
+        )
+
+    try:
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(
+            None,
+            lambda: _fetch_taifex_futures_institutional(
+                day_date,
+                commodity_id,
+                after_hours=True,
+            ),
+        )
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        socket.timeout,
+        TimeoutError,
+    ) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"期交所夜盤資料暫時無法取得：{exc}",
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"期交所夜盤回傳格式無法解析：{exc}",
+        )
+
+    fields = payload.get("fields") or []
+    rows = payload.get("data") or []
+    if not fields or not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="該日期查無期交所三大法人夜盤資料。",
+        )
+
+    contract_name = _TAIFEX_FUTURES_CONTRACTS[commodity_id]
+    return {
+        "success": True,
+        "source": "TAIFEX 三大法人夜盤",
+        "source_url": payload.get("source_url"),
+        "date": str(payload.get("date") or day_date),
+        "commodity_id": commodity_id,
+        "commodity_name": contract_name,
+        "title": f"{parsed_date.strftime('%Y/%m/%d')} {contract_name}夜盤三大法人交易",
+        "hints": "夜盤資料；單位：口數；契約金額為千元",
+        "fields": fields,
+        "data": rows,
+        "notes": [
+            "本表為盤後交易時段資料，僅包含交易口數與契約金額，不提供未平倉餘額。",
+            "盤後交易資料依交易量歸屬日期查詢。",
+            "資料由臺灣期貨交易所『區分各期貨契約－夜盤』查詢服務提供。",
+        ],
+    }
 
 
 @app.get("/api/futures_month_spread")
@@ -3448,6 +4240,38 @@ async def api_run_screener(payload: dict = {}):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"選股計算失敗: {str(e)}")
 
+
+@app.get("/api/stock-screener/weekly-kd")
+async def api_weekly_kd_screener(min_avg_volume_20d_lots: Optional[float] = None):
+    """查詢全市場週 KD 低檔鈍化後黃金交叉的普通股。"""
+    try:
+        result = await asyncio.to_thread(
+            weekly_kd_screener.scan_weekly_kd,
+            _STOCK_DB_PATH,
+            min_avg_volume_20d_lots=min_avg_volume_20d_lots,
+        )
+        return sanitize_for_json({"status": "success", **result})
+    except Exception as e:
+        print(f"[Weekly KD Screener] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="週 KD 篩選失敗，請檢查全市場日 K 資料")
+
+
+@app.get("/api/stock-screener/weekly-macd-divergence")
+async def api_weekly_macd_divergence_screener(
+    min_avg_volume_20d_lots: Optional[float] = None,
+):
+    """查詢全市場週 MACD 底背離的普通股。"""
+    try:
+        result = await asyncio.to_thread(
+            weekly_macd_screener.scan_weekly_macd_divergence,
+            _STOCK_DB_PATH,
+            min_avg_volume_20d_lots=min_avg_volume_20d_lots,
+        )
+        return sanitize_for_json({"status": "success", **result})
+    except Exception as e:
+        print(f"[Weekly MACD Screener] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="週 MACD 底背離篩選失敗，請檢查全市場日 K 資料")
+
 def _get_tg_recipients() -> list:
     """從環境變數讀取收件人清單 [{name, chatId}, ...]"""
     raw = os.environ.get("TELEGRAM_RECIPIENTS", "")
@@ -4001,12 +4825,21 @@ def validate_screener_data_date(data_date: str) -> dict:
     warnings, errors = [], []
 
     stock_kbar_date = ""
+    stock_kbar_count = 0
+    stock_kbar_expected_min = 0
+    stock_kbar_coverage_ok = False
     try:
         conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
-        row = conn.execute("SELECT MAX(date) FROM daily_kbars").fetchone()
-        conn.close()
+        row = conn.execute(
+            "SELECT MAX(date) FROM daily_kbars WHERE date <= ?", (data_date,)
+        ).fetchone()
         if row and row[0]:
             stock_kbar_date = normalize_date(str(row[0]))
+            coverage = screener._daily_kbar_coverage(conn, stock_kbar_date)
+            stock_kbar_count = int(coverage["count"])
+            stock_kbar_expected_min = int(coverage["minimum"])
+            stock_kbar_coverage_ok = bool(coverage["complete"])
+        conn.close()
     except Exception as e:
         errors.append(f"無法查詢個股日K最新日期: {e}")
 
@@ -4015,7 +4848,8 @@ def validate_screener_data_date(data_date: str) -> dict:
     try:
         conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
         row = conn.execute(
-            "SELECT date, close FROM market_index_daily ORDER BY date DESC LIMIT 1"
+            "SELECT date, close FROM market_index_daily "
+            "WHERE date <= ? ORDER BY date DESC LIMIT 1", (data_date,)
         ).fetchone()
         conn.close()
         if row:
@@ -4027,7 +4861,9 @@ def validate_screener_data_date(data_date: str) -> dict:
     institution_data_date = ""
     try:
         conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
-        row = conn.execute("SELECT MAX(date) FROM institutional_trading").fetchone()
+        row = conn.execute(
+            "SELECT MAX(date) FROM institutional_trading WHERE date <= ?", (data_date,)
+        ).fetchone()
         conn.close()
         if row and row[0]:
             institution_data_date = normalize_date(str(row[0]))
@@ -4050,15 +4886,23 @@ def validate_screener_data_date(data_date: str) -> dict:
     if data_date:
         if stock_kbar_date and stock_kbar_date != data_date:
             errors.append(f"個股日K最新日期 {stock_kbar_date} ≠ 選股基準日 {data_date}")
+        elif stock_kbar_date and not stock_kbar_coverage_ok:
+            errors.append(
+                f"個股日K {stock_kbar_date} 僅 {stock_kbar_count} 檔，"
+                f"低於完整性門檻 {stock_kbar_expected_min} 檔"
+            )
         if market_data_date and market_data_date != data_date:
             errors.append(f"大盤資料日 {market_data_date} ≠ 選股基準日 {data_date}")
         if institution_data_date and institution_data_date != data_date:
-            warnings.append(f"法人資料日 {institution_data_date} ≠ 選股基準日 {data_date}")
+            warnings.append(f"法人資料截至 {institution_data_date}（as_of_date={data_date}）")
 
     critical_ok = len(errors) == 0
     return {
         "data_date":             data_date,
         "stock_kbar_date":       stock_kbar_date,
+        "stock_kbar_count":      stock_kbar_count,
+        "stock_kbar_expected_min": stock_kbar_expected_min,
+        "stock_kbar_coverage_ok": stock_kbar_coverage_ok,
         "market_data_date":      market_data_date,
         "market_close":          market_close,
         "institution_data_date": institution_data_date,
@@ -4074,7 +4918,9 @@ def validate_result_data_date(integrated_result: dict) -> dict:
     檢查選股結果、大盤資料是否使用同一個 data_date。
     回傳 {valid, critical_ok, data_date, stock_kbar_date, market_data_date, ...}。
     """
-    data_date   = integrated_result.get("data_date", "")
+    data_date   = integrated_result.get("as_of_date") or integrated_result.get("data_date", "")
+    stock_kbar_date = integrated_result.get("stock_kbar_date", "")
+    strategy_valid = integrated_result.get("strategy_valid", False)
     mr          = integrated_result.get("market_regime", {}) or {}
     market_date = mr.get("data_date", "")
     mr_metrics  = mr.get("metrics") or {}
@@ -4086,7 +4932,14 @@ def validate_result_data_date(integrated_result: dict) -> dict:
     warnings, errors = [], []
 
     if not data_date:
-        errors.append("data_date 缺失，無法驗證資料一致性")
+        errors.append("as_of_date 缺失，無法驗證資料一致性")
+    if not strategy_valid:
+        errors.extend(
+            str(e) for e in (integrated_result.get("data_errors") or ["strategy_valid=false"])
+            if str(e) not in errors
+        )
+    if stock_kbar_date and data_date and stock_kbar_date != data_date:
+        errors.append(f"個股日K最新日期 {stock_kbar_date} ≠ as_of_date {data_date}")
 
     if mr_error:
         errors.append(
@@ -4100,19 +4953,21 @@ def validate_result_data_date(integrated_result: dict) -> dict:
     institution_data_date = ""
     try:
         conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
-        row = conn.execute("SELECT MAX(date) FROM institutional_trading").fetchone()
+        row = conn.execute(
+            "SELECT MAX(date) FROM institutional_trading WHERE date <= ?", (data_date,)
+        ).fetchone()
         conn.close()
         if row and row[0]:
             institution_data_date = normalize_date(str(row[0]))
             if data_date and institution_data_date != data_date:
-                warnings.append(f"法人資料日 {institution_data_date} ≠ 選股基準日 {data_date}")
+                warnings.append(f"法人資料截至 {institution_data_date}（as_of_date={data_date}）")
     except Exception:
         pass
 
     valid = critical_ok = (len(errors) == 0)
 
     print(
-        f"[日期檢查] data_date={data_date}, stock_kbar_date={data_date}, "
+        f"[日期檢查] as_of_date={data_date}, stock_kbar_date={stock_kbar_date}, "
         f"market_data_date={market_date}, institution_data_date={institution_data_date}, "
         f"critical_ok={critical_ok}"
     )
@@ -4124,8 +4979,10 @@ def validate_result_data_date(integrated_result: dict) -> dict:
     return {
         "valid":                 valid,
         "critical_ok":           critical_ok,
+        "strategy_valid":        strategy_valid and critical_ok,
+        "as_of_date":            data_date,
         "data_date":             data_date,
-        "stock_kbar_date":       data_date,
+        "stock_kbar_date":       stock_kbar_date,
         "market_data_date":      market_date,
         "taiex_close":           taiex_close,
         "market_close":          taiex_close,
@@ -4211,6 +5068,12 @@ def calculate_tg_score(stock: dict) -> float:
 
 def build_tg_pick_list(integrated_result: dict) -> dict:
     """從整合選股結果中挑選 TG 精選（最多3）與備選（最多2），含 K 線風險降級。"""
+    if not integrated_result.get("strategy_valid", False):
+        return {
+            "tg_picks": [], "tg_watch": [], "tg_skipped": [],
+            "downgraded": [], "downgrade_count": 0,
+            "blocked": True, "blocked_reason": "strategy_valid=false",
+        }
     buy = integrated_result.get("buy_candidates", [])
     tg_picks_pre, tg_watch_pre, tg_skipped = [], [], []
     downgraded: list = []
@@ -5085,7 +5948,7 @@ def _generate_integrated_tg_message(integrated_result: dict = None, data_date: s
     """Build the integrated-strategy Telegram message through the single shared pipeline."""
     if integrated_result is None:
         if data_date:
-            integrated_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+            integrated_result = integrated_strategy.run_integrated_strategy(as_of_date=data_date)
         else:
             integrated_result = integrated_strategy.run_integrated_strategy()
 
@@ -5233,12 +6096,13 @@ async def sync_all_stock_screener_data(target_date: str = "") -> dict:
         if test_date.weekday() in [5, 6]:
             continue
         try:
-            screener.sync_twse_institutional_data(test_date)
-            synced_days += 1
-            if not last_inst_date:
-                last_inst_date = test_date.strftime("%Y-%m-%d")
-            if synced_days >= 5:
-                break
+            _inst_day = screener.sync_twse_institutional_data(test_date) or {}
+            if _inst_day.get("success"):
+                synced_days += 1
+                if not last_inst_date:
+                    last_inst_date = _inst_day.get("date") or test_date.strftime("%Y-%m-%d")
+                if synced_days >= 5:
+                    break
         except Exception as e:
             print(f"[同步選股數據] 法人同步 {test_date.strftime('%Y-%m-%d')} 失敗：{e}")
     inst_result = {
@@ -5247,25 +6111,17 @@ async def sync_all_stock_screener_data(target_date: str = "") -> dict:
     }
     print(f"[同步選股數據] sync_institutional={'success' if synced_days > 0 else 'warning'}, latest={last_inst_date}")
 
-    # 2. 個股日K：本次富邦授權範圍僅限期貨行情，不能拿期貨 SDK
-    #    冒充股票日K來源。保留既有 DB 供篩選使用，並明確回報新鮮度。
+    # 2. 個股日K：以證交所／櫃買中心的每日全市場收盤行情回補缺日。
+    #    這是 EOD 選股資料，與富邦期貨即時行情分開，且每天只需兩個
+    #    cross-section request，避免逐檔查詢造成券商行情速率壓力。
     kbar_result = {"success": False, "latest_date": "", "error": None}
     try:
-        _conn = sqlite3.connect(_STOCK_DB_PATH, timeout=30.0)
-        _row = _conn.execute("SELECT MAX(date) FROM daily_kbars").fetchone()
-        _conn.close()
-        _latest_stock_kbar = normalize_date(str(_row[0])) if _row and _row[0] else ""
-        _is_current = bool(_latest_stock_kbar and _latest_stock_kbar >= target_date)
-        kbar_result = {
-            "success": _is_current,
-            "latest_date": _latest_stock_kbar,
-            "error": None if _is_current else (
-                "富邦目前只串接期貨行情；個股日K沿用本地DB，尚未更新到目標日期"
-            ),
-        }
+        kbar_result = screener.sync_official_stock_daily_kbars(target_date)
         print(
             "[同步選股數據] stock_daily_kbars="
-            f"{'cache-current' if _is_current else 'cache-stale'}, latest={_latest_stock_kbar or 'none'}"
+            f"{'success' if kbar_result['success'] else 'warning'}, "
+            f"latest={kbar_result.get('latest_date') or 'none'}, "
+            f"inserted={kbar_result.get('inserted_rows', 0)}"
         )
     except Exception as e:
         kbar_result = {"success": False, "latest_date": "", "error": str(e)}
@@ -5307,10 +6163,22 @@ async def sync_all_stock_screener_data(target_date: str = "") -> dict:
 
     # 4. 資料一致性驗證
     validation = validate_screener_data_date(target_date)
+    # 假日或盤中可能把有效基準日調整為資料庫最後完整交易日；同步結果
+    # 需依調整後日期重算，不沿用原行事曆日期的 warning。
+    if kbar_result.get("latest_date") == target_date:
+        _coverage = kbar_result.get("coverage") or {}
+        if _coverage.get("complete", True):
+            kbar_result["success"] = True
+            kbar_result["error"] = None
+    if not kbar_result.get("success"):
+        _kbar_error = kbar_result.get("error") or "個股日K同步未完成"
+        if _kbar_error not in validation["errors"]:
+            validation["errors"].append(_kbar_error)
+        validation["critical_ok"] = False
     print(f"[同步選股數據] validation.critical_ok={validation['critical_ok']}")
 
     return {
-        "success":                    validation["critical_ok"],
+        "success":                    validation["critical_ok"] and kbar_result.get("success", False),
         "data_date":                  target_date,
         "stock_kbar_date":            validation["stock_kbar_date"],
         "market_data_date":           validation["market_data_date"],
@@ -5558,7 +6426,7 @@ def _sync_moneydj_for_integrated_candidates(data_date: str, max_codes: int = 30,
 
     try:
         if initial_result is None:
-            initial_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+            initial_result = integrated_strategy.run_integrated_strategy(as_of_date=data_date)
         candidate_buckets = ["buy_candidates", "high_priority_watch", "wait_pullback"]
         summary["moneydj_candidate_counts"] = {
             bucket: len(initial_result.get(bucket, []) or []) for bucket in candidate_buckets
@@ -5590,7 +6458,7 @@ def _sync_moneydj_for_integrated_candidates(data_date: str, max_codes: int = 30,
             data_date=data_date,
         )
 
-        refreshed_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+        refreshed_result = integrated_strategy.run_integrated_strategy(as_of_date=data_date)
         for bucket in ("buy_candidates", "high_priority_watch", "wait_pullback", "other_watch", "excluded"):
             summary["moneydj_valid_after"] += sum(
                 1 for stock in (refreshed_result.get(bucket, []) or [])
@@ -5650,7 +6518,7 @@ async def _sync_screener_and_moneydj_pipeline(target_date: str = "") -> dict:
             "data_date": data_date,
         }
 
-    initial_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+    initial_result = integrated_strategy.run_integrated_strategy(as_of_date=data_date)
     integrated_result = initial_result
     _last_integrated_result = initial_result
 
@@ -5705,7 +6573,10 @@ async def api_sync_screener():
 
         return {
             "status":                      "success" if result["success"] else "warning",
-            "message":                     "選股數據同步完成！" if result["success"] else "同步完成但資料未完全對齊，請確認大盤資料",
+            "message":                     "選股數據同步完成！" if result["success"] else (
+                "同步尚未完成：" + "；".join(validation.get("errors", []))
+                if validation.get("errors") else "同步尚未完成，請查看資料日期明細"
+            ),
             "data_date":                   result["data_date"],
             "stock_kbar_date":             validation.get("stock_kbar_date", ""),
             "market_data_date":            validation.get("market_data_date", ""),
@@ -5719,6 +6590,7 @@ async def api_sync_screener():
             "market_close_source":         result.get("market_close_source", "Yahoo Finance"),
             "effective_data_date_reason":  result.get("effective_data_date_reason", ""),
             "used_twse_fallback":          result.get("used_twse_fallback", False),
+            "stock_sync":                  result.get("stock_result", {}),
             **moneydj_sync,
         }
     except Exception as e:
@@ -5972,7 +6844,7 @@ async def api_broker_moneydj_sync_candidates(payload: dict = {}):
         data_date = _eff["data_date"]
         print(f"[api/broker/moneydj-sync-candidates] data_date={data_date}, reason={_eff['reason']}")
 
-        initial_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+        initial_result = integrated_strategy.run_integrated_strategy(as_of_date=data_date)
         candidate_buckets = ["buy_candidates", "high_priority_watch", "wait_pullback"]
         candidate_counts = {bucket: len(initial_result.get(bucket, []) or []) for bucket in candidate_buckets}
 
@@ -5999,7 +6871,7 @@ async def api_broker_moneydj_sync_candidates(payload: dict = {}):
             data_date=data_date,
         )
 
-        refreshed_result = integrated_strategy.run_integrated_strategy(data_date=data_date)
+        refreshed_result = integrated_strategy.run_integrated_strategy(as_of_date=data_date)
         _last_integrated_result = refreshed_result
         refreshed_summary = refreshed_result.get("summary", {})
         after_valid = 0
@@ -6031,7 +6903,7 @@ async def api_tomorrow_strategy():
         _eff = get_effective_screener_data_date()
         _data_date = _eff["data_date"]
         print(f"[api/tomorrow_strategy] data_date={_data_date}, reason={_eff['reason']}")
-        result = tomorrow_strategy.run_tomorrow_strategy(data_date=_data_date)
+        result = tomorrow_strategy.run_tomorrow_strategy(as_of_date=_data_date)
         return {"status": "success", **result}
     except Exception as e:
         import traceback
@@ -6046,7 +6918,7 @@ async def api_integrated_strategy():
         _eff = get_effective_screener_data_date()
         _data_date = _eff["data_date"]
         print(f"[api/integrated-strategy] data_date={_data_date}, reason={_eff['reason']}")
-        result = integrated_strategy.run_integrated_strategy(data_date=_data_date)
+        result = integrated_strategy.run_integrated_strategy(as_of_date=_data_date)
         _last_integrated_result = result
         date_check = validate_result_data_date(result)
         return {
@@ -6085,11 +6957,22 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.on_event("startup")
 async def startup_event():
     _init_tg_targets_table()
+    _init_taifex_oi_history_table()
+    asyncio.create_task(_scheduled_trading_doctor_oi_sync())
     scheduler.add_job(
         _scheduled_sync_and_alert,
         CronTrigger(day_of_week="mon-fri", hour=18, minute=0, timezone="Asia/Taipei"),
         id="daily_alert",
         name="每日18:00整合選股+Telegram精選推送",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        _scheduled_trading_doctor_oi_sync,
+        CronTrigger(day_of_week="mon-fri", hour=18, minute=10, timezone="Asia/Taipei"),
+        id="trading_doctor_oi_history",
+        name="每日18:10交易醫生期交所OI紀錄",
         replace_existing=True,
         misfire_grace_time=3600,
         coalesce=True,
@@ -6104,7 +6987,7 @@ async def startup_event():
         coalesce=True,
     )
     scheduler.start()
-    print("[Scheduler] 排程已啟動 — 每週一至週五 18:00 選股推送 / 08:00 震幅日報")
+    print("[Scheduler] 排程已啟動 — 18:00 選股 / 18:10 交易醫生 OI / 08:00 震幅日報")
 
 @app.on_event("shutdown")
 async def shutdown_event():

@@ -5147,13 +5147,23 @@ async function startApp(contractCode) {
         const tomorrowView   = document.getElementById('stock-tomorrow-view');
         const integratedView = document.getElementById('stock-integrated-view');
         const brokerView     = document.getElementById('stock-broker-view');
+        const stockKdScreenerContainer = document.getElementById('stock-kd-screener-container');
         const freelancerContainer = document.getElementById('freelancer-container');
+        const tradingDoctorContainer = document.getElementById('trading-doctor-container');
         const ampStatsContainer   = document.getElementById('amplitude-statistics-container');
         const panesEl             = document.getElementById('panes-container');
 
         // ── 全域 reset：清除所有模式 class，隱藏所有可切換容器 ──
-        appContainer.classList.remove('market-stocks', 'market-freelancer', 'market-amplitude-statistics');
+        appContainer.classList.remove(
+            'market-stocks',
+            'market-stock-screener',
+            'market-freelancer',
+            'market-trading-doctor',
+            'market-amplitude-statistics'
+        );
+        if (stockKdScreenerContainer) stockKdScreenerContainer.style.display = 'none';
         if (freelancerContainer) freelancerContainer.style.display = 'none';
+        if (tradingDoctorContainer) tradingDoctorContainer.style.display = 'none';
         if (ampStatsContainer)   ampStatsContainer.style.display   = 'none';
         // 移除震幅統計模式注入的動態 style 覆蓋（讓 CSS 重新接管 panes-container）
         const _existOverride = document.getElementById('_amp-panes-override');
@@ -5207,6 +5217,13 @@ async function startApp(contractCode) {
                 if (industryView) industryView.style.display = 'flex';
                 loadIndustryRankings();
             }
+        } else if (market === 'stock-screener') {
+            // 頂層「股票篩選」：週 KD 低檔鈍化黃金交叉工作區。
+            appContainer.classList.add('market-stock-screener');
+            if (tabsBar) tabsBar.style.display = 'none';
+            if (placeholder) placeholder.style.display = 'none';
+            if (stockKdScreenerContainer) stockKdScreenerContainer.style.display = 'flex';
+            initWeeklyKdScreener();
         } else if (market === 'freelancer') {
             appContainer.classList.add('market-freelancer');
             if (freelancerContainer) freelancerContainer.style.display = 'flex';
@@ -5220,6 +5237,12 @@ async function startApp(contractCode) {
             setTimeout(() => ensureFreelancerWeightedStocks(), 0);
             flStartAmplitudeRefresh();
             flStartWeightedSpreadRefresh();
+        } else if (market === 'trading-doctor') {
+            if (tabsBar) tabsBar.style.display = 'none';
+            if (placeholder) placeholder.style.display = 'none';
+            appContainer.classList.add('market-trading-doctor');
+            if (tradingDoctorContainer) tradingDoctorContainer.style.display = 'flex';
+            initTradingDoctor();
         } else if (market === 'amplitude-statistics') {
             // ── 震幅統計：動態注入 <style> 來隱藏 panes-container ──
             // CSS style.css 有 `#panes-container { display: grid !important }`，
@@ -5257,7 +5280,12 @@ async function startApp(contractCode) {
         const savedMarket = localStorage.getItem('global-market-type') || 'futures';
         
         // 初始載入時，生成對應市場的選單項目（自由人/震幅統計模式不需要合約選單）
-        if (savedMarket !== 'freelancer' && savedMarket !== 'amplitude-statistics') updateContractSelector(savedMarket, contractCode);
+        if (
+            savedMarket !== 'freelancer'
+            && savedMarket !== 'trading-doctor'
+            && savedMarket !== 'stock-screener'
+            && savedMarket !== 'amplitude-statistics'
+        ) updateContractSelector(savedMarket, contractCode);
         
         marketSelector.value = savedMarket;
         applyMarket(savedMarket);
@@ -5339,7 +5367,7 @@ async function startApp(contractCode) {
             loadingView.style.display = 'flex';
             tablesView.style.display = 'none';
             if (syncStatusText) {
-                syncStatusText.innerText = '正在向證交所同步三大法人數據，並下載熱門個股歷史日K線(約150天)，約需30秒，請勿關閉網頁...';
+                syncStatusText.innerText = '正在同步三大法人、大盤，以及證交所／櫃買中心缺少的全市場日K，請勿關閉網頁...';
             }
             
             try {
@@ -5359,7 +5387,10 @@ async function startApp(contractCode) {
                     // 同步後刷新整合選股
                     await loadIntegratedStrategy();
                 } else {
-                    alert(`同步失敗: ${data.detail || data.message || '未知錯誤'}`);
+                    const syncErrors = Array.isArray(data.errors) && data.errors.length
+                        ? `\n${data.errors.join('\n')}`
+                        : '';
+                    alert(`同步尚未完成：${data.detail || data.message || '資料日期尚未對齊'}${syncErrors}`);
                     loadingView.style.display = 'none';
                     tablesView.style.display = 'flex';
                 }
@@ -7772,6 +7803,34 @@ async function loadIntegratedStrategy() {
             dateLabel.textContent = `📅 ${data.data_date}`;
         }
 
+        // V2 Milestone 1 fail-closed：資料無效時不渲染任何候選清單。
+        if (data.strategy_valid === false) {
+            const errors = Array.isArray(data.data_errors)
+                ? data.data_errors
+                : ((data.data_validation && data.data_validation.errors) || []);
+            if (regCard) {
+                regCard.style.display = 'block';
+                regCard.innerHTML = `
+                <div style="background:rgba(255,68,68,0.08);border:1px solid rgba(255,68,68,0.5);border-left:4px solid #ff4444;border-radius:10px;padding:16px;">
+                    <div style="font-size:1rem;font-weight:700;color:#ff6b6b;">資料無效，選股已停止</div>
+                    <div style="margin-top:8px;color:#bbb;font-size:0.78rem;line-height:1.7;">
+                        ${(errors.length ? errors : ['必要資料日期不一致']).map(e => `• ${e}`).join('<br>')}
+                    </div>
+                    <div style="margin-top:8px;color:#777;font-size:0.72rem;">本次不產生明日可買，也不產生 Telegram 精選。</div>
+                </div>`;
+            }
+            _renderIntegratedBuyTable([]);
+            _renderIntegratedHighWatchTable([]);
+            _renderIntegratedWaitPullbackTable([]);
+            _renderIntegratedOtherWatchTable([]);
+            _renderIntegratedExcludedList([], data.summary || {});
+            if (emptyEl) {
+                emptyEl.style.display = 'block';
+                emptyEl.textContent = '等待個股、大盤與必要資料同步至同一個 as_of_date。';
+            }
+            return;
+        }
+
         const summary = data.summary || {};
         if (!summary.total_analyzed) {
             if (emptyEl) emptyEl.style.display = 'block';
@@ -8439,4 +8498,856 @@ function initBrokerTabSearch() {
     input.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') searchKeyBrokers();
     });
+}
+
+const _WEEKLY_SCREENER_CONFIG = {
+    kd: {
+        endpoint: '/api/stock-screener/weekly-kd',
+        buttonText: '查詢 KD 低檔訊號',
+        loadingButtonText: 'KD 全市場計算中...',
+        prompt: '目前選擇「KD 低檔鈍化＋交叉」，請點擊右上角按鈕開始查詢。',
+        loadingStatus: '正在讀取所有普通股日 K、聚合週線並檢查 KD 低檔鈍化交叉...',
+        loadingTable: '正在聚合全市場週 K 並計算 KD，請稍候...',
+        resultTitle: 'KD 低檔鈍化＋交叉｜篩選結果',
+        columns: ['#', '代號', '股名', '產業', '資料日', '收盤', '20 日均量', '週漲跌', 'K', 'D', '交叉', '低檔週數'],
+    },
+    macd: {
+        endpoint: '/api/stock-screener/weekly-macd-divergence',
+        buttonText: '查詢週 MACD 底背離',
+        loadingButtonText: 'MACD 全市場計算中...',
+        prompt: '目前選擇「週 K MACD 底背離」，請點擊右上角按鈕開始查詢。',
+        loadingStatus: '正在讀取所有普通股日 K、聚合週線並檢查 MACD 價格與 OSC 底背離...',
+        loadingTable: '正在聚合全市場週 K 並計算 MACD 底背離，請稍候...',
+        resultTitle: '週 K MACD 底背離｜篩選結果',
+        columns: [
+            '#', '代號', '股名', '產業', '資料日', '收盤', '20 日均量',
+            '前低日期', '前低價', '近低日期', '近低價', '價格再低',
+            '前 OSC', '近 OSC', 'OSC 回升',
+        ],
+    },
+};
+
+let _weeklyScreenerMode = 'kd';
+
+function initWeeklyKdScreener() {
+    const button = document.getElementById('weekly-kd-run-btn');
+    if (button && button.dataset.bound !== '1') {
+        button.dataset.bound = '1';
+        button.addEventListener('click', loadWeeklyKdScreener);
+    }
+
+    document.querySelectorAll('.weekly-screener-mode-btn').forEach(modeButton => {
+        if (modeButton.dataset.bound === '1') return;
+        modeButton.dataset.bound = '1';
+        modeButton.addEventListener('click', () => {
+            _setWeeklyScreenerMode(modeButton.dataset.mode || 'kd');
+        });
+    });
+
+    const volumeCheckbox = document.getElementById('weekly-volume-filter-checkbox');
+    if (volumeCheckbox && volumeCheckbox.dataset.bound !== '1') {
+        volumeCheckbox.dataset.bound = '1';
+        volumeCheckbox.addEventListener('change', () => {
+            _setWeeklyScreenerMode(_weeklyScreenerMode);
+        });
+    }
+
+    const container = document.getElementById('stock-kd-screener-container');
+    if (container && container.dataset.modeInitialized !== '1') {
+        container.dataset.modeInitialized = '1';
+        _setWeeklyScreenerMode('kd');
+    }
+}
+
+function _setWeeklyScreenerMode(mode) {
+    if (!_WEEKLY_SCREENER_CONFIG[mode]) return;
+    _weeklyScreenerMode = mode;
+    const config = _WEEKLY_SCREENER_CONFIG[mode];
+
+    document.querySelectorAll('.weekly-screener-mode-btn').forEach(button => {
+        const isActive = button.dataset.mode === mode;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+    });
+
+    const kdCriteria = document.getElementById('weekly-kd-criteria');
+    const macdCriteria = document.getElementById('weekly-macd-criteria');
+    if (kdCriteria) kdCriteria.style.display = mode === 'kd' ? 'flex' : 'none';
+    if (macdCriteria) macdCriteria.style.display = mode === 'macd' ? 'flex' : 'none';
+
+    const button = document.getElementById('weekly-kd-run-btn');
+    if (button) button.textContent = config.buttonText;
+    const summary = document.getElementById('weekly-kd-summary');
+    if (summary) summary.style.display = 'none';
+    _showWeeklyScreenerWarning('');
+    _configureWeeklyScreenerTable(mode);
+    const volumeFilterEnabled = Boolean(
+        document.getElementById('weekly-volume-filter-checkbox')?.checked
+    );
+    _setWeeklyKdStatus(
+        `${config.prompt}${volumeFilterEnabled ? ' 已啟用「20 日平均成交量 > 500 張」。' : ''}`
+    );
+}
+
+function _configureWeeklyScreenerTable(mode) {
+    const config = _WEEKLY_SCREENER_CONFIG[mode];
+    const head = document.getElementById('weekly-kd-results-head');
+    const tbody = document.getElementById('weekly-kd-results-body');
+    const title = document.getElementById('weekly-kd-result-title');
+    if (!config || !head || !tbody) return;
+
+    const headerRow = document.createElement('tr');
+    config.columns.forEach(label => {
+        const header = document.createElement('th');
+        header.textContent = label;
+        headerRow.appendChild(header);
+    });
+    head.replaceChildren(headerRow);
+    const table = head.closest('table');
+    if (table) table.classList.toggle('is-macd', mode === 'macd');
+
+    const row = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = config.columns.length;
+    cell.className = 'weekly-kd-empty';
+    cell.textContent = '尚未執行篩選';
+    row.appendChild(cell);
+    tbody.replaceChildren(row);
+    if (title) title.textContent = config.resultTitle;
+}
+
+function _setWeeklyScreenerEmpty(message, mode = _weeklyScreenerMode) {
+    const tbody = document.getElementById('weekly-kd-results-body');
+    const config = _WEEKLY_SCREENER_CONFIG[mode];
+    if (!tbody || !config) return;
+    const row = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = config.columns.length;
+    cell.className = 'weekly-kd-empty';
+    cell.textContent = message;
+    row.appendChild(cell);
+    tbody.replaceChildren(row);
+}
+
+function _showWeeklyScreenerWarning(message) {
+    const warning = document.getElementById('weekly-screener-warning');
+    if (!warning) return;
+    warning.textContent = message ? `⚠️ ${message}` : '';
+    warning.style.display = message ? 'block' : 'none';
+}
+
+function _setWeeklyKdStatus(message, state = '') {
+    const status = document.getElementById('weekly-kd-status');
+    if (!status) return;
+    status.textContent = message;
+    status.className = `weekly-kd-status${state ? ` is-${state}` : ''}`;
+}
+
+function _appendWeeklyKdCell(row, value, className = '') {
+    const cell = document.createElement('td');
+    cell.textContent = String(value ?? '--');
+    if (className) cell.className = className;
+    row.appendChild(cell);
+    return cell;
+}
+
+function _renderWeeklyScreenerSummary(payload) {
+    const summary = document.getElementById('weekly-kd-summary');
+    const insufficient = Number(payload.insufficient_count || 0);
+    const stale = Number(payload.stale_count || 0);
+    const skipped = insufficient + stale;
+    const stats = [
+        ['weekly-kd-as-of', payload.as_of_date || '--'],
+        ['weekly-kd-universe-count', Number(payload.universe_count || 0).toLocaleString()],
+        ['weekly-kd-analyzed-count', Number(payload.analyzed_count || 0).toLocaleString()],
+        ['weekly-kd-skipped-count', skipped.toLocaleString()],
+        ['weekly-kd-matched-count', Number(payload.matched_count || 0).toLocaleString()],
+    ];
+    stats.forEach(([id, value]) => {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value;
+    });
+    const skippedEl = document.getElementById('weekly-kd-skipped-count');
+    if (skippedEl) {
+        skippedEl.title = `歷史不足 ${insufficient.toLocaleString()} 檔；資料過期 ${stale.toLocaleString()} 檔`;
+    }
+    if (summary) summary.style.display = 'grid';
+}
+
+function _renderWeeklyKdResults(payload) {
+    const tbody = document.getElementById('weekly-kd-results-body');
+    const title = document.getElementById('weekly-kd-result-title');
+    if (!tbody) return;
+    _renderWeeklyScreenerSummary(payload);
+
+    const results = Array.isArray(payload.results) ? payload.results : [];
+    if (title) title.textContent = `KD 低檔鈍化＋交叉｜符合 ${results.length.toLocaleString()} 檔`;
+    tbody.replaceChildren();
+
+    if (!results.length) {
+        _setWeeklyScreenerEmpty('目前沒有同時符合「連續 3 週低檔鈍化＋最新週黃金交叉」的股票。', 'kd');
+        return;
+    }
+
+    results.forEach(item => {
+        const row = document.createElement('tr');
+        _appendWeeklyKdCell(row, item.rank);
+        _appendWeeklyKdCell(row, item.code, 'weekly-kd-code');
+        _appendWeeklyKdCell(row, item.name);
+        _appendWeeklyKdCell(row, item.category || '未分類');
+        _appendWeeklyKdCell(row, item.data_date);
+        _appendWeeklyKdCell(row, Number(item.close).toLocaleString(undefined, { maximumFractionDigits: 2 }));
+        _appendWeeklyKdCell(
+            row,
+            `${Number(item.avg_volume_20d || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })} 張`,
+            'weekly-volume-value'
+        );
+
+        const weeklyChange = Number(item.weekly_change_pct || 0);
+        const changeCell = _appendWeeklyKdCell(
+            row,
+            `${weeklyChange > 0 ? '+' : ''}${weeklyChange.toFixed(2)}%`
+        );
+        changeCell.style.color = weeklyChange > 0 ? '#ff6b6b' : weeklyChange < 0 ? '#39d98a' : '#8a96a8';
+
+        _appendWeeklyKdCell(row, Number(item.k).toFixed(2), 'weekly-kd-k');
+        _appendWeeklyKdCell(row, Number(item.d).toFixed(2), 'weekly-kd-d');
+
+        const crossCell = document.createElement('td');
+        const crossBadge = document.createElement('span');
+        crossBadge.className = 'weekly-kd-cross';
+        crossBadge.textContent = `黃金交叉 +${Number(item.cross_strength).toFixed(2)}`;
+        crossCell.appendChild(crossBadge);
+        row.appendChild(crossCell);
+
+        _appendWeeklyKdCell(row, `${Number(item.low_weeks || 0)} 週`);
+        tbody.appendChild(row);
+    });
+}
+
+function _renderWeeklyMacdResults(payload) {
+    const tbody = document.getElementById('weekly-kd-results-body');
+    const title = document.getElementById('weekly-kd-result-title');
+    if (!tbody) return;
+    _renderWeeklyScreenerSummary(payload);
+
+    const results = Array.isArray(payload.results) ? payload.results : [];
+    if (title) title.textContent = `週 K MACD 底背離｜符合 ${results.length.toLocaleString()} 檔`;
+    tbody.replaceChildren();
+
+    if (!results.length) {
+        _setWeeklyScreenerEmpty('目前沒有同時符合「價格創較低低點＋負值 OSC 低點抬高」的股票。', 'macd');
+        return;
+    }
+
+    results.forEach(item => {
+        const row = document.createElement('tr');
+        _appendWeeklyKdCell(row, item.rank);
+        _appendWeeklyKdCell(row, item.code, 'weekly-kd-code');
+        _appendWeeklyKdCell(row, item.name);
+        _appendWeeklyKdCell(row, item.category || '未分類');
+        _appendWeeklyKdCell(row, item.data_date);
+        _appendWeeklyKdCell(row, Number(item.close).toLocaleString(undefined, { maximumFractionDigits: 2 }));
+        _appendWeeklyKdCell(
+            row,
+            `${Number(item.avg_volume_20d || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })} 張`,
+            'weekly-volume-value'
+        );
+        _appendWeeklyKdCell(row, item.previous_low_date);
+        _appendWeeklyKdCell(row, Number(item.previous_price_low).toLocaleString(undefined, { maximumFractionDigits: 2 }));
+        _appendWeeklyKdCell(row, item.recent_low_date);
+        _appendWeeklyKdCell(row, Number(item.recent_price_low).toLocaleString(undefined, { maximumFractionDigits: 2 }));
+        _appendWeeklyKdCell(row, `${Number(item.price_lower_pct).toFixed(2)}%`, 'weekly-macd-price-lower');
+        _appendWeeklyKdCell(row, Number(item.previous_osc).toFixed(4), 'weekly-macd-osc');
+        _appendWeeklyKdCell(row, Number(item.recent_osc).toFixed(4), 'weekly-macd-osc is-recent');
+
+        const recoveryCell = document.createElement('td');
+        const recoveryBadge = document.createElement('span');
+        recoveryBadge.className = 'weekly-macd-recovery';
+        recoveryBadge.textContent = `+${Number(item.osc_recovery_pct).toFixed(2)}%`;
+        recoveryCell.appendChild(recoveryBadge);
+        row.appendChild(recoveryCell);
+        tbody.appendChild(row);
+    });
+}
+
+async function loadWeeklyKdScreener() {
+    const requestedMode = _weeklyScreenerMode;
+    const config = _WEEKLY_SCREENER_CONFIG[requestedMode];
+    const button = document.getElementById('weekly-kd-run-btn');
+    const summary = document.getElementById('weekly-kd-summary');
+    const volumeCheckbox = document.getElementById('weekly-volume-filter-checkbox');
+    const volumeFilterEnabled = Boolean(volumeCheckbox?.checked);
+    const endpoint = volumeFilterEnabled
+        ? `${config.endpoint}?min_avg_volume_20d_lots=500`
+        : config.endpoint;
+
+    if (button) {
+        button.disabled = true;
+        button.textContent = config.loadingButtonText;
+    }
+    document.querySelectorAll('.weekly-screener-mode-btn').forEach(modeButton => {
+        modeButton.disabled = true;
+    });
+    if (volumeCheckbox) volumeCheckbox.disabled = true;
+    if (summary) summary.style.display = 'none';
+    _showWeeklyScreenerWarning('');
+    _setWeeklyScreenerEmpty(config.loadingTable, requestedMode);
+    _setWeeklyKdStatus(config.loadingStatus, 'loading');
+
+    try {
+        const response = await fetch(endpoint, { cache: 'no-store' });
+        const payload = await response.json();
+        if (!response.ok || payload.status !== 'success') {
+            throw new Error(payload.detail || `HTTP ${response.status}`);
+        }
+
+        if (requestedMode === 'macd') {
+            _renderWeeklyMacdResults(payload);
+        } else {
+            _renderWeeklyKdResults(payload);
+        }
+        const insufficient = Number(payload.insufficient_count || 0);
+        const stale = Number(payload.stale_count || 0);
+        const excludedKyDr = Number(payload.excluded_ky_dr_count || 0);
+        const technicalMatched = Number(payload.technical_matched_count || payload.matched_count || 0);
+        const volumeExcluded = Number(payload.volume_filter_excluded_count || 0);
+        const matchSummary = volumeFilterEnabled
+            ? `技術訊號 ${technicalMatched.toLocaleString()} 檔，成交量排除 ${volumeExcluded.toLocaleString()} 檔，符合 ${Number(payload.matched_count || 0).toLocaleString()} 檔`
+            : `符合 ${Number(payload.matched_count || 0).toLocaleString()} 檔`;
+        _setWeeklyKdStatus(
+            `完成：分析 ${Number(payload.analyzed_count || 0).toLocaleString()} 檔，${matchSummary}；` +
+            `已排除 KY／DR ${excludedKyDr.toLocaleString()} 檔；歷史不足 ${insufficient.toLocaleString()} 檔、` +
+            `資料過期 ${stale.toLocaleString()} 檔未納入（耗時 ${Number(payload.elapsed_ms || 0).toLocaleString()} ms）。`,
+            'success'
+        );
+        _showWeeklyScreenerWarning(payload.warmup_warning || '');
+    } catch (error) {
+        _setWeeklyScreenerEmpty(`查詢失敗：${error.message || String(error)}`, requestedMode);
+        _setWeeklyKdStatus(`查詢失敗：${error.message || error}`, 'error');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = _WEEKLY_SCREENER_CONFIG[_weeklyScreenerMode].buttonText;
+        }
+        document.querySelectorAll('.weekly-screener-mode-btn').forEach(modeButton => {
+            modeButton.disabled = false;
+        });
+        if (volumeCheckbox) volumeCheckbox.disabled = false;
+    }
+}
+
+function _tradingDoctorLocalDateValue(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
+function initTradingDoctor() {
+    const input = document.getElementById('trading-doctor-date');
+    const button = document.getElementById('trading-doctor-fetch-btn');
+    const taifexButton = document.getElementById('trading-doctor-taifex-fetch-btn');
+    const taifexNightButton = document.getElementById('trading-doctor-taifex-night-fetch-btn');
+    if (!input || !button) return;
+
+    const today = new Date();
+    input.max = _tradingDoctorLocalDateValue(today);
+    if (!input.value) {
+        const previousDay = new Date(today);
+        previousDay.setDate(previousDay.getDate() - 1);
+        input.value = _tradingDoctorLocalDateValue(previousDay);
+    }
+
+    if (button.dataset.bound !== '1') {
+        button.dataset.bound = '1';
+        button.addEventListener('click', loadTradingDoctorInstitutionalSummary);
+    }
+    if (taifexButton && taifexButton.dataset.bound !== '1') {
+        taifexButton.dataset.bound = '1';
+        taifexButton.addEventListener('click', loadTradingDoctorTaifexFutures);
+    }
+    if (taifexNightButton && taifexNightButton.dataset.bound !== '1') {
+        taifexNightButton.dataset.bound = '1';
+        taifexNightButton.addEventListener('click', loadTradingDoctorTaifexNightFutures);
+    }
+    if (input.dataset.tradingDoctorBound !== '1') {
+        input.dataset.tradingDoctorBound = '1';
+        input.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+                loadTradingDoctorInstitutionalSummary();
+                loadTradingDoctorTaifexFutures();
+            }
+        });
+    }
+    loadTradingDoctorTaifexOiHistory();
+}
+
+function _setTradingDoctorStatus(message, state = '') {
+    const status = document.getElementById('trading-doctor-status');
+    if (!status) return;
+    status.textContent = message;
+    status.className = `trading-doctor-status${state ? ` is-${state}` : ''}`;
+}
+
+function _setTradingDoctorTaifexStatus(message, state = '') {
+    const status = document.getElementById('trading-doctor-taifex-status');
+    if (!status) return;
+    status.textContent = message;
+    status.className = `trading-doctor-status${state ? ` is-${state}` : ''}`;
+}
+
+function _setTradingDoctorTaifexNightStatus(message, state = '') {
+    const status = document.getElementById('trading-doctor-taifex-night-status');
+    if (!status) return;
+    status.textContent = message;
+    status.className = `trading-doctor-status${state ? ` is-${state}` : ''}`;
+}
+
+function _renderTradingDoctorInstitutionalSummary(payload) {
+    const result = document.getElementById('trading-doctor-result');
+    const title = document.getElementById('trading-doctor-result-title');
+    const hint = document.getElementById('trading-doctor-result-hint');
+    const sourceLink = document.getElementById('trading-doctor-source-link');
+    const tableHead = document.getElementById('trading-doctor-table-head');
+    const tableBody = document.getElementById('trading-doctor-table-body');
+    const notes = document.getElementById('trading-doctor-notes');
+    if (!result || !tableHead || !tableBody || !notes) return;
+
+    if (title) title.textContent = payload.title || '三大法人買賣金額統計表';
+    if (hint) {
+        const hintParts = [payload.hints, payload.source].filter(Boolean);
+        hint.textContent = hintParts.join('　｜　');
+    }
+
+    const officialUrl = String(payload.source_url || '');
+    if (sourceLink) {
+        const isTwseUrl = officialUrl.startsWith('https://www.twse.com.tw/');
+        sourceLink.style.display = isTwseUrl ? 'inline' : 'none';
+        sourceLink.href = isTwseUrl ? officialUrl : '#';
+    }
+
+    tableHead.replaceChildren();
+    tableBody.replaceChildren();
+    notes.replaceChildren();
+
+    const fields = Array.isArray(payload.fields) ? payload.fields : [];
+    const differenceIndex = fields.findIndex(field =>
+        String(field).replace(/\s/g, '').includes('買賣差額')
+    );
+    const headerRow = document.createElement('tr');
+    fields.forEach(field => {
+        const th = document.createElement('th');
+        th.textContent = String(field ?? '');
+        headerRow.appendChild(th);
+    });
+    tableHead.appendChild(headerRow);
+
+    const rows = Array.isArray(payload.data) ? payload.data : [];
+    rows.forEach(row => {
+        const tr = document.createElement('tr');
+        fields.forEach((_, index) => {
+            const td = document.createElement('td');
+            const value = Array.isArray(row) ? row[index] : '';
+            td.textContent = String(value ?? '');
+            if (index === differenceIndex) {
+                const numericValue = Number(String(value ?? '').replace(/,/g, ''));
+                if (numericValue > 0) td.classList.add('trading-doctor-value-positive');
+                if (numericValue < 0) td.classList.add('trading-doctor-value-negative');
+            }
+            tr.appendChild(td);
+        });
+        tableBody.appendChild(tr);
+    });
+
+    const noteItems = Array.isArray(payload.notes) ? payload.notes : [];
+    noteItems.forEach(note => {
+        const item = document.createElement('li');
+        item.textContent = String(note ?? '').replace(/<br\s*\/?>/gi, ' ');
+        notes.appendChild(item);
+    });
+    notes.style.display = noteItems.length ? 'block' : 'none';
+    result.style.display = 'flex';
+}
+
+async function loadTradingDoctorInstitutionalSummary() {
+    const input = document.getElementById('trading-doctor-date');
+    const button = document.getElementById('trading-doctor-fetch-btn');
+    const result = document.getElementById('trading-doctor-result');
+    const selectedDate = String(input?.value || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) {
+        _setTradingDoctorStatus('請先選擇有效日期。', 'error');
+        return;
+    }
+
+    const dayDate = selectedDate.replace(/-/g, '');
+    if (button) {
+        button.disabled = true;
+        button.textContent = '查詢中...';
+    }
+    if (result) result.style.display = 'none';
+    _setTradingDoctorStatus('正在向證交所取得資料...', 'loading');
+
+    try {
+        const response = await fetch(
+            `/api/trading-doctor/bfi82u?day_date=${encodeURIComponent(dayDate)}`
+        );
+        const payload = await response.json();
+        if (!response.ok || payload.success !== true) {
+            throw new Error(payload.detail || `HTTP ${response.status}`);
+        }
+        _renderTradingDoctorInstitutionalSummary(payload);
+        _setTradingDoctorStatus(
+            `已取得 ${payload.date || dayDate}，共 ${(payload.data || []).length} 筆資料。`,
+            'success'
+        );
+    } catch (error) {
+        _setTradingDoctorStatus(`查詢失敗：${error.message || error}`, 'error');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '查詢證交所資料';
+        }
+    }
+}
+
+function _formatTradingDoctorOiValue(value) {
+    const numericValue = Number(value);
+    if (!Number.isFinite(numericValue)) return '--';
+    const maximumFractionDigits = Number.isInteger(numericValue) ? 0 : 2;
+    const formattedValue = Math.abs(numericValue).toLocaleString('en-US', {
+        minimumFractionDigits: maximumFractionDigits,
+        maximumFractionDigits,
+    });
+    return `${numericValue > 0 ? '+' : numericValue < 0 ? '-' : ''}${formattedValue}`;
+}
+
+function _renderTradingDoctorTaifexOiHistory(rows, maxRecords = 14) {
+    const tableBody = document.getElementById('trading-doctor-oi-history-body');
+    const count = document.getElementById('trading-doctor-oi-history-count');
+    if (!tableBody) return;
+
+    const historyRows = Array.isArray(rows) ? rows : [];
+    tableBody.replaceChildren();
+    if (count) {
+        count.textContent = `已記錄 ${historyRows.length} / ${maxRecords} 個交易日・新到舊`;
+    }
+
+    if (!historyRows.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 6;
+        td.className = 'trading-doctor-oi-history-empty';
+        td.textContent = '尚無紀錄；查詢期貨資料後會自動保存。';
+        tr.appendChild(td);
+        tableBody.appendChild(tr);
+        return;
+    }
+
+    const valueKeys = [
+        'txf_foreign_net_oi',
+        'mxf_foreign_net_oi',
+        'tmf_foreign_net_oi',
+        'equivalent_net_oi_rounded',
+        'day_session_change',
+    ];
+    historyRows.forEach(row => {
+        const tr = document.createElement('tr');
+        const dateCell = document.createElement('td');
+        dateCell.textContent = String(row.display_date || row.date || '');
+        tr.appendChild(dateCell);
+
+        valueKeys.forEach(key => {
+            const td = document.createElement('td');
+            if (key === 'day_session_change' && row[key] == null) {
+                td.textContent = '';
+                tr.appendChild(td);
+                return;
+            }
+            const numericValue = Number(row[key]);
+            td.textContent = _formatTradingDoctorOiValue(row[key]);
+            if (numericValue > 0) td.classList.add('trading-doctor-value-positive');
+            if (numericValue < 0) td.classList.add('trading-doctor-value-negative');
+            tr.appendChild(td);
+        });
+        tableBody.appendChild(tr);
+    });
+}
+
+async function loadTradingDoctorTaifexOiHistory() {
+    const count = document.getElementById('trading-doctor-oi-history-count');
+    try {
+        const response = await fetch('/api/trading-doctor/taifex-oi-history');
+        const payload = await response.json();
+        if (!response.ok || payload.success !== true) {
+            throw new Error(payload.detail || `HTTP ${response.status}`);
+        }
+        _renderTradingDoctorTaifexOiHistory(
+            payload.data,
+            Number(payload.max_records) || 14
+        );
+    } catch (error) {
+        if (count) count.textContent = `紀錄讀取失敗：${error.message || error}`;
+    }
+}
+
+function _renderTradingDoctorTaifexFutures(payload) {
+    const result = document.getElementById('trading-doctor-taifex-result');
+    const title = document.getElementById('trading-doctor-taifex-result-title');
+    const hint = document.getElementById('trading-doctor-taifex-result-hint');
+    const sourceLink = document.getElementById('trading-doctor-taifex-source-link');
+    const tableHead = document.getElementById('trading-doctor-taifex-table-head');
+    const tableBody = document.getElementById('trading-doctor-taifex-table-body');
+    const notes = document.getElementById('trading-doctor-taifex-notes');
+    if (!result || !tableHead || !tableBody || !notes) return;
+
+    const summary = payload.foreign_oi_summary || {};
+    const summaryFields = [
+        ['trading-doctor-txf-net-oi', summary.txf_foreign_net_oi],
+        ['trading-doctor-mxf-net-oi', summary.mxf_foreign_net_oi],
+        ['trading-doctor-tmf-net-oi', summary.tmf_foreign_net_oi],
+        ['trading-doctor-equivalent-net-oi', summary.equivalent_net_oi],
+    ];
+    summaryFields.forEach(([elementId, value]) => {
+        const element = document.getElementById(elementId);
+        if (!element) return;
+        element.textContent = _formatTradingDoctorOiValue(value);
+    });
+
+    if (Array.isArray(payload.oi_history)) {
+        _renderTradingDoctorTaifexOiHistory(
+            payload.oi_history,
+            Number(payload.history_limit) || 14
+        );
+    }
+
+    if (title) title.textContent = payload.title || '期交所三大法人期貨部位';
+    if (hint) {
+        const hintParts = [payload.hints, payload.source].filter(Boolean);
+        hint.textContent = hintParts.join('　｜　');
+    }
+
+    const officialUrl = String(payload.source_url || '');
+    if (sourceLink) {
+        const isTaifexUrl = officialUrl.startsWith('https://www.taifex.com.tw/');
+        sourceLink.style.display = isTaifexUrl ? 'inline' : 'none';
+        sourceLink.href = isTaifexUrl ? officialUrl : '#';
+    }
+
+    tableHead.replaceChildren();
+    tableBody.replaceChildren();
+    notes.replaceChildren();
+
+    const fields = Array.isArray(payload.fields) ? payload.fields : [];
+    const netIndexes = new Set();
+    const headerRow = document.createElement('tr');
+    fields.forEach((field, index) => {
+        const fieldText = String(field ?? '');
+        if (fieldText.replace(/\s/g, '').includes('淨額')) netIndexes.add(index);
+        const th = document.createElement('th');
+        th.textContent = fieldText;
+        headerRow.appendChild(th);
+    });
+    tableHead.appendChild(headerRow);
+
+    const rows = Array.isArray(payload.data) ? payload.data : [];
+    rows.forEach(row => {
+        const tr = document.createElement('tr');
+        fields.forEach((_, index) => {
+            const td = document.createElement('td');
+            const rawValue = String(Array.isArray(row) ? (row[index] ?? '') : '');
+            const numericText = rawValue.replace(/,/g, '');
+            td.textContent = index >= 3 && /^-?\d+$/.test(numericText)
+                ? Number(numericText).toLocaleString('en-US')
+                : rawValue;
+            if (netIndexes.has(index)) {
+                const numericValue = Number(numericText);
+                if (numericValue > 0) td.classList.add('trading-doctor-value-positive');
+                if (numericValue < 0) td.classList.add('trading-doctor-value-negative');
+            }
+            tr.appendChild(td);
+        });
+        tableBody.appendChild(tr);
+    });
+
+    const noteItems = Array.isArray(payload.notes) ? payload.notes : [];
+    noteItems.forEach(note => {
+        const item = document.createElement('li');
+        item.textContent = String(note ?? '');
+        notes.appendChild(item);
+    });
+    notes.style.display = noteItems.length ? 'block' : 'none';
+    result.style.display = 'flex';
+}
+
+async function loadTradingDoctorTaifexFutures() {
+    const input = document.getElementById('trading-doctor-date');
+    const button = document.getElementById('trading-doctor-taifex-fetch-btn');
+    const result = document.getElementById('trading-doctor-taifex-result');
+    const selectedDate = String(input?.value || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) {
+        _setTradingDoctorTaifexStatus('期交所：請先選擇有效日期。', 'error');
+        return;
+    }
+
+    const dayDate = selectedDate.replace(/-/g, '');
+    const commodityId = 'TAIWAN_INDEX';
+    const commodityName = '台指期／小台／微型台指';
+    if (button) {
+        button.disabled = true;
+        button.textContent = '查詢中...';
+    }
+    if (result) result.style.display = 'none';
+    _setTradingDoctorTaifexStatus(
+        `期交所：正在取得 ${commodityName} 三大法人資料...`,
+        'loading'
+    );
+
+    try {
+        const query = new URLSearchParams({
+            day_date: dayDate,
+            commodity_id: commodityId,
+        });
+        const response = await fetch(`/api/trading-doctor/taifex-futures?${query}`);
+        const payload = await response.json();
+        if (!response.ok || payload.success !== true) {
+            throw new Error(payload.detail || `HTTP ${response.status}`);
+        }
+        _renderTradingDoctorTaifexFutures(payload);
+        _setTradingDoctorTaifexStatus(
+            `期交所：已取得 ${payload.date || dayDate} ${payload.commodity_name || commodityName}，共 ${(payload.data || []).length} 筆資料。`,
+            'success'
+        );
+    } catch (error) {
+        _setTradingDoctorTaifexStatus(
+            `期交所查詢失敗：${error.message || error}`,
+            'error'
+        );
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '查詢三項期貨資料';
+        }
+    }
+}
+
+function _renderTradingDoctorTaifexNightFutures(payload) {
+    const result = document.getElementById('trading-doctor-taifex-night-result');
+    const title = document.getElementById('trading-doctor-taifex-night-result-title');
+    const hint = document.getElementById('trading-doctor-taifex-night-result-hint');
+    const sourceLink = document.getElementById('trading-doctor-taifex-night-source-link');
+    const tableHead = document.getElementById('trading-doctor-taifex-night-table-head');
+    const tableBody = document.getElementById('trading-doctor-taifex-night-table-body');
+    const notes = document.getElementById('trading-doctor-taifex-night-notes');
+    if (!result || !tableHead || !tableBody || !notes) return;
+
+    if (title) title.textContent = payload.title || '期交所三大法人夜盤交易';
+    if (hint) {
+        const hintParts = [payload.hints, payload.source].filter(Boolean);
+        hint.textContent = hintParts.join('　｜　');
+    }
+
+    const officialUrl = String(payload.source_url || '');
+    if (sourceLink) {
+        const isTaifexUrl = officialUrl === 'https://www.taifex.com.tw/cht/3/futContractsDateAh';
+        sourceLink.style.display = isTaifexUrl ? 'inline' : 'none';
+        sourceLink.href = isTaifexUrl ? officialUrl : '#';
+    }
+
+    tableHead.replaceChildren();
+    tableBody.replaceChildren();
+    notes.replaceChildren();
+
+    const fields = Array.isArray(payload.fields) ? payload.fields : [];
+    const netIndexes = new Set();
+    const headerRow = document.createElement('tr');
+    fields.forEach((field, index) => {
+        const fieldText = String(field ?? '');
+        if (fieldText.replace(/\s/g, '').includes('淨額')) netIndexes.add(index);
+        const th = document.createElement('th');
+        th.textContent = fieldText;
+        headerRow.appendChild(th);
+    });
+    tableHead.appendChild(headerRow);
+
+    const rows = Array.isArray(payload.data) ? payload.data : [];
+    rows.forEach(row => {
+        const tr = document.createElement('tr');
+        fields.forEach((_, index) => {
+            const td = document.createElement('td');
+            const rawValue = String(Array.isArray(row) ? (row[index] ?? '') : '');
+            const numericText = rawValue.replace(/,/g, '');
+            td.textContent = index >= 3 && /^-?\d+$/.test(numericText)
+                ? Number(numericText).toLocaleString('en-US')
+                : rawValue;
+            if (netIndexes.has(index)) {
+                const numericValue = Number(numericText);
+                if (numericValue > 0) td.classList.add('trading-doctor-value-positive');
+                if (numericValue < 0) td.classList.add('trading-doctor-value-negative');
+            }
+            tr.appendChild(td);
+        });
+        tableBody.appendChild(tr);
+    });
+
+    const noteItems = Array.isArray(payload.notes) ? payload.notes : [];
+    noteItems.forEach(note => {
+        const item = document.createElement('li');
+        item.textContent = String(note ?? '');
+        notes.appendChild(item);
+    });
+    notes.style.display = noteItems.length ? 'block' : 'none';
+    result.style.display = 'flex';
+}
+
+async function loadTradingDoctorTaifexNightFutures() {
+    const input = document.getElementById('trading-doctor-date');
+    const button = document.getElementById('trading-doctor-taifex-night-fetch-btn');
+    const result = document.getElementById('trading-doctor-taifex-night-result');
+    const selectedDate = String(input?.value || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) {
+        _setTradingDoctorTaifexNightStatus('期交所夜盤：請先選擇有效日期。', 'error');
+        return;
+    }
+
+    const dayDate = selectedDate.replace(/-/g, '');
+    const commodityName = '台指期／小台／微型台指';
+    if (button) {
+        button.disabled = true;
+        button.textContent = '查詢中...';
+    }
+    if (result) result.style.display = 'none';
+    _setTradingDoctorTaifexNightStatus(
+        `期交所夜盤：正在取得 ${commodityName} 三大法人交易資料...`,
+        'loading'
+    );
+
+    try {
+        const query = new URLSearchParams({
+            day_date: dayDate,
+            commodity_id: 'TAIWAN_INDEX',
+        });
+        const response = await fetch(
+            `/api/trading-doctor/taifex-futures-after-hours?${query}`
+        );
+        const payload = await response.json();
+        if (!response.ok || payload.success !== true) {
+            throw new Error(payload.detail || `HTTP ${response.status}`);
+        }
+        _renderTradingDoctorTaifexNightFutures(payload);
+        _setTradingDoctorTaifexNightStatus(
+            `期交所夜盤：已取得 ${payload.date || dayDate}，共 ${(payload.data || []).length} 筆資料。`,
+            'success'
+        );
+    } catch (error) {
+        _setTradingDoctorTaifexNightStatus(
+            `期交所夜盤查詢失敗：${error.message || error}`,
+            'error'
+        );
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '查詢三項夜盤資料';
+        }
+    }
 }

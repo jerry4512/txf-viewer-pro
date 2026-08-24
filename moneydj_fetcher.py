@@ -559,17 +559,24 @@ def _build_period_chip_summary(buy_rows: list[dict[str, Any]], sell_rows: list[d
     return {"period_chip_status": status, "period_chip_reason": reason}
 
 
-def get_moneydj_period_summary(conn: sqlite3.Connection, code: str, period_label: str = "5D") -> dict[str, Any]:
+def get_moneydj_period_summary(
+    conn: sqlite3.Connection,
+    code: str,
+    period_label: str = "5D",
+    as_of_date: str | None = None,
+) -> dict[str, Any]:
     ensure_broker_period_summary_table(conn)
     period = _normalize_period(period_label)
     conn.row_factory = sqlite3.Row
+    as_of_clause = " AND end_date <= ?" if as_of_date else ""
     latest = conn.execute(
-        """
+        f"""
         SELECT MAX(end_date) AS end_date
         FROM broker_period_summary
         WHERE code=? AND period_label=? AND source=?
+        {as_of_clause}
         """,
-        (str(code), period, SOURCE),
+        (str(code), period, SOURCE, *([str(as_of_date)] if as_of_date else [])),
     ).fetchone()
     end_date = latest["end_date"] if latest and latest["end_date"] else None
     if not end_date:

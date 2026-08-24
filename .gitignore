@@ -7,8 +7,13 @@
 # 資料庫與快取（執行期產生，不上 git）
 stock_cache.db
 kbars_cache.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.before-*.db
 institutional_cache.json
 shioaji.log
+log/
 
 # Python
 __pycache__/

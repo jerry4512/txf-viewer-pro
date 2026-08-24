@@ -1,0 +1,50 @@
+{
+  "baseline_commit": "55036b328d84fb61ea62196764956d5f541f41cc",
+  "captured_before_capital_flow_v2_m1": true,
+  "as_of_date": "2026-08-10",
+  "strategy_valid": true,
+  "formal_projection_fields": [
+    "stock_id",
+    "stock_name",
+    "final_category",
+    "tomorrow_category",
+    "final_score",
+    "base_score",
+    "chip_bonus",
+    "industry_bonus",
+    "liquidity_bonus",
+    "broker_bonus",
+    "risk_penalty",
+    "grade",
+    "risk_reward",
+    "rr_valid",
+    "rr_buyable"
+  ],
+  "buckets": {
+    "buy_candidates": {
+      "count": 14,
+      "ordered_codes": ["2891", "1402", "3362", "2882", "5371", "4938", "2542", "2606", "6197", "2302", "1303", "2484", "2330", "6177"],
+      "sha256": "5d45b513286ab236d60c5431c53362e3a9ea2c4e7c7412182151d7f9d5f8b0fa"
+    },
+    "high_priority_watch": {
+      "count": 22,
+      "ordered_codes": ["3441", "2618", "2881", "6277", "2539", "3029", "2884", "2867", "2885", "2887", "2615", "2637", "1101", "4123", "2002", "2609", "6409", "2409", "2603", "2421", "6278", "3498"],
+      "sha256": "1a72e80c273ef8fc73cb5bed633a2feb74eb2d713239b10f8cf8f756c00b785b"
+    },
+    "wait_pullback": {
+      "count": 9,
+      "ordered_codes": ["1907", "2027", "3017", "2377", "6414", "3709", "3702", "6279", "2727"],
+      "sha256": "51f80fcdf82ae2531b3ca18f6a7860a0a6a32007c98b3235b0510144e475781b"
+    },
+    "other_watch": {
+      "count": 37,
+      "ordered_codes": ["2886", "6214", "3005", "2101", "2880", "6416", "2883", "3617", "2915", "4536", "2425", "2527", "2605", "1709", "2850", "2006", "2347", "1216", "6196", "3034", "2633", "1477", "3260", "3023", "3665", "4939", "2889", "2890", "2357", "4541", "3293", "6187", "2206", "5434", "2845", "5876", "2892"],
+      "sha256": "086e7f6b1735bb52081dc02e8789a9f19df15be6711a56adbf8726e1100bbff8"
+    },
+    "excluded": {
+      "count": 2060,
+      "ordered_codes": null,
+      "sha256": "5463fec40738dc025227da33ba2624f2191b4683cc8de6971946b56585d8c443"
+    }
+  }
+}

@@ -18,10 +18,11 @@ integrated_strategy.py
 import os
 import sqlite3
 import pandas as pd
-from datetime import datetime
 from collections import defaultdict
 
 import tomorrow_strategy as _ts
+import capital_flow_v2 as _capital_flow_v2
+from stock_selection_schema import ensure_stock_selection_schema
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _DB_PATH  = os.path.join(_BASE_DIR, "stock_cache.db")
@@ -36,13 +37,14 @@ def _get_conn():
         conn.execute("PRAGMA journal_mode=WAL;")
     except Exception:
         pass
+    ensure_stock_selection_schema(conn)
     return conn
 
 
 # ── Step 2：從 DB 取得籌碼資料 ─────────────────────────────────────────────────
 
-def _get_chip_data(codes: list) -> dict:
-    """對指定股票代號查詢近5日三大法人買超與連續買超天數。"""
+def _get_chip_data(codes: list, as_of_date: str) -> dict:
+    """Point-in-time法人資料：只查 latest dates <= as_of_date。"""
     if not codes:
         return {}
 
@@ -56,16 +58,20 @@ def _get_chip_data(codes: list) -> dict:
                    SUM(foreign_buy)    AS foreign_5d,
                    SUM(investment_buy) AS trust_5d,
                    SUM(dealer_buy)     AS dealer_5d,
-                   SUM(foreign_buy + investment_buy + dealer_buy) AS total_5d
+                   SUM(foreign_buy + investment_buy + dealer_buy) AS total_5d,
+                   SUM(COALESCE(foreign_buy_shares, foreign_buy * 1000)) AS foreign_5d_shares,
+                   SUM(COALESCE(investment_buy_shares, investment_buy * 1000)) AS trust_5d_shares,
+                   SUM(COALESCE(dealer_buy_shares, dealer_buy * 1000)) AS dealer_5d_shares
             FROM institutional_trading
             WHERE code IN ({ph})
               AND date IN (
                   SELECT DISTINCT date FROM institutional_trading
+                  WHERE date <= ?
                   ORDER BY date DESC LIMIT 5
               )
             GROUP BY code
             """,
-            conn, params=codes,
+            conn, params=[*codes, as_of_date],
         )
         # 近10日明細（用於計算連續買超天數）
         df10 = pd.read_sql_query(
@@ -73,9 +79,10 @@ def _get_chip_data(codes: list) -> dict:
             SELECT code, date, foreign_buy, investment_buy
             FROM institutional_trading
             WHERE code IN ({ph})
+              AND date <= ?
             ORDER BY code, date ASC
             """,
-            conn, params=codes,
+            conn, params=[*codes, as_of_date],
         )
     except Exception as e:
         print(f"[IntegratedStrategy] chip data query error: {e}")
@@ -92,6 +99,9 @@ def _get_chip_data(codes: list) -> dict:
                 'trust_5d':          int(row['trust_5d']    or 0),
                 'dealer_5d':         int(row['dealer_5d']   or 0),
                 'total_5d':          int(row['total_5d']    or 0),
+                'foreign_5d_shares': int(row['foreign_5d_shares'] or 0),
+                'trust_5d_shares':   int(row['trust_5d_shares'] or 0),
+                'dealer_5d_shares':  int(row['dealer_5d_shares'] or 0),
                 'foreign_consecutive': 0,
                 'trust_consecutive':   0,
             }
@@ -115,6 +125,8 @@ def _get_chip_data(codes: list) -> dict:
                 result[code] = {
                     'foreign_5d': 0, 'trust_5d': 0,
                     'dealer_5d': 0, 'total_5d': 0,
+                    'foreign_5d_shares': 0, 'trust_5d_shares': 0,
+                    'dealer_5d_shares': 0,
                 }
             result[code]['foreign_consecutive'] = f_strike
             result[code]['trust_consecutive']   = t_strike
@@ -137,7 +149,7 @@ def _empty_broker() -> dict:
     }
 
 
-def _score_moneydj_summary(summary: dict, data_date: str) -> dict:
+def _score_moneydj_summary(summary: dict, as_of_date: str) -> dict:
     broker = _empty_broker()
     if not summary or summary.get('status') != 'success':
         return broker
@@ -157,7 +169,7 @@ def _score_moneydj_summary(summary: dict, data_date: str) -> dict:
         'broker_comment': reason_text or status_text or 'MoneyDJ\u5206\u9ede\u8cc7\u6599\u7121\u660e\u78ba\u8a0a\u865f\u3002',
     })
 
-    if not end_date or str(end_date) != str(data_date):
+    if not end_date or str(end_date) != str(as_of_date):
         display_end_date = end_date or '\u7f3a\u5931'
         broker.update({
             'broker_score': 0,
@@ -165,7 +177,7 @@ def _score_moneydj_summary(summary: dict, data_date: str) -> dict:
             'broker_risk': 'stale_data',
             'broker_tags': ['MoneyDJ\u65e5\u671f\u4e0d\u4e00\u81f4'],
             'moneydj_date_valid': False,
-            'broker_comment': f"MoneyDJ\u8cc7\u6599\u65e5\u671f{display_end_date}\u8207\u9078\u80a1\u57fa\u6e96\u65e5{data_date}\u4e0d\u4e00\u81f4\uff0c\u4e0d\u53c3\u8207\u52a0\u5206\u3002",
+            'broker_comment': f"MoneyDJ\u8cc7\u6599\u65e5\u671f{display_end_date}\u8207\u9078\u80a1\u57fa\u6e96\u65e5{as_of_date}\u4e0d\u4e00\u81f4\uff0c\u4e0d\u53c3\u8207\u52a0\u5206\u3002",
         })
         return broker
 
@@ -214,7 +226,7 @@ def _score_moneydj_summary(summary: dict, data_date: str) -> dict:
     return broker
 
 
-def _get_broker_data(codes: list, data_date: str) -> dict:
+def _get_broker_data(codes: list, as_of_date: str) -> dict:
     """Read existing MoneyDJ period summaries and convert them to broker helper fields."""
     result = {str(code): _empty_broker() for code in (codes or [])}
     if not codes:
@@ -232,8 +244,10 @@ def _get_broker_data(codes: list, data_date: str) -> dict:
         for code in codes:
             code_str = str(code)
             try:
-                summary = moneydj_fetcher.get_moneydj_period_summary(conn, code_str, '5D')
-                result[code_str] = _score_moneydj_summary(summary, data_date)
+                summary = moneydj_fetcher.get_moneydj_period_summary(
+                    conn, code_str, '5D', as_of_date=as_of_date
+                )
+                result[code_str] = _score_moneydj_summary(summary, as_of_date)
             except Exception as one_err:
                 print(f"[IntegratedStrategy] WARNING: MoneyDJ broker read failed for {code_str}: {one_err}")
                 result[code_str] = _empty_broker()
@@ -251,6 +265,7 @@ def _empty_chip() -> dict:
     return {
         'foreign_5d': 0, 'trust_5d': 0, 'dealer_5d': 0,
         'total_5d': 0, 'foreign_consecutive': 0, 'trust_consecutive': 0,
+        'foreign_5d_shares': 0, 'trust_5d_shares': 0, 'dealer_5d_shares': 0,
     }
 
 
@@ -566,7 +581,10 @@ def _build_action_suggestion(stock: dict) -> str:
 
 # ── 主函式 ────────────────────────────────────────────────────────────────────
 
-def run_integrated_strategy(data_date: str = None) -> dict:
+def run_integrated_strategy(
+    as_of_date: str = None,
+    data_date: str = None,
+) -> dict:
     """
     整合選股主入口。
     Returns:
@@ -584,12 +602,48 @@ def run_integrated_strategy(data_date: str = None) -> dict:
     """
     print("[IntegratedStrategy] 開始執行整合選股…")
 
+    if data_date is not None:
+        if as_of_date is not None and str(as_of_date) != str(data_date):
+            return {
+                'status': 'success', 'strategy_valid': False,
+                'as_of_date': str(as_of_date), 'data_date': str(as_of_date),
+                'market_regime': {},
+                'summary': {'total_analyzed': 0, 'buy_count': 0,
+                            'high_priority_watch_count': 0, 'wait_pullback_count': 0,
+                            'other_watch_count': 0, 'excluded_count': 0},
+                'buy_candidates': [], 'high_priority_watch': [],
+                'wait_pullback': [], 'other_watch': [], 'excluded': [],
+                'data_errors': [
+                    f"as_of_date {as_of_date} 與 legacy data_date {data_date} 不一致"
+                ],
+            }
+        as_of_date = str(data_date)
+
     # ── Step 1：執行 tomorrow_strategy 取得主決策結果 ───────────────────
-    ts_result     = _ts.run_tomorrow_strategy(data_date=data_date)
+    ts_result     = _ts.run_tomorrow_strategy(as_of_date=as_of_date)
     market_regime = ts_result.get('market_regime', {})
-    data_date     = ts_result.get('data_date', datetime.now().strftime('%Y-%m-%d'))
+    as_of_date    = ts_result.get('as_of_date') or ts_result.get('data_date') or str(as_of_date or '')
     regime_status = market_regime.get('status', '')
     regime_label  = market_regime.get('label', '')
+
+    if not ts_result.get('strategy_valid', False):
+        errors = ts_result.get('data_errors') or ["必要資料無效，策略已停止"]
+        return {
+            'status': 'success',
+            'strategy_valid': False,
+            'as_of_date': as_of_date,
+            'data_date': as_of_date,
+            'stock_kbar_date': ts_result.get('stock_kbar_date', ''),
+            'market_regime': market_regime,
+            'summary': {
+                'total_analyzed': 0, 'buy_count': 0,
+                'high_priority_watch_count': 0, 'wait_pullback_count': 0,
+                'other_watch_count': 0, 'excluded_count': 0,
+            },
+            'buy_candidates': [], 'high_priority_watch': [],
+            'wait_pullback': [], 'other_watch': [], 'excluded': [],
+            'data_errors': errors,
+        }
 
     # 非 excluded 的股票（含 buy / high_watch / other_watch）
     ts_active = (
@@ -599,9 +653,35 @@ def run_integrated_strategy(data_date: str = None) -> dict:
     )
     all_codes = list({s['symbol'] for s in ts_active})
 
+    # Capital Flow V2 Milestone 1 is intentionally computed out-of-band.  The
+    # formal scoring/classification code below never reads these shadow fields.
+    capital_flow_bundle = {
+        'shadow_mode': True,
+        'as_of_date': as_of_date,
+        'metrics_by_code': {},
+        'universe_size': 0,
+        'errors': [],
+    }
+    capital_flow_conn = _get_conn()
+    try:
+        capital_flow_bundle = _capital_flow_v2.compute_capital_flow_v2_shadow(
+            capital_flow_conn, as_of_date
+        )
+    except Exception as exc:
+        capital_flow_bundle['errors'] = [
+            f'{type(exc).__name__}: {exc}'
+        ]
+        print(
+            '[IntegratedStrategy] Capital Flow V2 shadow calculation error: '
+            f'{type(exc).__name__}: {exc}'
+        )
+    finally:
+        capital_flow_conn.close()
+    capital_flow_by_code = capital_flow_bundle.get('metrics_by_code', {})
+
     # ── Step 2：取得籌碼資料 ─────────────────────────────────────────────
-    chip_data = _get_chip_data(all_codes)
-    broker_data = _get_broker_data(all_codes, data_date)
+    chip_data = _get_chip_data(all_codes, as_of_date)
+    broker_data = _get_broker_data(all_codes, as_of_date)
 
     # ── Step 3：合併個股資料 ─────────────────────────────────────────────
     enriched: list = []
@@ -648,13 +728,28 @@ def run_integrated_strategy(data_date: str = None) -> dict:
             'down_vol':             s.get('down_vol', False),
             'vol_shrinking':        s.get('vol_shrinking', False),
             'volume_ma20':          s.get('volume_ma20', 0),
+            'amount_ma5':           s.get('amount_ma5', 0),
             'amount_ma20':          s.get('amount_ma20', 0),
+            'liquidity_trend':       s.get('liquidity_trend'),
+            'amount_rank':           s.get('amount_rank'),
+            'volume_rank':           s.get('volume_rank'),
             'stop_price':           stop_price,
             'stop_loss_pct':        stop_pct,
             'resistance_price':     s.get('resistance_price', 0),
+            'target_price':         s.get('target_price'),
+            'previous_60d_high':    s.get('previous_60d_high'),
+            'current_60d_high':     s.get('current_60d_high'),
+            'target_status':        s.get('target_status'),
             'is_near_60d_high':     s.get('is_near_60d_high', False),
             'risk_reward':          s.get('risk_reward'),
+            'signal_rr':            s.get('signal_rr'),
             'rr_valid':             s.get('rr_valid', False),
+            'rr_buyable':           s.get('rr_buyable', False),
+            'signal_entry':         s.get('signal_entry'),
+            'signal_close':         s.get('signal_close'),
+            'max_entry_rr15':       s.get('max_entry_rr15'),
+            'actual_entry':         s.get('actual_entry'),
+            'skip_trade':           s.get('skip_trade'),
             'buy_method':           s.get('buy_method', ''),
             'entry_condition':      s.get('entry_condition', ''),
             'include_reasons':      s.get('include_reasons', []),
@@ -667,6 +762,9 @@ def run_integrated_strategy(data_date: str = None) -> dict:
             'trust_5d':             chip.get('trust_5d',    0),
             'dealer_5d':            chip.get('dealer_5d',   0),
             'institution_5d_total': chip.get('total_5d',    0),
+            'foreign_5d_shares':    chip.get('foreign_5d_shares', 0),
+            'trust_5d_shares':      chip.get('trust_5d_shares', 0),
+            'dealer_5d_shares':     chip.get('dealer_5d_shares', 0),
             'foreign_consecutive':  chip.get('foreign_consecutive', 0),
             'trust_consecutive':    chip.get('trust_consecutive',   0),
             'chip_tier':            tier,
@@ -686,6 +784,10 @@ def run_integrated_strategy(data_date: str = None) -> dict:
             'industry_status': '',
             'has_industry_resonance': False,
         }
+        merged.update(capital_flow_by_code.get(
+            code,
+            _capital_flow_v2.empty_capital_flow_shadow('not_in_eligible_universe'),
+        ))
         enriched.append(merged)
 
     # ── Step 4：產業排行（先計算 chip_bonus_raw 以便產業評分使用）────────
@@ -735,9 +837,25 @@ def run_integrated_strategy(data_date: str = None) -> dict:
             'macd_status':          s.get('macd_status',   ''),
             'volume_status':        s.get('volume_status', ''),
             'volume_ma20':          s.get('volume_ma20'),
+            'amount_ma5':           s.get('amount_ma5'),
             'amount_ma20':          s.get('amount_ma20'),
+            'liquidity_trend':       s.get('liquidity_trend'),
+            'amount_rank':           s.get('amount_rank'),
+            'volume_rank':           s.get('volume_rank'),
             'stop_price':           s.get('stop_price'),
+            'target_price':         s.get('target_price'),
+            'previous_60d_high':    s.get('previous_60d_high'),
+            'current_60d_high':     s.get('current_60d_high'),
+            'target_status':        s.get('target_status'),
             'risk_reward':          s.get('risk_reward'),
+            'signal_rr':            s.get('signal_rr'),
+            'rr_valid':             s.get('rr_valid', False),
+            'rr_buyable':           s.get('rr_buyable', False),
+            'signal_entry':         s.get('signal_entry'),
+            'signal_close':         s.get('signal_close'),
+            'max_entry_rr15':       s.get('max_entry_rr15'),
+            'actual_entry':         s.get('actual_entry'),
+            'skip_trade':           s.get('skip_trade'),
             'exclude_reasons':      s.get('exclude_reasons', []),
             'instrument_type':      s.get('instrument_type', ''),
             'final_category':       'excluded',
@@ -756,6 +874,10 @@ def run_integrated_strategy(data_date: str = None) -> dict:
             'base_score': 0, 'chip_bonus': 0, 'industry_bonus': 0,
             'liquidity_bonus': 0, 'risk_penalty': 0, 'final_score': 0,
         }
+        e.update(capital_flow_by_code.get(
+            e['stock_id'],
+            _capital_flow_v2.empty_capital_flow_shadow('not_in_eligible_universe'),
+        ))
         reasons = s.get('exclude_reasons', [])
         e['final_reason']      = '；'.join(str(r) for r in reasons[:2])
         e['action_suggestion'] = '排除原因：' + '；'.join(str(r) for r in reasons[:2])
@@ -838,9 +960,17 @@ def run_integrated_strategy(data_date: str = None) -> dict:
         f"排除:{summary['excluded_count']}"
     )
 
+    capital_flow_metadata = {
+        key: value for key, value in capital_flow_bundle.items()
+        if key != 'metrics_by_code'
+    }
+
     return {
         'status':              'success',
-        'data_date':           data_date,
+        'strategy_valid':      True,
+        'as_of_date':          as_of_date,
+        'data_date':           as_of_date,
+        'stock_kbar_date':     ts_result.get('stock_kbar_date', as_of_date),
         'market_regime':       market_regime,
         'summary':             summary,
         'buy_candidates':      buy_candidates,
@@ -848,4 +978,5 @@ def run_integrated_strategy(data_date: str = None) -> dict:
         'wait_pullback':       wait_pullback,
         'other_watch':         other_watch,
         'excluded':            all_excluded,
+        'capital_flow_v2_shadow': capital_flow_metadata,
     }

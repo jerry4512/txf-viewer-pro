@@ -1,13 +1,17 @@
 import os
+import math
 import ssl
 import sqlite3
 import urllib.request
+import urllib.parse
 import json
 import re
 import pandas as pd
 from datetime import datetime, timedelta
+from typing import Optional
 import time
 import market_status as _ms
+from stock_selection_schema import ensure_stock_selection_schema
 
 try:
     import certifi
@@ -146,6 +150,16 @@ def init_db():
             foreign_buy INTEGER,
             investment_buy INTEGER,
             dealer_buy INTEGER,
+            foreign_buy_shares INTEGER,
+            investment_buy_shares INTEGER,
+            dealer_buy_shares INTEGER,
+            foreign_net INTEGER,
+            trust_net INTEGER,
+            dealer_prop_net INTEGER,
+            dealer_hedge_net INTEGER,
+            dealer_unknown_net INTEGER,
+            flow_detail_level TEXT,
+            flow_data_source TEXT,
             PRIMARY KEY (code, date)
         )
     """)
@@ -185,6 +199,9 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_kbars_code ON daily_kbars(code)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_inst_date ON institutional_trading(date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_inst_code ON institutional_trading(code)")
+
+    # V2 Milestone 1：security master 與法人原始股數欄位。
+    ensure_stock_selection_schema(conn)
     
     conn.commit()
     conn.close()
@@ -193,6 +210,34 @@ def init_db():
 def fetch_twse_daily_quotes():
     """Step 3 資料：從證交所 + 櫃買中心取得今日所有股票的收盤價、成交金額、漲跌幅。
     回傳 (quotes dict, data_date str)，data_date 格式為 'YYYYMMDD'；抓不到時為 None。"""
+    # Prefer the same historical-capable cross-section parser used by the
+    # sync button.  The older STOCK_DAY_ALL endpoint may return CSV even when
+    # response=json is requested, which previously dropped every TWSE stock.
+    try:
+        official = fetch_official_stock_daily_kbars(datetime.now())
+        if all(status == "ok" for status in official["source_status"].values()):
+            quotes = {
+                record["code"]: {
+                    "name": record["name"],
+                    "close": record["close"],
+                    "open": record["open"],
+                    "high": record["high"],
+                    "low": record["low"],
+                    "volume": record["volume"],
+                    "turnover": record["turnover"],
+                    "change_pct": record["change_pct"],
+                }
+                for record in official["records"]
+            }
+            data_date = official["date"].replace("-", "")
+            print(
+                f"[Screener] Official daily quotes fetched: {len(quotes)} stocks, "
+                f"data_date={data_date}"
+            )
+            return quotes, data_date
+    except Exception as exc:
+        print(f"[Screener] Official daily quote parser failed, using fallback: {exc}")
+
     quotes = {}
     data_date = None
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -284,6 +329,290 @@ def fetch_twse_daily_quotes():
     return quotes, data_date
 
 
+_OFFICIAL_QUOTE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 Chrome/124 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.7",
+}
+
+
+def _official_number(value, default=None):
+    """Parse exchange numeric cells without treating '--' as zero."""
+    if value is None:
+        return default
+    text = re.sub(r"<[^>]*>", "", str(value)).strip().replace(",", "")
+    text = text.replace("＋", "+").replace("－", "-")
+    if text in ("", "--", "---", "N/A", "除權", "除息"):
+        return default
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fetch_official_json(url: str, timeout: int = 25) -> dict:
+    req = urllib.request.Request(url, headers=_OFFICIAL_QUOTE_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as response:
+        raw = response.read().decode("utf-8-sig")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("官方行情回傳格式不是 JSON object")
+    return payload
+
+
+def _table_with_fields(payload: dict, required_fields: set[str]) -> Optional[dict]:
+    for table in payload.get("tables", []) or []:
+        fields = set(table.get("fields", []) or [])
+        if required_fields.issubset(fields):
+            return table
+    return None
+
+
+def _quote_record(fields: list, row: list, *, market: str) -> Optional[dict]:
+    """Normalize one TWSE/TPEx daily quote row to the local lots convention."""
+    values = dict(zip(fields, row))
+    if market == "twse":
+        code = str(values.get("證券代號") or "").strip()
+        name = str(values.get("證券名稱") or "").strip()
+        open_price = _official_number(values.get("開盤價"))
+        high = _official_number(values.get("最高價"))
+        low = _official_number(values.get("最低價"))
+        close = _official_number(values.get("收盤價"))
+        shares = _official_number(values.get("成交股數"), 0) or 0
+        turnover = _official_number(values.get("成交金額"), 0) or 0
+        change = _official_number(values.get("漲跌價差"), 0) or 0
+        sign_text = re.sub(r"<[^>]*>", "", str(values.get("漲跌(+/-)") or ""))
+        if "-" in sign_text or "－" in sign_text or "green" in str(values.get("漲跌(+/-)") or "").lower():
+            change = -abs(change)
+        elif "+" in sign_text or "＋" in sign_text or "red" in str(values.get("漲跌(+/-)") or "").lower():
+            change = abs(change)
+    else:
+        code = str(values.get("代號") or "").strip()
+        name = str(values.get("名稱") or "").strip()
+        open_price = _official_number(values.get("開盤"))
+        high = _official_number(values.get("最高"))
+        low = _official_number(values.get("最低"))
+        close = _official_number(values.get("收盤"))
+        shares = _official_number(values.get("成交股數"), 0) or 0
+        turnover = _official_number(values.get("成交金額(元)"), 0) or 0
+        change = _official_number(values.get("漲跌"), 0) or 0
+
+    # The stock-selection universe is ordinary four-digit stock codes.  This
+    # avoids importing warrants/bonds while still allowing newly listed stocks.
+    if not re.fullmatch(r"\d{4}", code) or close is None:
+        return None
+    if open_price is None or high is None or low is None:
+        # A no-trade row is not a valid OHLC bar.
+        return None
+
+    volume_lots = int(float(shares) // 1000)
+    if shares > 0 and volume_lots == 0:
+        volume_lots = 1
+    previous_close = close - change
+    change_pct = (change / previous_close * 100.0) if previous_close > 0 else 0.0
+    return {
+        "code": code,
+        "name": name,
+        "market": market,
+        "open": float(open_price),
+        "high": float(high),
+        "low": float(low),
+        "close": float(close),
+        "volume": volume_lots,
+        "turnover": int(turnover),
+        "change_pct": change_pct,
+    }
+
+
+def fetch_official_stock_daily_kbars(trading_date) -> dict:
+    """Fetch one historical daily cross-section from official TWSE + TPEx APIs."""
+    if isinstance(trading_date, datetime):
+        date_obj = trading_date.date()
+    elif hasattr(trading_date, "strftime"):
+        date_obj = trading_date
+    else:
+        date_obj = datetime.strptime(str(trading_date)[:10], "%Y-%m-%d").date()
+    date_hyphen = date_obj.strftime("%Y-%m-%d")
+    date_compact = date_obj.strftime("%Y%m%d")
+    records: dict[str, dict] = {}
+    errors = []
+    source_status = {"twse": "no_data", "tpex": "no_data"}
+
+    twse_url = (
+        "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?"
+        + urllib.parse.urlencode({
+            "date": date_compact, "type": "ALLBUT0999", "response": "json",
+        })
+    )
+    try:
+        payload = _fetch_official_json(twse_url)
+        actual_date = str(payload.get("date") or "")
+        table = _table_with_fields(payload, {"證券代號", "收盤價", "成交股數"})
+        if actual_date == date_compact and table:
+            for row in table.get("data", []) or []:
+                record = _quote_record(table.get("fields", []), row, market="twse")
+                if record:
+                    records[record["code"]] = record
+            source_status["twse"] = "ok" if any(r["market"] == "twse" for r in records.values()) else "no_data"
+    except Exception as exc:
+        source_status["twse"] = "error"
+        errors.append(f"TWSE {date_hyphen}: {type(exc).__name__}")
+
+    tpex_url = (
+        "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes?"
+        + urllib.parse.urlencode({
+            "date": date_obj.strftime("%Y/%m/%d"), "id": "", "response": "json",
+        })
+    )
+    try:
+        payload = _fetch_official_json(tpex_url)
+        actual_date = str(payload.get("date") or "")
+        table = _table_with_fields(payload, {"代號", "收盤", "成交股數"})
+        tpex_count = 0
+        if actual_date == date_compact and table:
+            for row in table.get("data", []) or []:
+                record = _quote_record(table.get("fields", []), row, market="tpex")
+                if record:
+                    records[record["code"]] = record
+                    tpex_count += 1
+            source_status["tpex"] = "ok" if tpex_count else "no_data"
+    except Exception as exc:
+        source_status["tpex"] = "error"
+        errors.append(f"TPEx {date_hyphen}: {type(exc).__name__}")
+
+    twse_count = sum(1 for record in records.values() if record["market"] == "twse")
+    tpex_count = sum(1 for record in records.values() if record["market"] == "tpex")
+    return {
+        "date": date_hyphen,
+        "records": list(records.values()),
+        "twse_count": twse_count,
+        "tpex_count": tpex_count,
+        "source_status": source_status,
+        "errors": errors,
+    }
+
+
+def _daily_kbar_coverage(conn: sqlite3.Connection, data_date: str) -> dict:
+    target_count = int(conn.execute(
+        "SELECT COUNT(DISTINCT code) FROM daily_kbars WHERE date=?", (data_date,)
+    ).fetchone()[0])
+    prior_row = conn.execute(
+        "SELECT MAX(code_count) FROM ("
+        " SELECT date, COUNT(DISTINCT code) AS code_count FROM daily_kbars"
+        " WHERE date < ? GROUP BY date ORDER BY date DESC LIMIT 20"
+        ")", (data_date,),
+    ).fetchone()
+    prior_max = int(prior_row[0] or target_count) if prior_row else target_count
+    minimum = max(1, int(math.ceil(prior_max * 0.85)))
+    return {
+        "count": target_count,
+        "prior_max": prior_max,
+        "minimum": minimum,
+        "complete": target_count >= minimum,
+    }
+
+
+def sync_official_stock_daily_kbars(target_date: str, start_date: Optional[str] = None) -> dict:
+    """Backfill missing EOD stock bars using two cross-market official requests per day."""
+    init_db()
+    target_obj = datetime.strptime(str(target_date)[:10], "%Y-%m-%d").date()
+    conn = get_db_connection()
+    try:
+        latest_row = conn.execute("SELECT MAX(date) FROM daily_kbars").fetchone()
+        latest_before = str(latest_row[0] or "") if latest_row else ""
+    finally:
+        conn.close()
+
+    if start_date:
+        start_obj = datetime.strptime(str(start_date)[:10], "%Y-%m-%d").date()
+    elif latest_before:
+        # Re-fetch the latest cached day so a previously partial write can heal.
+        start_obj = datetime.strptime(latest_before, "%Y-%m-%d").date()
+    else:
+        start_obj = target_obj - timedelta(days=120)
+
+    # Avoid accidental unbounded backfills while retaining enough history for
+    # the 62-bar strategy warm-up.
+    earliest = target_obj - timedelta(days=370)
+    start_obj = max(start_obj, earliest)
+
+    fetched_dates = []
+    holiday_dates = []
+    failed_dates = []
+    inserted_rows = 0
+    cursor_date = start_obj
+    while cursor_date <= target_obj:
+        if cursor_date.weekday() < 5:
+            daily = fetch_official_stock_daily_kbars(cursor_date)
+            statuses = daily["source_status"]
+            if statuses["twse"] == "ok" and statuses["tpex"] == "ok":
+                records = daily["records"]
+                conn = get_db_connection()
+                try:
+                    conn.executemany(
+                        "INSERT INTO daily_kbars(code,date,open,high,low,close,volume) "
+                        "VALUES(?,?,?,?,?,?,?) ON CONFLICT(code,date) DO UPDATE SET "
+                        "open=excluded.open, high=excluded.high, low=excluded.low, "
+                        "close=excluded.close, volume=excluded.volume",
+                        [(
+                            record["code"], daily["date"], record["open"],
+                            record["high"], record["low"], record["close"], record["volume"],
+                        ) for record in records],
+                    )
+                    conn.executemany(
+                        "INSERT INTO stock_names(code,name,category) VALUES(?,?,'') "
+                        "ON CONFLICT(code) DO UPDATE SET name=excluded.name",
+                        [(record["code"], record["name"] or record["code"]) for record in records],
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                inserted_rows += len(records)
+                fetched_dates.append({
+                    "date": daily["date"],
+                    "twse_count": daily["twse_count"],
+                    "tpex_count": daily["tpex_count"],
+                })
+            elif statuses["twse"] == "no_data" and statuses["tpex"] == "no_data":
+                holiday_dates.append(daily["date"])
+            else:
+                failed_dates.append({
+                    "date": daily["date"],
+                    "source_status": statuses,
+                    "errors": daily["errors"],
+                })
+        cursor_date += timedelta(days=1)
+
+    conn = get_db_connection()
+    try:
+        latest_row = conn.execute(
+            "SELECT MAX(date) FROM daily_kbars WHERE date <= ?", (str(target_date)[:10],)
+        ).fetchone()
+        latest_after = str(latest_row[0] or "") if latest_row else ""
+        coverage = _daily_kbar_coverage(conn, latest_after) if latest_after else {
+            "count": 0, "prior_max": 0, "minimum": 1, "complete": False,
+        }
+    finally:
+        conn.close()
+
+    success = bool(latest_after == str(target_date)[:10] and coverage["complete"])
+    return {
+        "success": success,
+        "latest_date": latest_after,
+        "latest_before": latest_before,
+        "inserted_rows": inserted_rows,
+        "fetched_dates": fetched_dates,
+        "holiday_dates": holiday_dates,
+        "failed_dates": failed_dates,
+        "coverage": coverage,
+        "error": None if success else (
+            "個股日K仍未同步到目標交易日" if not failed_dates
+            else "部分證交所／櫃買中心日行情下載失敗"
+        ),
+    }
+
+
 def get_inst_5d_candidates():
     """Step 1：近5日三大法人合計>0，且外資或投信至少一方>0"""
     conn = get_db_connection()
@@ -330,6 +659,12 @@ def sync_twse_institutional_data(target_date=None):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
     }
+
+    def _int_cell(row, index, default=0):
+        try:
+            return int(str(row[index]).replace(',', '').strip())
+        except (IndexError, TypeError, ValueError):
+            return default
     
     # 1. 抓取證交所 (TWSE - 上市) 法人交易
     twse_url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={date_str}&selectType=ALLBUT0999"
@@ -339,24 +674,46 @@ def sync_twse_institutional_data(target_date=None):
             res_json = json.loads(response.read().decode('utf-8'))
             
         if "data" in res_json:
+            field_index = {
+                str(field): index
+                for index, field in enumerate(res_json.get("fields", []) or [])
+            }
             for row in res_json["data"]:
                 code = row[0].strip()
-                # 欄位：5外資買賣超, 8投信買賣超, 11自營商買賣超 (有時索引因證交所更新微調，故使用名稱匹配或安全過濾)
-                # 證交所標準欄位：
-                # 0證券代號, 1證券名稱, 2外陸資買進, 3外陸資賣出, 4外陸資買賣超...
-                # 標準對齊：
-                # row[4] = 外資買賣超
-                # row[7] = 投信買賣超
-                # row[10] = 自營商買賣超 (避險+自行買賣合計)
                 try:
-                    f_buy = int(row[4].replace(',', '')) if len(row) > 4 else 0
-                    i_buy = int(row[10].replace(',', '')) if len(row) > 10 else 0
-                    d_buy = int(row[11].replace(',', '')) if len(row) > 11 else 0
-                    # 換算成「張數」（官方是股數，除以 1000）
+                    # Legacy formal score keeps the original definitions so
+                    # shadow-mode cannot change the candidate list.
+                    foreign_legacy = _int_cell(row, field_index.get(
+                        '外陸資買賣超股數(不含外資自營商)', 4
+                    ))
+                    trust_net = _int_cell(row, field_index.get('投信買賣超股數', 10))
+                    dealer_total = _int_cell(row, field_index.get('自營商買賣超股數', 11))
+
+                    # Capital Flow V2 identity layer.  Foreign net includes
+                    # foreign proprietary dealers; dealer prop/hedge remain
+                    # separate and hedge is never a directional positive score.
+                    foreign_dealer = _int_cell(row, field_index.get('外資自營商買賣超股數', 7))
+                    foreign_net = foreign_legacy + foreign_dealer
+                    dealer_prop = _int_cell(
+                        row, field_index.get('自營商買賣超股數(自行買賣)', 14)
+                    )
+                    dealer_hedge = _int_cell(
+                        row, field_index.get('自營商買賣超股數(避險)', 17)
+                    )
                     inst_data[code] = {
-                        "foreign_buy": f_buy // 1000,
-                        "investment_buy": i_buy // 1000,
-                        "dealer_buy": d_buy // 1000
+                        "foreign_buy": int(foreign_legacy / 1000),
+                        "investment_buy": int(trust_net / 1000),
+                        "dealer_buy": int(dealer_total / 1000),
+                        "foreign_buy_shares": foreign_legacy,
+                        "investment_buy_shares": trust_net,
+                        "dealer_buy_shares": dealer_total,
+                        "foreign_net": foreign_net,
+                        "trust_net": trust_net,
+                        "dealer_prop_net": dealer_prop,
+                        "dealer_hedge_net": dealer_hedge,
+                        "dealer_unknown_net": None,
+                        "flow_detail_level": "split",
+                        "flow_data_source": "twse_t86",
                     }
                 except ValueError:
                     continue
@@ -388,20 +745,34 @@ def sync_twse_institutional_data(target_date=None):
                 code = row[0].strip()
                 if is_new_format:
                     # 新版欄位索引：row[10]=外資及陸資合計買賣超, row[13]=投信買賣超, row[22]=自營商合計買賣超
-                    f_buy = int(str(row[10]).replace(',', '')) if len(row) > 10 else 0
-                    i_buy = int(str(row[13]).replace(',', '')) if len(row) > 13 else 0
-                    d_buy = int(str(row[22]).replace(',', '')) if len(row) > 22 else 0
+                    f_buy = _int_cell(row, 10)
+                    i_buy = _int_cell(row, 13)
+                    dealer_prop = _int_cell(row, 16)
+                    dealer_hedge = _int_cell(row, 19)
+                    d_buy = _int_cell(row, 22)
                 else:
                     # 舊版欄位索引
-                    f_buy = int(str(row[8]).replace(',', '')) if len(row) > 8 else 0
-                    i_buy = int(str(row[11]).replace(',', '')) if len(row) > 11 else 0
-                    d_buy = int(str(row[14]).replace(',', '')) if len(row) > 14 else 0
+                    f_buy = _int_cell(row, 8)
+                    i_buy = _int_cell(row, 11)
+                    d_buy = _int_cell(row, 14)
+                    dealer_prop = None
+                    dealer_hedge = None
                 
-                # 櫃買單位也是股數，除以 1000 換算張數
+                # 櫃買單位也是股數；保留股數並另存相容張數欄位。
                 inst_data[code] = {
-                    "foreign_buy": f_buy // 1000,
-                    "investment_buy": i_buy // 1000,
-                    "dealer_buy": d_buy // 1000
+                    "foreign_buy": int(f_buy / 1000),
+                    "investment_buy": int(i_buy / 1000),
+                    "dealer_buy": int(d_buy / 1000),
+                    "foreign_buy_shares": f_buy,
+                    "investment_buy_shares": i_buy,
+                    "dealer_buy_shares": d_buy,
+                    "foreign_net": f_buy,
+                    "trust_net": i_buy,
+                    "dealer_prop_net": dealer_prop,
+                    "dealer_hedge_net": dealer_hedge,
+                    "dealer_unknown_net": None if is_new_format else d_buy,
+                    "flow_detail_level": "split" if is_new_format else "legacy_combined",
+                    "flow_data_source": "tpex_3insti",
                 }
             except (ValueError, IndexError):
                 continue
@@ -414,18 +785,51 @@ def sync_twse_institutional_data(target_date=None):
         cursor = conn.cursor()
         for code, val in inst_data.items():
             cursor.execute("""
-                INSERT INTO institutional_trading (code, date, foreign_buy, investment_buy, dealer_buy)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO institutional_trading (
+                    code, date, foreign_buy, investment_buy, dealer_buy,
+                    foreign_buy_shares, investment_buy_shares, dealer_buy_shares,
+                    foreign_net, trust_net, dealer_prop_net, dealer_hedge_net,
+                    dealer_unknown_net, flow_detail_level, flow_data_source
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(code, date) DO UPDATE SET
                     foreign_buy=excluded.foreign_buy,
                     investment_buy=excluded.investment_buy,
-                    dealer_buy=excluded.dealer_buy
-            """, (code, date_hyphen, val["foreign_buy"], val["investment_buy"], val["dealer_buy"]))
+                    dealer_buy=excluded.dealer_buy,
+                    foreign_buy_shares=excluded.foreign_buy_shares,
+                    investment_buy_shares=excluded.investment_buy_shares,
+                    dealer_buy_shares=excluded.dealer_buy_shares,
+                    foreign_net=excluded.foreign_net,
+                    trust_net=excluded.trust_net,
+                    dealer_prop_net=excluded.dealer_prop_net,
+                    dealer_hedge_net=excluded.dealer_hedge_net,
+                    dealer_unknown_net=excluded.dealer_unknown_net,
+                    flow_detail_level=excluded.flow_detail_level,
+                    flow_data_source=excluded.flow_data_source
+            """, (
+                code, date_hyphen,
+                val["foreign_buy"], val["investment_buy"], val["dealer_buy"],
+                val["foreign_buy_shares"], val["investment_buy_shares"],
+                val["dealer_buy_shares"], val["foreign_net"], val["trust_net"],
+                val["dealer_prop_net"], val["dealer_hedge_net"],
+                val["dealer_unknown_net"], val["flow_detail_level"],
+                val["flow_data_source"],
+            ))
         conn.commit()
         conn.close()
         print(f"[Screener] Institutional data synced. Total tickers: {len(inst_data)}")
+        return {
+            "success": True,
+            "date": date_hyphen,
+            "count": len(inst_data),
+            "split_count": sum(
+                1 for value in inst_data.values()
+                if value.get("flow_detail_level") == "split"
+            ),
+        }
     else:
         print("[Screener] No institutional data found (possibly non-trading day).")
+        return {"success": False, "date": date_hyphen, "count": 0}
 
 def sync_stock_kbars(legacy_stock_api, codes=None, progress_callback=None):
     """
