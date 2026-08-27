@@ -35,13 +35,13 @@ RUN pip install --upgrade pip \
 # 應用程式碼（compose 預設會再以 bind mount 覆蓋，方便本機改檔即時生效）
 COPY . .
 
-EXPOSE 8000
+EXPOSE 8080
 
 # 容器不開啟瀏覽器（原 .command 的 open 行為由使用者自行連線取代）；
 # 健康檢查只讀 /api/status，未登入也會正常回應
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/status', timeout=3).status == 200 else 1)"
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/status', timeout=3).status == 200 else 1)"
 
 # 綁 0.0.0.0 讓容器外（本機與區網其他裝置）都能用瀏覽器連進來
 # （.command 綁 127.0.0.1 是給本機直跑用的）
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

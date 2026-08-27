@@ -13,7 +13,7 @@ services:
     platform: linux/amd64
     # 容器內綁 0.0.0.0；此處綁所有網卡，區網／外部機器可用瀏覽器連 http://<主機IP>:8000
     ports:
-      - "8000:8000"
+      - "8000:8080"
     # .env 內含 FUBON_API_KEY / TELEGRAM_BOT_TOKEN / ANTHROPIC_API_KEY 等
     env_file:
       - .env
