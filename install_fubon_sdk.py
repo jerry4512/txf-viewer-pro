@@ -1,4 +1,4 @@
-"""Install the official Fubon Neo 2.2.8 binary for this platform."""
+"""Install the official Fubon Neo 2.2.9 binary for this platform."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 
-VERSION = "2.2.8"
+VERSION = "2.2.9"
 BASE_URL = "https://www.fbs.com.tw/TradeAPI_SDK/fubon_binary"
 PACKAGES = {
     ("Darwin", "arm64"): f"fubon_neo-{VERSION}-cp37-abi3-macosx_11_0_arm64.zip",

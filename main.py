@@ -5,6 +5,7 @@ import asyncio
 import calendar
 import sqlite3
 import socket
+import tempfile
 import threading
 import time
 import math
@@ -14,7 +15,7 @@ import urllib.request
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from typing import Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -32,11 +33,18 @@ import broker_fetcher  # official on-demand broker data fetcher
 import moneydj_fetcher  # MoneyDJ Fubon broker period summary fetcher
 from market_status import sync_taiex_daily_kbars, normalize_date, TAIEX_SYMBOL
 from fubon_market_data import FubonMarketDataClient, FubonMarketDataError
+from etf_holdings import ETFHoldingsRepository, ETFHoldingsService, SUPPORTED_ETFS
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 _BASE_DIR_MAIN = os.path.dirname(os.path.abspath(__file__))
 _STOCK_DB_PATH = os.path.join(_BASE_DIR_MAIN, "stock_cache.db")
+_CERTIFICATE_DIR = os.path.join(_BASE_DIR_MAIN, ".credentials")
+_CERTIFICATE_MAX_BYTES = 5 * 1024 * 1024
+_ETF_HOLDINGS_DB_PATH = os.path.join(_BASE_DIR_MAIN, "etf_holdings_cache.db")
+_etf_holdings_service = ETFHoldingsService(
+    ETFHoldingsRepository(_ETF_HOLDINGS_DB_PATH, _STOCK_DB_PATH)
+)
 
 _tg_push_status = {
     "last_push_time":   None,
@@ -83,6 +91,7 @@ is_logged_in = False
 contract = None
 main_loop = None
 _kbars_lock = asyncio.Lock()  # 富邦 REST 查詢全局序列化，避免碰觸速率限制
+_etf_holdings_lock = asyncio.Lock()
 _kbars_retry_after: dict[tuple[str, str], float] = {}
 _kbars_retry_lock = threading.Lock()
 _kbars_forced_refresh_after: dict[str, float] = {}
@@ -945,6 +954,115 @@ class LoginRequest(BaseModel):
     cert_pass: str = ""
     save_keys: bool = True
 
+
+def _form_text(form, name: str) -> str:
+    value = form.get(name, "")
+    return value if isinstance(value, str) else ""
+
+
+def _form_bool(form, name: str, default: bool = False) -> bool:
+    value = form.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _stage_certificate_upload(upload) -> str:
+    """Store a browser-selected certificate under an opaque local filename."""
+    filename = str(getattr(upload, "filename", "") or "").strip()
+    suffix = os.path.splitext(filename)[1].lower()
+    if suffix not in {".pfx", ".p12"}:
+        raise HTTPException(status_code=422, detail="憑證檔案僅支援 .pfx 或 .p12")
+
+    os.makedirs(_CERTIFICATE_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(_CERTIFICATE_DIR, 0o700)
+    except OSError:
+        pass
+
+    file_descriptor, staged_path = tempfile.mkstemp(
+        prefix=".fubon-cert-upload-",
+        suffix=suffix,
+        dir=_CERTIFICATE_DIR,
+    )
+    total_bytes = 0
+    try:
+        try:
+            os.fchmod(file_descriptor, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(file_descriptor, "wb") as staged_file:
+            while True:
+                chunk = await upload.read(64 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > _CERTIFICATE_MAX_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="憑證檔案不可超過 5 MB",
+                    )
+                staged_file.write(chunk)
+        if total_bytes == 0:
+            raise HTTPException(status_code=422, detail="選取的憑證檔案是空的")
+        return staged_path
+    except Exception:
+        try:
+            os.remove(staged_path)
+        except OSError:
+            pass
+        raise
+    finally:
+        await upload.close()
+
+
+async def _parse_login_submission(request: Request) -> tuple[LoginRequest, Optional[str]]:
+    """Accept the legacy JSON body and the browser's multipart file picker body."""
+    content_type = request.headers.get("content-type", "").lower()
+    if content_type.startswith("application/json"):
+        try:
+            payload = await request.json()
+            return LoginRequest(**payload), None
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="登入資料格式不正確") from exc
+
+    if content_type.startswith(("multipart/form-data", "application/x-www-form-urlencoded")):
+        try:
+            form = await request.form()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="無法讀取登入表單") from exc
+        req = LoginRequest(
+            api_key=_form_text(form, "api_key"),
+            person_id=_form_text(form, "person_id"),
+            cert_path=_form_text(form, "cert_path"),
+            cert_pass=_form_text(form, "cert_pass"),
+            save_keys=_form_bool(form, "save_keys", True),
+        )
+        upload = form.get("cert_file")
+        if upload is not None and str(getattr(upload, "filename", "") or "").strip():
+            return req, await _stage_certificate_upload(upload)
+        return req, None
+
+    raise HTTPException(status_code=415, detail="登入資料格式不支援")
+
+
+def _persist_uploaded_certificate(staged_path: str) -> str:
+    suffix = os.path.splitext(staged_path)[1].lower()
+    saved_path = os.path.join(_CERTIFICATE_DIR, f"fubon_certificate{suffix}")
+    os.replace(staged_path, saved_path)
+    try:
+        os.chmod(saved_path, 0o600)
+    except OSError:
+        pass
+    return saved_path
+
+
+class ETFHoldingsRefreshRequest(BaseModel):
+    symbol: str = "00981A"
+    period: int = 5
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+
 # 報價健康監控：不輪詢 snapshots，避免把查詢型 API 當成即時源
 async def quote_fallback_loop():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Quote health monitor started")
@@ -1236,14 +1354,15 @@ async def shutdown_event():
             pass
 
 @app.post("/api/login")
-async def login(req: LoginRequest):
+async def login(request: Request):
     global api, is_logged_in, contract, main_loop
     global _quote_subscription_status, _quote_event_detail
     global _rt_contract_code, _rt_bar
+    req, staged_cert_path = await _parse_login_submission(request)
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     personal_id = req.person_id.strip() or os.getenv("FUBON_PERSON_ID", "").strip()
     api_key = req.api_key.strip() or os.getenv("FUBON_API_KEY", "").strip()
-    cert_path = req.cert_path.strip() or os.getenv("FUBON_CERT_PATH", "").strip()
+    cert_path = staged_cert_path or req.cert_path.strip() or os.getenv("FUBON_CERT_PATH", "").strip()
     cert_pass = req.cert_pass or os.getenv("FUBON_CERT_PASS", "")
     print(f"\n[{now_str}] [SECURE] 收到富邦唯讀期貨行情登入請求")
     print(f"[{now_str}] [DIR] 登入模式: {'API Key + 憑證' if cert_path else 'API Key DMA'}")
@@ -1368,6 +1487,9 @@ async def login(req: LoginRequest):
 
         # 儲存登入憑證至 .env
         if req.save_keys:
+            if staged_cert_path:
+                cert_path = _persist_uploaded_certificate(staged_cert_path)
+                staged_cert_path = None
             env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
             set_key(env_path, "FUBON_API_KEY", api_key)
             set_key(env_path, "FUBON_PERSON_ID", personal_id)
@@ -1404,6 +1526,12 @@ async def login(req: LoginRequest):
             pass
         print(f"[{now_str}] [ERROR] 登入失敗！異常訊息: {e}\n")
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        if staged_cert_path:
+            try:
+                os.remove(staged_cert_path)
+            except OSError:
+                pass
 
 @app.post("/api/select_contract")
 async def select_contract(req: dict):
@@ -1468,6 +1596,140 @@ async def get_status():
             "has_cert_pass": bool(os.getenv("FUBON_CERT_PASS", "")),
         }
     }
+
+
+def _validate_etf_symbol(symbol: str) -> str:
+    normalized = str(symbol or "").strip().upper()
+    if not normalized or len(normalized) > 12 or not normalized.isalnum():
+        raise HTTPException(status_code=422, detail="ETF 代號格式不正確")
+    return normalized
+
+
+async def _refresh_etf_holdings(
+    symbol: str,
+    *,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> dict:
+    if not is_logged_in or not api:
+        raise FubonMarketDataError("尚未登入富邦行情服務")
+    loop = asyncio.get_running_loop()
+    async with _etf_holdings_lock:
+        return await loop.run_in_executor(
+            None,
+            lambda: _etf_holdings_service.refresh(
+                api,
+                symbol,
+                date_from=date_from,
+                date_to=date_to,
+            ),
+        )
+
+
+@app.get("/api/etf/holdings")
+async def get_etf_holdings_dashboard(
+    symbol: str = Query("00981A"),
+    period: int = Query(5),
+    refresh: bool = Query(False),
+):
+    """Return cached raw holdings plus transparent manager-intent analysis."""
+    normalized = _validate_etf_symbol(symbol)
+    if period not in (1, 5, 10, 20):
+        raise HTTPException(status_code=422, detail="期間僅支援今日、5、10、20 日")
+    has_cache = bool(_etf_holdings_service.repository.latest_date(normalized))
+    refresh_warning = None
+    if refresh or not has_cache:
+        try:
+            await _refresh_etf_holdings(normalized)
+        except Exception as exc:
+            message = str(exc) or type(exc).__name__
+            _etf_holdings_service.repository.record_error(
+                normalized, message, str(getattr(api, "version", "unknown"))
+            )
+            print(f"[ETF] {normalized} holdings refresh failed: {type(exc).__name__}: {message}")
+            if not has_cache:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"ETF 持股資料目前無法取得：{message}",
+                )
+            refresh_warning = f"更新失敗，目前顯示本地快取：{message}"
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, lambda: _etf_holdings_service.dashboard(normalized, period)
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"ETF 持股資料目前無法取得：{str(exc) or type(exc).__name__}",
+        )
+    result["supportedETFs"] = [
+        {"symbol": code, "name": name} for code, name in SUPPORTED_ETFS.items()
+    ]
+    if refresh_warning:
+        result["refreshWarning"] = refresh_warning
+    return result
+
+
+@app.post("/api/etf/holdings/refresh")
+async def refresh_etf_holdings(req: ETFHoldingsRefreshRequest):
+    normalized = _validate_etf_symbol(req.symbol)
+    if req.period not in (1, 5, 10, 20):
+        raise HTTPException(status_code=422, detail="期間僅支援今日、5、10、20 日")
+    try:
+        refresh_result = await _refresh_etf_holdings(
+            normalized,
+            date_from=req.date_from,
+            date_to=req.date_to,
+        )
+        loop = asyncio.get_running_loop()
+        dashboard = await loop.run_in_executor(
+            None, lambda: _etf_holdings_service.dashboard(normalized, req.period)
+        )
+        dashboard["refresh"] = refresh_result
+        dashboard["supportedETFs"] = [
+            {"symbol": code, "name": name} for code, name in SUPPORTED_ETFS.items()
+        ]
+        return dashboard
+    except Exception as exc:
+        message = str(exc) or type(exc).__name__
+        _etf_holdings_service.repository.record_error(
+            normalized, message, str(getattr(api, "version", "unknown"))
+        )
+        print(f"[ETF] {normalized} holdings refresh failed: {type(exc).__name__}: {message}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"ETF 持股資料目前無法取得：{message}",
+        )
+
+
+@app.get("/api/etf/holdings/{symbol}/stocks/{stock_symbol}")
+async def get_etf_holding_detail(
+    symbol: str,
+    stock_symbol: str,
+    period: int = Query(5),
+):
+    normalized = _validate_etf_symbol(symbol)
+    if period not in (1, 5, 10, 20):
+        raise HTTPException(status_code=422, detail="期間僅支援今日、5、10、20 日")
+    normalized_stock = str(stock_symbol or "").strip().upper()
+    if not normalized_stock or len(normalized_stock) > 16:
+        raise HTTPException(status_code=422, detail="股票代號格式不正確")
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: _etf_holdings_service.detail(
+                normalized, normalized_stock, period
+            ),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"ETF 個股明細目前無法取得：{str(exc) or type(exc).__name__}",
+        )
 
 # ── K 線本地快取（SQLite）────────────────────────────────────────
 _KBARS_CACHE_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kbars_cache.db')

@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TXF Pro Viewer</title>
-    <link rel="stylesheet" href="style.css?v=weekly-volume-filter-v16">
+    <link rel="stylesheet" href="style.css?v=weekly-volume-filter-v17">
+    <link rel="stylesheet" href="etf_holdings.css?v=2">
     <!-- TradingView Lightweight Charts v4.1.1 -->
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <script>
@@ -1369,8 +1370,9 @@
             <input type="password" id="api_key" autocomplete="current-password">
         </div>
         <div class="form-group">
-            <label>憑證路徑（選填；未填使用 API Key DMA 登入）</label>
-            <input type="text" id="cert_path" placeholder="例如 /Users/you/Downloads/cert.pfx">
+            <label for="cert_file">憑證檔案（選填）</label>
+            <input type="file" id="cert_file" accept=".pfx,.p12,application/x-pkcs12">
+            <div id="cert-file-hint" class="cert-file-hint">未選取時使用 API Key DMA 登入</div>
         </div>
         <div class="form-group">
             <label>憑證密碼（選填）</label>
@@ -1399,6 +1401,7 @@
                         <option value="trading-doctor">🩺 交易醫生</option>
                         <option value="stock-screener">🔍 股票篩選</option>
                         <option value="amplitude-statistics">📈 震幅統計</option>
+                        <option value="etf-holdings">🧭 ETF 動向</option>
                     </select>
                     <select id="contract-selector" style="background: #222; color: #fff; border: 1px solid #4facfe; font-size: 1.1rem; font-weight: bold; padding: 5px 12px; border-radius: 6px; cursor: pointer; outline: none; transition: all 0.3s;">
                         <option value="TMFR1">微台近月全 (TMF)</option>
@@ -3204,7 +3207,96 @@
                 </div>
             </div>
         </div><!-- /#amplitude-statistics-container -->
+
+        <!-- ETF 經理人動向：與股票、期貨同級的外層工作區 -->
+        <main id="etf-holdings-container" class="etf-workspace" style="display:none;">
+            <header class="etf-header">
+                <div>
+                    <div class="etf-eyebrow">ACTIVE ETF RESEARCH</div>
+                    <h1>ETF 動向</h1>
+                    <p>辨識相對配置變化與建倉節奏，不把申購／贖回造成的股數縮放誤判為經理人方向。</p>
+                </div>
+                <div class="etf-header-actions">
+                    <label>ETF
+                        <select id="etf-symbol-selector">
+                            <option value="00981A">00981A 統一台股增長</option>
+                        </select>
+                    </label>
+                    <button id="etf-refresh-btn" type="button">↻ 重新整理</button>
+                    <div class="etf-update-meta">資料日 <strong id="etf-data-date">—</strong><br>最後更新 <span id="etf-last-updated">—</span></div>
+                </div>
+            </header>
+
+            <section class="etf-toolbar" aria-label="分析期間">
+                <span>期間</span>
+                <div id="etf-period-switch" class="etf-period-switch">
+                    <button type="button" data-period="1">今日</button>
+                    <button type="button" data-period="5" class="is-active">5日</button>
+                    <button type="button" data-period="10">10日</button>
+                    <button type="button" data-period="20">20日</button>
+                </div>
+                <div id="etf-baseline-chip" class="etf-baseline-chip">申贖縮放基準 —</div>
+                <div class="etf-principle">ETF 決定「看誰」・價格決定「何時買」</div>
+            </section>
+
+            <div id="etf-alert" class="etf-alert" hidden></div>
+            <div id="etf-loading" class="etf-loading" hidden><span></span>正在整理持股歷史與相對配置…</div>
+
+            <section id="etf-dashboard" hidden>
+                <div class="etf-summary-grid">
+                    <article><span>今日新建倉</span><strong id="etf-summary-new">0</strong><small>有效部位門檻以上</small></article>
+                    <article><span>今日主動加碼</span><strong id="etf-summary-add">0</strong><small>已扣除整體縮放</small></article>
+                    <article><span>今日主動減碼</span><strong id="etf-summary-reduce">0</strong><small>相對配置顯著下降</small></article>
+                    <article class="is-accent"><span id="etf-summary-fast-label">5日快速建倉</span><strong id="etf-summary-fast">0</strong><small>低權重、多次提高配置</small></article>
+                </div>
+
+                <section class="etf-intent-panel">
+                    <div class="etf-section-title">
+                        <div><span>經理人意圖摘要</span><small>規則式分析・可追溯</small></div>
+                        <p>信念分數只描述 00981A 近期配置意圖，不是買進訊號。</p>
+                    </div>
+                    <div id="etf-intent-groups" class="etf-intent-groups"></div>
+                </section>
+
+                <section class="etf-table-panel">
+                    <div class="etf-section-title">
+                        <div><span>經理人信念排行榜</span><small id="etf-holdings-count">—</small></div>
+                        <p id="etf-period-description">目前依最近 5 個 ETF 持股揭露日分析。</p>
+                    </div>
+                    <div class="etf-table-wrap">
+                        <table class="etf-table">
+                            <thead>
+                                <tr>
+                                    <th data-sort="stockName">股票</th>
+                                    <th data-sort="behavior">今日狀態</th>
+                                    <th data-sort="quantity">目前持股</th>
+                                    <th data-sort="quantityChange">今日增減</th>
+                                    <th data-sort="weight">目前權重</th>
+                                    <th data-sort="weightChange">今日權重變化</th>
+                                    <th id="etf-period-relative-heading" data-sort="cumulativeRelativeAllocationChange">5日相對增配</th>
+                                    <th id="etf-period-add-heading" data-sort="activeAddCount">5日加碼</th>
+                                    <th id="etf-period-reduce-heading" data-sort="activeReduceCount">5日減碼</th>
+                                    <th id="etf-period-score-heading" data-sort="convictionScore">5日分數</th>
+                                    <th data-sort="intent">經理人意圖</th>
+                                    <th data-sort="currentPrice">參考股價</th>
+                                </tr>
+                            </thead>
+                            <tbody id="etf-holdings-body"></tbody>
+                        </table>
+                    </div>
+                </section>
+            </section>
+        </main>
     </div><!-- /#app-container -->
+
+    <div id="etf-detail-overlay" class="etf-detail-overlay" hidden></div>
+    <aside id="etf-detail-drawer" class="etf-detail-drawer" aria-hidden="true">
+        <div class="etf-detail-head">
+            <div><span id="etf-detail-code">—</span><h2 id="etf-detail-name">個股明細</h2></div>
+            <button id="etf-detail-close" type="button" aria-label="關閉">×</button>
+        </div>
+        <div id="etf-detail-content" class="etf-detail-content"></div>
+    </aside>
 
     <!-- 股票策略詳情 Drawer -->
     <div id="stock-detail-drawer" style="display:none; position:fixed; top:0; right:0; width:420px; max-width:95vw; height:100vh; background:#141414; border-left:1px solid #2a2a2a; z-index:9999; flex-direction:column; box-shadow:-8px 0 32px rgba(0,0,0,0.7); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; overflow-y:auto;">
@@ -3303,7 +3395,8 @@
     <div id="drawer-overlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998;" onclick="closeStockDrawer()"></div>
 
     <!-- 載入主程式 (加入版本號避免快取問題) -->
-    <script src="app_pro.js?v=weekly-volume-filter-v66"></script>
+    <script src="etf_holdings.js?v=2"></script>
+    <script src="app_pro.js?v=weekly-volume-filter-v67"></script>
 </body>
 </html>
 

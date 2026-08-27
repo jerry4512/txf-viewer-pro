@@ -12,9 +12,17 @@ html, body {
 }
 .form-group { margin-bottom: 15px; }
 .form-group label { display: block; margin-bottom: 5px; color: #aaa; font-size: 14px; }
-.form-group input[type="text"], .form-group input[type="password"] {
+.form-group input[type="text"], .form-group input[type="password"], .form-group input[type="file"] {
     width: 100%; padding: 8px; background: #222; border: 1px solid #444; color: #fff; box-sizing: border-box;
 }
+.form-group input[type="file"] { cursor: pointer; }
+.form-group input[type="file"]::file-selector-button {
+    margin-right: 10px; padding: 7px 10px; border: 0; border-radius: 4px;
+    background: #2196F3; color: #fff; cursor: pointer;
+}
+.cert-file-hint { margin-top: 6px; color: #777; font-size: 12px; }
+.cert-file-hint.has-selection { color: #4facfe; }
+.cert-file-hint.has-error { color: #ff6b6b; }
 .form-group.row { display: flex; align-items: center; gap: 8px; }
 button {
     width: 100%; padding: 12px; background: #2196F3; border: none; color: #fff;

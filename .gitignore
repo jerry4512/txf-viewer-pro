@@ -3,10 +3,13 @@
 
 # 永豐金 CA 憑證
 *.pfx
+*.p12
+.credentials/
 
 # 資料庫與快取（執行期產生，不上 git）
 stock_cache.db
 kbars_cache.db
+etf_holdings_cache.db
 *.db-wal
 *.db-shm
 *.db-journal

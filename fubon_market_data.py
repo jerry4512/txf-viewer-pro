@@ -994,6 +994,50 @@ class FubonMarketDataClient:
             "ts": raw.get("lastUpdated") or raw.get("closeTime") or last_trade.get("time"),
         }
 
+    def etf_holdings(
+        self,
+        *,
+        symbol: str,
+        start: str,
+        end: str,
+        sort: str = "asc",
+    ) -> dict[str, Any]:
+        """Return an ETF's disclosed holdings through the shared stock client.
+
+        The endpoint was added in Fubon Neo 2.2.9.  Keeping it on this facade
+        ensures ETF analysis reuses the existing login and market-data session.
+        """
+        if self.stock_rest is None:
+            raise FubonMarketDataError("富邦股票行情尚未登入")
+        ownership = getattr(self.stock_rest, "ownership", None)
+        request = getattr(ownership, "etf_holdings", None)
+        if not callable(request):
+            raise FubonMarketDataError(
+                f"富邦 SDK {self.version} 不支援 ETF Holdings，最低需要 2.2.9"
+            )
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            raise FubonMarketDataError("ETF 代號不可為空")
+        try:
+            datetime.strptime(start, "%Y-%m-%d")
+            datetime.strptime(end, "%Y-%m-%d")
+        except (TypeError, ValueError) as exc:
+            raise FubonMarketDataError("ETF Holdings 日期格式必須為 yyyy-MM-dd") from exc
+        if sort not in {"asc", "desc"}:
+            raise FubonMarketDataError("ETF Holdings sort 僅支援 asc 或 desc")
+        try:
+            payload = _response_payload(request(**{
+                "symbol": normalized_symbol,
+                "from": start,
+                "to": end,
+                "sort": sort,
+            }))
+        except Exception as exc:
+            raise self._safe_rest_error(exc, f"ETF {normalized_symbol} 持股")
+        if not isinstance(payload.get("data"), list):
+            raise FubonMarketDataError("富邦 ETF Holdings 回應格式異常（缺少 data 陣列）")
+        return payload
+
     @staticmethod
     def _safe_rest_error(exc: Exception, operation: str) -> FubonMarketDataError:
         status = getattr(exc, "status_code", None)

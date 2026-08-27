@@ -5151,6 +5151,7 @@ async function startApp(contractCode) {
         const freelancerContainer = document.getElementById('freelancer-container');
         const tradingDoctorContainer = document.getElementById('trading-doctor-container');
         const ampStatsContainer   = document.getElementById('amplitude-statistics-container');
+        const etfHoldingsContainer = document.getElementById('etf-holdings-container');
         const panesEl             = document.getElementById('panes-container');
 
         // ── 全域 reset：清除所有模式 class，隱藏所有可切換容器 ──
@@ -5159,12 +5160,15 @@ async function startApp(contractCode) {
             'market-stock-screener',
             'market-freelancer',
             'market-trading-doctor',
-            'market-amplitude-statistics'
+            'market-amplitude-statistics',
+            'market-etf-holdings'
         );
         if (stockKdScreenerContainer) stockKdScreenerContainer.style.display = 'none';
         if (freelancerContainer) freelancerContainer.style.display = 'none';
         if (tradingDoctorContainer) tradingDoctorContainer.style.display = 'none';
         if (ampStatsContainer)   ampStatsContainer.style.display   = 'none';
+        if (etfHoldingsContainer) etfHoldingsContainer.style.display = 'none';
+        if (window.ETFHoldingsPage) window.ETFHoldingsPage.hide();
         // 移除震幅統計模式注入的動態 style 覆蓋（讓 CSS 重新接管 panes-container）
         const _existOverride = document.getElementById('_amp-panes-override');
         if (_existOverride) _existOverride.remove();
@@ -5261,6 +5265,11 @@ async function startApp(contractCode) {
             if (ampStatsContainer) ampStatsContainer.style.display = 'flex';
             loadAmplitudeStatistics();
             loadAmplitudeTgTargets();
+        } else if (market === 'etf-holdings') {
+            if (tabsBar) tabsBar.style.display = 'none';
+            if (placeholder) placeholder.style.display = 'none';
+            appContainer.classList.add('market-etf-holdings');
+            if (window.ETFHoldingsPage) window.ETFHoldingsPage.show();
         } else { // futures
             flStopAmplitudeRefresh();
             if (tabsBar) tabsBar.style.display = 'none';
@@ -5285,6 +5294,7 @@ async function startApp(contractCode) {
             && savedMarket !== 'trading-doctor'
             && savedMarket !== 'stock-screener'
             && savedMarket !== 'amplitude-statistics'
+            && savedMarket !== 'etf-holdings'
         ) updateContractSelector(savedMarket, contractCode);
         
         marketSelector.value = savedMarket;
@@ -5709,23 +5719,50 @@ function updateFullUI(snap) {
 }
 
 const loginBtn = document.getElementById('login-btn');
+const certFileInput = document.getElementById('cert_file');
+const certFileHint = document.getElementById('cert-file-hint');
+
+function emptyCertFileHint() {
+    return certFileInput && certFileInput.dataset.hasSavedCertificate === 'true'
+        ? '已儲存在本機，未重新選取時將沿用'
+        : '未選取時使用 API Key DMA 登入';
+}
+
+if (certFileInput) {
+    certFileInput.addEventListener('change', () => {
+        const selectedFile = certFileInput.files && certFileInput.files[0];
+        const validExtension = !selectedFile || /\.(pfx|p12)$/i.test(selectedFile.name);
+        certFileInput.setCustomValidity(validExtension ? '' : '請選擇 .pfx 或 .p12 憑證檔案');
+        if (certFileHint) {
+            certFileHint.innerText = selectedFile
+                ? (validExtension ? `已選取：${selectedFile.name}` : '檔案格式不支援，請重新選擇')
+                : emptyCertFileHint();
+            certFileHint.classList.toggle('has-selection', Boolean(selectedFile && validExtension));
+            certFileHint.classList.toggle('has-error', Boolean(selectedFile && !validExtension));
+        }
+    });
+}
+
 if (loginBtn) {
     loginBtn.addEventListener('click', async () => {
+        if (certFileInput && !certFileInput.checkValidity()) {
+            certFileInput.reportValidity();
+            return;
+        }
         loginBtn.disabled = true;
         const msgEl = document.getElementById('login-msg');
         if (msgEl) msgEl.innerText = "連線中...";
-        const req = {
-            api_key: document.getElementById('api_key').value,
-            person_id: document.getElementById('person_id').value,
-            cert_path: document.getElementById('cert_path').value,
-            cert_pass: document.getElementById('cert_pass').value,
-            save_keys: document.getElementById('save_keys').checked
-        };
+        const formData = new FormData();
+        formData.append('api_key', document.getElementById('api_key').value);
+        formData.append('person_id', document.getElementById('person_id').value);
+        formData.append('cert_pass', document.getElementById('cert_pass').value);
+        formData.append('save_keys', document.getElementById('save_keys').checked ? 'true' : 'false');
+        const selectedCertificate = certFileInput && certFileInput.files && certFileInput.files[0];
+        if (selectedCertificate) formData.append('cert_file', selectedCertificate, selectedCertificate.name);
         try {
             const res = await fetch('/api/login', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(req)
+                body: formData
             });
             const data = await res.json();
             if (res.ok && data.status === 'success') {
@@ -6020,7 +6057,8 @@ async function checkStatus() {
                 const savedHint = '已儲存在本機，留空即可沿用';
                 if (data.env.has_api_key) document.getElementById('api_key').placeholder = savedHint;
                 if (data.env.has_person_id) document.getElementById('person_id').placeholder = savedHint;
-                if (data.env.has_cert_path) document.getElementById('cert_path').placeholder = savedHint;
+                if (data.env.has_cert_path && certFileInput) certFileInput.dataset.hasSavedCertificate = 'true';
+                if (data.env.has_cert_path && certFileHint) certFileHint.innerText = emptyCertFileHint();
                 if (data.env.has_cert_pass) document.getElementById('cert_pass').placeholder = savedHint;
             }
         }
