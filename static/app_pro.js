@@ -5191,6 +5191,7 @@ async function startApp(contractCode) {
         const stockKdScreenerContainer = document.getElementById('stock-kd-screener-container');
         const freelancerContainer = document.getElementById('freelancer-container');
         const tradingDoctorContainer = document.getElementById('trading-doctor-container');
+        const dayTradingContainer = document.getElementById('day-trading-container');
         const ampStatsContainer   = document.getElementById('amplitude-statistics-container');
         const etfHoldingsContainer = document.getElementById('etf-holdings-container');
         const panesEl             = document.getElementById('panes-container');
@@ -5201,15 +5202,18 @@ async function startApp(contractCode) {
             'market-stock-screener',
             'market-freelancer',
             'market-trading-doctor',
+            'market-day-trading',
             'market-amplitude-statistics',
             'market-etf-holdings'
         );
         if (stockKdScreenerContainer) stockKdScreenerContainer.style.display = 'none';
         if (freelancerContainer) freelancerContainer.style.display = 'none';
         if (tradingDoctorContainer) tradingDoctorContainer.style.display = 'none';
+        if (dayTradingContainer) dayTradingContainer.style.display = 'none';
         if (ampStatsContainer)   ampStatsContainer.style.display   = 'none';
         if (etfHoldingsContainer) etfHoldingsContainer.style.display = 'none';
         if (window.ETFHoldingsPage) window.ETFHoldingsPage.hide();
+        if (window.ShortCandidatesPage) window.ShortCandidatesPage.hide();
         // 移除震幅統計模式注入的動態 style 覆蓋（讓 CSS 重新接管 panes-container）
         const _existOverride = document.getElementById('_amp-panes-override');
         if (_existOverride) _existOverride.remove();
@@ -5288,6 +5292,11 @@ async function startApp(contractCode) {
             appContainer.classList.add('market-trading-doctor');
             if (tradingDoctorContainer) tradingDoctorContainer.style.display = 'flex';
             initTradingDoctor();
+        } else if (market === 'day-trading') {
+            if (tabsBar) tabsBar.style.display = 'none';
+            if (placeholder) placeholder.style.display = 'none';
+            appContainer.classList.add('market-day-trading');
+            if (window.ShortCandidatesPage) window.ShortCandidatesPage.show();
         } else if (market === 'amplitude-statistics') {
             // ── 震幅統計：動態注入 <style> 來隱藏 panes-container ──
             // CSS style.css 有 `#panes-container { display: grid !important }`，
@@ -5333,6 +5342,7 @@ async function startApp(contractCode) {
         if (
             savedMarket !== 'freelancer'
             && savedMarket !== 'trading-doctor'
+            && savedMarket !== 'day-trading'
             && savedMarket !== 'stock-screener'
             && savedMarket !== 'amplitude-statistics'
             && savedMarket !== 'etf-holdings'

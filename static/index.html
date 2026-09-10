@@ -6,6 +6,7 @@
     <title>TXF Pro Viewer</title>
     <link rel="stylesheet" href="style.css?v=weekly-volume-filter-v17">
     <link rel="stylesheet" href="etf_holdings.css?v=2">
+    <link rel="stylesheet" href="short_candidates.css?v=1">
     <!-- TradingView Lightweight Charts v4.1.1 -->
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <script>
@@ -1399,6 +1400,7 @@
                         <option value="futures">📈 期貨</option>
                         <option value="freelancer">🧑‍💻 自由人</option>
                         <option value="trading-doctor">🩺 交易醫生</option>
+                        <option value="day-trading">⚡ 當沖</option>
                         <option value="stock-screener">🔍 股票篩選</option>
                         <option value="amplitude-statistics">📈 震幅統計</option>
                         <option value="etf-holdings">🧭 ETF 動向</option>
@@ -3287,6 +3289,61 @@
                 </section>
             </section>
         </main>
+
+        <!-- 當沖：獨立外層工作區；V1 先提供隔日放空候選 -->
+        <main id="day-trading-container" class="short-workspace" style="display:none;">
+            <header class="short-header">
+                <div>
+                    <div class="short-eyebrow">DAY-TRADING RESEARCH</div>
+                    <h1>當沖</h1>
+                    <p>前一交易日的可解釋候選篩選。這不是自動交易、開盤放空訊號，也不保證隔日下跌。</p>
+                </div>
+                <div class="short-header-actions">
+                    <button id="short-refresh-btn" type="button">更新隔日放空候選</button>
+                    <div class="short-update-meta">
+                        資料日期 <strong id="short-data-date">—</strong><br>
+                        Scanner <span id="short-version">Short V1</span><br>
+                        最近更新 <span id="short-last-updated">—</span>
+                    </div>
+                </div>
+            </header>
+
+            <section class="short-notice">
+                <strong>明日放空觀察</strong>
+                <span>系統只縮小觀察名單；實際進場仍需觀察支撐壓力、反彈是否失敗與開盤後強弱。</span>
+            </section>
+            <div id="short-alert" class="short-alert" hidden></div>
+            <div id="short-loading" class="short-loading" hidden>
+                <span class="short-spinner"></span>
+                <div><strong id="short-loading-title">更新今日市場資料</strong><small id="short-loading-detail">正在讀取富邦 TSE／OTC Snapshot…</small></div>
+            </div>
+
+            <section id="short-dashboard" hidden>
+                <div class="short-summary-grid">
+                    <article><span>掃描範圍</span><strong id="short-summary-universe">—</strong><small id="short-summary-market">上市 —／上櫃 —</small></article>
+                    <article><span>成功計算</span><strong id="short-summary-success">—</strong><small id="short-summary-missing">缺資料 —</small></article>
+                    <article><span>排除</span><strong id="short-summary-excluded">—</strong><small id="short-summary-excluded-detail">流動性 —／異常 —</small></article>
+                    <article class="is-accent"><span>有效候選</span><strong id="short-summary-valid">—</strong><small id="short-summary-chip">籌碼缺資料 —</small></article>
+                </div>
+
+                <section class="short-table-panel">
+                    <div class="short-section-title">
+                        <div><span>明日放空觀察 Top </span><small id="short-candidate-count">—</small></div>
+                        <p>點選股票可查看入選原因、原始 Factor 與分數拆解。</p>
+                    </div>
+                    <div class="short-table-wrap">
+                        <table class="short-table">
+                            <thead><tr>
+                                <th>排名</th><th>股票</th><th>Short Score</th><th>今日漲跌</th>
+                                <th>相對大盤</th><th>量比</th><th>收盤位置</th><th>型態</th>
+                                <th>Prior Trend</th><th>籌碼</th><th>Penalty</th><th>當沖</th><th>風險</th>
+                            </tr></thead>
+                            <tbody id="short-candidates-body"></tbody>
+                        </table>
+                    </div>
+                </section>
+            </section>
+        </main>
     </div><!-- /#app-container -->
 
     <div id="etf-detail-overlay" class="etf-detail-overlay" hidden></div>
@@ -3296,6 +3353,15 @@
             <button id="etf-detail-close" type="button" aria-label="關閉">×</button>
         </div>
         <div id="etf-detail-content" class="etf-detail-content"></div>
+    </aside>
+
+    <div id="short-detail-overlay" class="short-detail-overlay" hidden></div>
+    <aside id="short-detail-drawer" class="short-detail-drawer" aria-hidden="true">
+        <div class="short-detail-head">
+            <div><span id="short-detail-code">—</span><h2 id="short-detail-name">候選明細</h2></div>
+            <button id="short-detail-close" type="button" aria-label="關閉">×</button>
+        </div>
+        <div id="short-detail-content" class="short-detail-content"></div>
     </aside>
 
     <!-- 股票策略詳情 Drawer -->
@@ -3396,7 +3462,8 @@
 
     <!-- 載入主程式 (加入版本號避免快取問題) -->
     <script src="etf_holdings.js?v=2"></script>
-    <script src="app_pro.js?v=weekly-volume-filter-v68"></script>
+    <script src="short_candidates.js?v=1"></script>
+    <script src="app_pro.js?v=weekly-volume-filter-v69"></script>
 </body>
 </html>
 

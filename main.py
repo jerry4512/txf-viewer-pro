@@ -39,6 +39,11 @@ from etf_holdings import (
     EzMoneyPCFClient,
     SUPPORTED_ETFS,
 )
+from short_candidates import (
+    ShortCandidatesRepository,
+    ShortCandidatesService,
+    ShortScannerError,
+)
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
@@ -51,6 +56,9 @@ _etf_holdings_service = ETFHoldingsService(
     ETFHoldingsRepository(_ETF_HOLDINGS_DB_PATH, _STOCK_DB_PATH)
 )
 _etf_holdings_client = EzMoneyPCFClient()
+_short_candidates_service = ShortCandidatesService(
+    ShortCandidatesRepository(_STOCK_DB_PATH)
+)
 
 _tg_push_status = {
     "last_push_time":   None,
@@ -98,6 +106,7 @@ contract = None
 main_loop = None
 _kbars_lock = asyncio.Lock()  # 富邦 REST 查詢全局序列化，避免碰觸速率限制
 _etf_holdings_lock = asyncio.Lock()
+_short_candidates_lock = asyncio.Lock()
 _kbars_retry_after: dict[tuple[str, str], float] = {}
 _kbars_retry_lock = threading.Lock()
 _kbars_forced_refresh_after: dict[str, float] = {}
@@ -1737,6 +1746,60 @@ async def get_etf_holding_detail(
         raise HTTPException(
             status_code=503,
             detail=f"ETF 個股明細目前無法取得：{str(exc) or type(exc).__name__}",
+        )
+
+
+@app.get("/api/short-candidates")
+async def get_short_candidates(
+    date: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    min_score: float = Query(0.0, ge=0.0, le=100.0),
+    sort: str = Query("score"),
+):
+    """Return a saved Short V1 run; this endpoint never triggers market calls."""
+    if date:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="日期格式必須為 YYYY-MM-DD") from exc
+    if sort not in {"score", "rank"}:
+        raise HTTPException(status_code=422, detail="sort 僅支援 score 或 rank")
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: _short_candidates_service.repository.dashboard(
+            data_date=date,
+            limit=limit,
+            min_score=min_score,
+            sort=sort,
+            scanner_version=_short_candidates_service.config.scanner_version,
+        ),
+    )
+
+
+@app.post("/api/short-candidates/refresh")
+async def refresh_short_candidates():
+    """Run the manual, read-only Fubon Short V1 pipeline once."""
+    global api, is_logged_in
+    if not is_logged_in or api is None or api.stock_rest is None:
+        raise HTTPException(status_code=401, detail="請先登入富邦行情服務再更新隔日放空候選")
+    if _short_candidates_lock.locked():
+        raise HTTPException(status_code=409, detail="隔日放空候選正在更新，請勿重複點擊")
+    try:
+        async with _short_candidates_lock:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, lambda: _short_candidates_service.refresh(api)
+            )
+    except ShortScannerError as exc:
+        print(f"[SHORT_V1] data_not_ready={exc}")
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        message = str(exc) or type(exc).__name__
+        print(f"[SHORT_V1] refresh_failed={type(exc).__name__}: {message}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"隔日放空候選更新失敗：{message}",
         )
 
 # ── K 線本地快取（SQLite）────────────────────────────────────────

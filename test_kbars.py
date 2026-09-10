@@ -62,7 +62,12 @@ class FakeIntraday:
 
 
 class FakeStockIntraday:
+    def tickers(self, **params):
+        self.last_tickers_params = params
+        return {"date": "2026-08-04", "data": [{"symbol": "2330", "name": "台積電"}]}
+
     def ticker(self, **params):
+        self.last_ticker_params = params
         return {
             "date": "2026-08-04",
             "type": "EQUITY",
@@ -70,7 +75,12 @@ class FakeStockIntraday:
             "market": "TSE",
             "symbol": params["symbol"],
             "name": "台積電",
+            "industry": "24",
+            "securityType": "01",
             "referencePrice": 1000,
+            "canDayTrade": True,
+            "canBuyDayTrade": True,
+            "securityStatus": "NORMAL",
         }
 
     def quote(self, **params):
@@ -106,6 +116,27 @@ class FakeStockIntraday:
         }
 
 
+class FakeStockSnapshot:
+    def quotes(self, **params):
+        self.last_params = params
+        return {
+            "date": "2026-08-04", "time": "140000", "market": params["market"],
+            "data": [{"symbol": "2330", "closePrice": 1015}],
+        }
+
+
+class FakeStockHistorical:
+    def candles(self, **params):
+        self.last_params = params
+        return {
+            "symbol": params["symbol"],
+            "data": [{
+                "date": "2026-08-04", "open": 1010, "high": 1020,
+                "low": 1005, "close": 1015, "volume": 12_345_000,
+            }],
+        }
+
+
 class FakeWebSocket:
     def __init__(self):
         self.subscriptions = []
@@ -124,7 +155,13 @@ class FubonMarketDataTests(unittest.TestCase):
         self.client = FubonMarketDataClient()
         self.client.rest = SimpleNamespace(intraday=self.intraday)
         self.stock_intraday = FakeStockIntraday()
-        self.client.stock_rest = SimpleNamespace(intraday=self.stock_intraday)
+        self.stock_snapshot = FakeStockSnapshot()
+        self.stock_historical = FakeStockHistorical()
+        self.client.stock_rest = SimpleNamespace(
+            intraday=self.stock_intraday,
+            snapshot=self.stock_snapshot,
+            historical=self.stock_historical,
+        )
 
     def test_rolling_contract_resolves_nearest_nonexpired_month(self):
         contract = self.client.resolve_contract("TXFR1")
@@ -217,6 +254,32 @@ class FubonMarketDataTests(unittest.TestCase):
         self.assertEqual(contract.reference, 1005.0)
         self.assertEqual(snapshots[0].avg_price, 1012.5)
         self.assertEqual(snapshots[0].total_volume, 12345)
+
+    def test_stock_scanner_wrappers_use_snapshot_historical_and_ticker_schema(self):
+        snapshot = self.client.stock_snapshot_quotes("TSE")
+        self.assertEqual(snapshot["data"][0]["symbol"], "2330")
+        self.assertEqual(
+            self.stock_snapshot.last_params,
+            {"market": "TSE", "type": "COMMONSTOCK"},
+        )
+
+        tickers = self.client.stock_tickers("OTC", isDisposition=True)
+        self.assertEqual(tickers["data"][0]["symbol"], "2330")
+        self.assertEqual(self.stock_intraday.last_tickers_params["type"], "EQUITY")
+        self.assertEqual(self.stock_intraday.last_tickers_params["market"], "OTC")
+        self.assertTrue(self.stock_intraday.last_tickers_params["isDisposition"])
+
+        details = self.client.stock_ticker_details("2330")
+        self.assertTrue(details["canDayTrade"])
+        self.assertEqual(details["securityStatus"], "NORMAL")
+
+        history = self.client.stock_historical_daily_candles(
+            "2330", "2026-07-01", "2026-08-04"
+        )
+        self.assertEqual(history["data"][0]["close"], 1015)
+        self.assertEqual(self.stock_historical.last_params["timeframe"], "D")
+        self.assertEqual(self.stock_historical.last_params["adjusted"], "false")
+        self.assertEqual(self.stock_historical.last_params["sort"], "asc")
 
     def test_stock_websocket_normalizes_trades_and_candles(self):
         ws = FakeWebSocket()

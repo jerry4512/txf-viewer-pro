@@ -994,6 +994,106 @@ class FubonMarketDataClient:
             "ts": raw.get("lastUpdated") or raw.get("closeTime") or last_trade.get("time"),
         }
 
+    def stock_snapshot_quotes(
+        self, market: str, security_type: str = "COMMONSTOCK"
+    ) -> dict[str, Any]:
+        """Return the official Fubon whole-market stock snapshot payload."""
+        if self.stock_rest is None:
+            raise FubonMarketDataError("富邦股票行情尚未登入")
+        normalized_market = str(market or "").strip().upper()
+        if normalized_market not in {"TSE", "OTC"}:
+            raise FubonMarketDataError("股票 Snapshot 市場僅支援 TSE 或 OTC")
+        try:
+            payload = _response_payload(
+                self.stock_rest.snapshot.quotes(
+                    market=normalized_market,
+                    type=security_type,
+                )
+            )
+        except Exception as exc:
+            raise self._safe_rest_error(
+                exc, f"{normalized_market} 股票 Snapshot"
+            )
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            raise FubonMarketDataError(
+                f"富邦 {normalized_market} Snapshot 回應格式異常（缺少 data 陣列）"
+            )
+        return payload
+
+    def stock_tickers(self, market: str, **filters: Any) -> dict[str, Any]:
+        """Query Fubon's equity universe/status list without a second client."""
+        if self.stock_rest is None:
+            raise FubonMarketDataError("富邦股票行情尚未登入")
+        normalized_market = str(market or "").strip().upper()
+        if normalized_market not in {"TSE", "OTC"}:
+            raise FubonMarketDataError("股票清單市場僅支援 TSE 或 OTC")
+        params = {"type": "EQUITY", "market": normalized_market, **filters}
+        try:
+            payload = _response_payload(self.stock_rest.intraday.tickers(**params))
+        except Exception as exc:
+            raise self._safe_rest_error(
+                exc, f"{normalized_market} 股票清單"
+            )
+        if not isinstance(payload.get("data"), list):
+            raise FubonMarketDataError(
+                f"富邦 {normalized_market} 股票清單格式異常（缺少 data 陣列）"
+            )
+        return payload
+
+    def stock_ticker_details(self, symbol: str) -> dict[str, Any]:
+        """Return Fubon's current security and day-trade metadata."""
+        if self.stock_rest is None:
+            raise FubonMarketDataError("富邦股票行情尚未登入")
+        normalized = str(symbol or "").strip().upper()
+        if not normalized:
+            raise FubonMarketDataError("股票代號不可為空")
+        try:
+            payload = _response_payload(
+                self.stock_rest.intraday.ticker(symbol=normalized)
+            )
+        except Exception as exc:
+            raise self._safe_rest_error(exc, f"股票 {normalized} 基本資料")
+        if str(payload.get("symbol") or "").strip().upper() != normalized:
+            raise FubonMarketDataError(f"富邦股票 {normalized} 基本資料格式異常")
+        return payload
+
+    def stock_historical_daily_candles(
+        self, symbol: str, start: str, end: str
+    ) -> dict[str, Any]:
+        """Read unadjusted Fubon daily OHLCV over an explicit date window."""
+        if self.stock_rest is None:
+            raise FubonMarketDataError("富邦股票行情尚未登入")
+        normalized = str(symbol or "").strip().upper()
+        if not normalized:
+            raise FubonMarketDataError("股票代號不可為空")
+        try:
+            start_date = datetime.strptime(start, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end, "%Y-%m-%d").date()
+        except (TypeError, ValueError) as exc:
+            raise FubonMarketDataError("歷史日 K 日期格式必須為 yyyy-MM-dd") from exc
+        if start_date > end_date:
+            raise FubonMarketDataError("歷史日 K 開始日期不可晚於結束日期")
+        try:
+            payload = _response_payload(
+                self.stock_rest.historical.candles(**{
+                    "symbol": normalized,
+                    "from": start,
+                    "to": end,
+                    "timeframe": "D",
+                    "adjusted": "false",
+                    "fields": "open,high,low,close,volume,turnover,change",
+                    "sort": "asc",
+                })
+            )
+        except Exception as exc:
+            raise self._safe_rest_error(exc, f"股票 {normalized} 歷史日 K")
+        if not isinstance(payload.get("data"), list):
+            raise FubonMarketDataError(
+                f"富邦股票 {normalized} 歷史日 K 格式異常（缺少 data 陣列）"
+            )
+        return payload
+
     def etf_holdings(
         self,
         *,
