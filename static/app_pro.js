@@ -1433,6 +1433,9 @@ class FreelancerKChart {
         this.pendingDrawPoint = null;
         this.previewDrawing = null;
         this.drawingOverlay = null;
+        this.overlayRenderFrame = null;
+        this.chartPointerActive = false;
+        this.chartInteractionSyncReady = false;
         this.countdownTimer = null;
         this.lastRealtimeTickAt = 0;
         this.isReconcilingRecent = false;
@@ -1585,6 +1588,7 @@ class FreelancerKChart {
         this.setupProductSwitch();
         this.syncSessionToolbar();
         this.setupDrawingTools();
+        this.setupChartInteractionSync(mainEl);
         this.reload();
     }
 
@@ -3329,6 +3333,43 @@ class FreelancerKChart {
         rect.setAttribute('stroke-width', '2');
         rect.setAttribute('stroke-dasharray', preview ? '6 5' : '');
         this.drawingOverlay.appendChild(rect);
+    }
+
+    scheduleOverlayRender() {
+        if (this.overlayRenderFrame !== null) return;
+        this.overlayRenderFrame = window.requestAnimationFrame(() => {
+            this.overlayRenderFrame = null;
+            this.renderDrawings();
+            this.updateCountdown();
+        });
+    }
+
+    setupChartInteractionSync(mainEl) {
+        if (!mainEl || this.chartInteractionSyncReady) return;
+        this.chartInteractionSyncReady = true;
+
+        // 成本線與手動畫線位於獨立 SVG 覆蓋層。Lightweight Charts 沒有
+        // 提供價格軸可視範圍變動事件，因此拖曳 Y 軸時必須跟著指標事件
+        // 重新換算 priceToCoordinate，否則 SVG 會停留在舊的價格座標。
+        mainEl.addEventListener('pointerdown', () => {
+            this.chartPointerActive = true;
+            this.scheduleOverlayRender();
+        }, { passive: true });
+
+        window.addEventListener('pointermove', () => {
+            if (this.chartPointerActive) this.scheduleOverlayRender();
+        }, { passive: true });
+
+        const finishInteraction = () => {
+            if (!this.chartPointerActive) return;
+            this.chartPointerActive = false;
+            this.scheduleOverlayRender();
+        };
+        window.addEventListener('pointerup', finishInteraction, { passive: true });
+        window.addEventListener('pointercancel', finishInteraction, { passive: true });
+
+        // 雙擊價格軸會恢復自動縮放，也需要在套件完成重設後刷新覆蓋層。
+        mainEl.addEventListener('dblclick', () => this.scheduleOverlayRender());
     }
 
     resize() {
