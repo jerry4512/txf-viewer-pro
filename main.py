@@ -33,7 +33,12 @@ import broker_fetcher  # official on-demand broker data fetcher
 import moneydj_fetcher  # MoneyDJ Fubon broker period summary fetcher
 from market_status import sync_taiex_daily_kbars, normalize_date, TAIEX_SYMBOL
 from fubon_market_data import FubonMarketDataClient, FubonMarketDataError
-from etf_holdings import ETFHoldingsRepository, ETFHoldingsService, SUPPORTED_ETFS
+from etf_holdings import (
+    ETFHoldingsRepository,
+    ETFHoldingsService,
+    EzMoneyPCFClient,
+    SUPPORTED_ETFS,
+)
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
@@ -45,6 +50,7 @@ _ETF_HOLDINGS_DB_PATH = os.path.join(_BASE_DIR_MAIN, "etf_holdings_cache.db")
 _etf_holdings_service = ETFHoldingsService(
     ETFHoldingsRepository(_ETF_HOLDINGS_DB_PATH, _STOCK_DB_PATH)
 )
+_etf_holdings_client = EzMoneyPCFClient()
 
 _tg_push_status = {
     "last_push_time":   None,
@@ -1611,14 +1617,12 @@ async def _refresh_etf_holdings(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ) -> dict:
-    if not is_logged_in or not api:
-        raise FubonMarketDataError("尚未登入富邦行情服務")
     loop = asyncio.get_running_loop()
     async with _etf_holdings_lock:
         return await loop.run_in_executor(
             None,
             lambda: _etf_holdings_service.refresh(
-                api,
+                _etf_holdings_client,
                 symbol,
                 date_from=date_from,
                 date_to=date_to,
@@ -1644,7 +1648,9 @@ async def get_etf_holdings_dashboard(
         except Exception as exc:
             message = str(exc) or type(exc).__name__
             _etf_holdings_service.repository.record_error(
-                normalized, message, str(getattr(api, "version", "unknown"))
+                normalized,
+                message,
+                str(getattr(_etf_holdings_client, "version", "unknown")),
             )
             print(f"[ETF] {normalized} holdings refresh failed: {type(exc).__name__}: {message}")
             if not has_cache:
@@ -1694,7 +1700,9 @@ async def refresh_etf_holdings(req: ETFHoldingsRefreshRequest):
     except Exception as exc:
         message = str(exc) or type(exc).__name__
         _etf_holdings_service.repository.record_error(
-            normalized, message, str(getattr(api, "version", "unknown"))
+            normalized,
+            message,
+            str(getattr(_etf_holdings_client, "version", "unknown")),
         )
         print(f"[ETF] {normalized} holdings refresh failed: {type(exc).__name__}: {message}")
         raise HTTPException(

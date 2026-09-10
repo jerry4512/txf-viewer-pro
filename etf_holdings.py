@@ -15,8 +15,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sqlite3
 import statistics
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.cookiejar import CookieJar
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
@@ -26,6 +31,10 @@ TAIPEI = timezone(timedelta(hours=8))
 
 SUPPORTED_ETFS = {
     "00981A": "統一台股增長",
+}
+
+EZMONEY_PCF_FUND_CODES = {
+    "00981A": "49YTW",
 }
 
 BEHAVIOR_LABELS = {
@@ -129,6 +138,186 @@ def _optional_float(value: Any) -> Optional[float]:
 
 def _round(value: Optional[float], digits: int = 6) -> Optional[float]:
     return round(value, digits) if value is not None and math.isfinite(value) else None
+
+
+_DOTNET_DATE_RE = re.compile(r"^/Date\((-?\d+)(?:[+-]\d{4})?\)/$")
+
+
+def _parse_ezmoney_date(value: Any) -> Optional[str]:
+    """Normalize both ISO and legacy ASP.NET JSON dates to Taipei YYYY-MM-DD."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(TAIPEI).date().isoformat() if value.tzinfo else value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    match = _DOTNET_DATE_RE.match(text)
+    if match:
+        return datetime.fromtimestamp(int(match.group(1)) / 1000, TAIPEI).date().isoformat()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return None
+
+
+class EzMoneyPCFClient:
+    """Read the issuer's public PCF and expose the existing holdings shape."""
+
+    endpoint = "https://www.ezmoney.com.tw/ETF/Transaction/GetPCF"
+    referer = "https://www.ezmoney.com.tw/ETF/Transaction/"
+    version = "ezmoney-pcf-v1"
+
+    def __init__(self, *, timeout: float = 20.0, opener: Any = None):
+        self.timeout = timeout
+        self._opener = opener or urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar())
+        )
+
+    @staticmethod
+    def _roc_date(value: str) -> str:
+        parsed = date.fromisoformat(value)
+        return f"{parsed.year - 1911:03d}/{parsed:%m/%d}"
+
+    def _request_latest(self, fund_code: str, requested_date: str) -> dict[str, Any]:
+        body = urllib.parse.urlencode({
+            "fundCode": fund_code,
+            "date": self._roc_date(requested_date),
+            # false makes the issuer return its newest published PCF.  Using a
+            # specific date would require querying the next PCF post date to
+            # obtain the requested holdings transaction date.
+            "specificDate": "false",
+        }).encode("utf-8")
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 Chrome/140.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": self.referer,
+        }
+        last_error: Optional[Exception] = None
+        for attempt in range(2):
+            request = urllib.request.Request(self.endpoint, data=body, headers=headers)
+            try:
+                with self._opener.open(request, timeout=self.timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("統一投信 PCF 回應不是 JSON 物件")
+                return payload
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                # The site first issues a same-URL redirect while installing
+                # its __nxquid cookie. CookieJar stores it; retrying then works.
+                if attempt == 0 and exc.code in {301, 302, 303, 307, 308}:
+                    exc.close()
+                    continue
+                raise RuntimeError(f"統一投信 PCF HTTP {exc.code}") from exc
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"統一投信 PCF 連線失敗：{exc}") from exc
+        raise RuntimeError(f"統一投信 PCF 連線失敗：{last_error}")
+
+    @staticmethod
+    def normalize_payload(
+        payload: dict[str, Any],
+        *,
+        symbol: str,
+        fund_code: str,
+    ) -> dict[str, Any]:
+        fund = payload.get("fund") if isinstance(payload.get("fund"), dict) else {}
+        response_symbol = str(fund.get("sStockNo") or "").strip().upper()
+        if response_symbol and response_symbol != symbol:
+            raise ValueError(
+                f"統一投信 PCF 基金不符：預期 {symbol}，實際 {response_symbol}"
+            )
+        response_fund_code = str(fund.get("sFundCode") or "").strip().upper()
+        if response_fund_code and response_fund_code != fund_code:
+            raise ValueError(
+                f"統一投信 PCF fundCode 不符：預期 {fund_code}，實際 {response_fund_code}"
+            )
+
+        assets = payload.get("asset")
+        if not isinstance(assets, list):
+            raise ValueError("統一投信 PCF 回應缺少 asset 陣列")
+        stock_asset = next(
+            (
+                item for item in assets
+                if isinstance(item, dict) and str(item.get("AssetCode") or "").upper() == "ST"
+            ),
+            None,
+        )
+        details = stock_asset.get("Details") if isinstance(stock_asset, dict) else None
+        if not isinstance(details, list) or not details:
+            raise ValueError("統一投信 PCF 回應沒有股票持股明細")
+
+        pcf_rows = payload.get("pcf") if isinstance(payload.get("pcf"), list) else []
+        fallback_date = next(
+            (
+                _parse_ezmoney_date(row.get("TranDate"))
+                for row in pcf_rows if isinstance(row, dict) and row.get("TranDate")
+            ),
+            None,
+        )
+        components: list[dict[str, Any]] = []
+        disclosure_dates: set[str] = set()
+        for item in details:
+            if not isinstance(item, dict):
+                continue
+            stock_symbol = str(item.get("DetailCode") or "").strip().upper()
+            if not stock_symbol:
+                continue
+            data_date = _parse_ezmoney_date(item.get("TranDate")) or fallback_date
+            if data_date:
+                disclosure_dates.add(data_date)
+            components.append({
+                "symbol": stock_symbol,
+                "name": str(item.get("DetailName") or "").strip(),
+                "quantity": _safe_int(item.get("Share")),
+                "weight": _safe_float(item.get("NavRate")),
+                "marketValue": _optional_float(item.get("Amount")),
+                "editTime": item.get("EditTime"),
+                "source": "ezmoney_pcf",
+            })
+        if not components:
+            raise ValueError("統一投信 PCF 回應沒有有效股票代號")
+        if len(disclosure_dates) != 1:
+            raise ValueError(
+                f"統一投信 PCF 持股日期異常：{sorted(disclosure_dates) or '缺少 TranDate'}"
+            )
+
+        return {
+            "symbol": symbol,
+            "type": "EQUITY",
+            "exchange": "TWSE",
+            "market": "TSE",
+            "source": "ezmoney_pcf",
+            "data": [{
+                "date": next(iter(disclosure_dates)),
+                "components": components,
+            }],
+        }
+
+    def etf_holdings(
+        self,
+        *,
+        symbol: str,
+        start: str,
+        end: str,
+        sort: str = "asc",
+    ) -> dict[str, Any]:
+        del start, sort  # GetPCF latest mode returns one authoritative snapshot.
+        normalized_symbol = str(symbol or "").strip().upper()
+        fund_code = EZMONEY_PCF_FUND_CODES.get(normalized_symbol)
+        if not fund_code:
+            raise ValueError(f"統一投信 PCF 尚未設定 ETF {normalized_symbol}")
+        payload = self._request_latest(fund_code, end)
+        return self.normalize_payload(
+            payload,
+            symbol=normalized_symbol,
+            fund_code=fund_code,
+        )
 
 
 class ETFHoldingsRepository:
@@ -317,7 +506,7 @@ class ETFHoldingsRepository:
 
             meta = {
                 key: payload.get(key)
-                for key in ("symbol", "type", "exchange", "market")
+                for key in ("symbol", "type", "exchange", "market", "source")
             }
             last_data_date = max(saved_dates) if saved_dates else self.latest_date(symbol)
             conn.execute(
@@ -346,6 +535,7 @@ class ETFHoldingsRepository:
             "rows": saved_rows,
             "lastDataDate": max(saved_dates) if saved_dates else None,
             "fetchedAt": fetched_at,
+            "source": payload.get("source") or "unknown",
         }
 
     def record_error(self, symbol: str, message: str, sdk_version: str = "") -> None:
@@ -987,9 +1177,14 @@ class ETFHoldingsService:
             price_metrics=prices,
         )
         sync = self.repository.sync_status(symbol)
+        try:
+            response_meta = json.loads(sync.get("response_meta") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            response_meta = {}
         result["lastUpdated"] = sync.get("last_fetched_at")
         result["cache"] = {
             "source": "sqlite",
+            "provider": response_meta.get("source") or "unknown",
             "database": os.path.basename(self.repository.db_path),
             "sdkVersion": sync.get("sdk_version"),
             "lastRequestedFrom": sync.get("last_from"),

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 import main
 from etf_holdings import (
+    EzMoneyPCFClient,
     ETFHoldingsAnalyzer,
     ETFHoldingsRepository,
     ETFHoldingsService,
@@ -247,6 +248,56 @@ class _FakeETFClient:
         return self.payload
 
 
+def _ezmoney_payload(tran_date="2026-08-27T00:00:00"):
+    return {
+        "fund": {
+            "sFundCode": "49YTW",
+            "sStockNo": "00981A    ",
+        },
+        "pcf": [{"TranDate": tran_date, "PostDate": "2026-08-28T00:00:00"}],
+        "asset": [{
+            "AssetCode": "ST",
+            "Details": [{
+                "DetailCode": "2383",
+                "DetailName": "台光電",
+                "Share": 4_807_000.0,
+                "NavRate": 9.11,
+                "Amount": 43_787_770_000.0,
+                "TranDate": tran_date,
+                "EditTime": "2026-08-27T16:28:44",
+            }],
+        }],
+    }
+
+
+def test_ezmoney_adapter_normalizes_latest_pcf():
+    payload = EzMoneyPCFClient.normalize_payload(
+        _ezmoney_payload("/Date(1787760000000)/"),
+        symbol="00981A",
+        fund_code="49YTW",
+    )
+    assert payload["source"] == "ezmoney_pcf"
+    assert payload["data"][0]["date"] == "2026-08-27"
+    assert payload["data"][0]["components"][0] == {
+        "symbol": "2383",
+        "name": "台光電",
+        "quantity": 4_807_000,
+        "weight": 9.11,
+        "marketValue": 43_787_770_000.0,
+        "editTime": "2026-08-27T16:28:44",
+        "source": "ezmoney_pcf",
+    }
+
+
+def test_ezmoney_adapter_rejects_wrong_fund():
+    payload = _ezmoney_payload()
+    payload["fund"]["sStockNo"] = "0050"
+    with pytest.raises(ValueError, match="基金不符"):
+        EzMoneyPCFClient.normalize_payload(
+            payload, symbol="00981A", fund_code="49YTW"
+        )
+
+
 def _api_payload():
     by_date = {}
     for row in _scaling_fixture():
@@ -297,8 +348,7 @@ def _payload_from_rows(rows):
 def test_api_refresh_and_history_range(monkeypatch, tmp_path):
     service = ETFHoldingsService(ETFHoldingsRepository(str(tmp_path / "api.db")))
     monkeypatch.setattr(main, "_etf_holdings_service", service)
-    monkeypatch.setattr(main, "api", _FakeETFClient(_api_payload()))
-    monkeypatch.setattr(main, "is_logged_in", True)
+    monkeypatch.setattr(main, "_etf_holdings_client", _FakeETFClient(_api_payload()))
     client = TestClient(main.app)
 
     refreshed = client.post("/api/etf/holdings/refresh", json={"symbol": "00981A"})
@@ -364,8 +414,11 @@ def test_api_period_regression_returns_independent_window_analysis(monkeypatch, 
 def test_api_empty_and_upstream_error_do_not_crash(monkeypatch, tmp_path):
     service = ETFHoldingsService(ETFHoldingsRepository(str(tmp_path / "empty.db")))
     monkeypatch.setattr(main, "_etf_holdings_service", service)
-    monkeypatch.setattr(main, "api", _FakeETFClient(error=RuntimeError("permission denied")))
-    monkeypatch.setattr(main, "is_logged_in", True)
+    monkeypatch.setattr(
+        main,
+        "_etf_holdings_client",
+        _FakeETFClient(error=RuntimeError("permission denied")),
+    )
     client = TestClient(main.app)
 
     response = client.get("/api/etf/holdings?symbol=00981A")
