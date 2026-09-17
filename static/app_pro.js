@@ -1384,6 +1384,27 @@ const FREELANCER_COST_LINE = Object.freeze({
     lineWidth: 2,
     showResetMarks: false
 });
+// 選取中的手繪圖形高亮色，以及透明命中區的筆畫寬度（點擊容錯範圍）。
+const DRAWING_SELECTED_COLOR = '#ffd24a';
+const DRAWING_HIT_WIDTH = 10;
+// 斐波那契趨勢擴展：只保留 TradingView 設定面板中勾選的層級與其顏色，
+// 水平線一律實線，三個錨點之間的趨勢線為灰色虛線。
+const FIBONACCI_EXTENSION_LEVELS = Object.freeze([
+    { value: 0, color: '#ffffff' },
+    { value: 0.236, color: '#ffffff' },
+    { value: 0.618, color: '#ff0000' },
+    { value: 0.786, color: '#ff0000' },
+    { value: 1, color: '#ff0000' },
+    { value: 1.618, color: '#ff0000' },
+    { value: 2, color: '#ffffff' },
+    { value: 2.618, color: '#ff0000' },
+    { value: 3.14, color: '#ffffff' },
+    { value: 3.618, color: '#f7525f' }
+]);
+const FIBONACCI_EXTENSION_TREND_COLOR = '#9aa3b2';
+// 擴展的水平線只畫在第二、第三個錨點之間，標籤放左側；回撤則維持拉到右緣、
+// 標籤靠右。兩者分處畫面左右才不會疊在一起。
+const FIBONACCI_EXTENSION_MIN_SPAN = 40;
 const FREELANCER_MACD = Object.freeze({
     fastLength: 12,
     slowLength: 26,
@@ -1434,8 +1455,11 @@ class FreelancerKChart {
         this.drawTool = 'cursor';
         this.drawings = [];
         this.pendingDrawPoint = null;
+        this.pendingDrawPoints = [];
         this.previewDrawing = null;
         this.drawingOverlay = null;
+        this.selectedDrawingIndex = null;
+        this.drawingKeyboardReady = false;
         this.fibonacciEditIndex = null;
         this.overlayRenderFrame = null;
         this.chartPointerActive = false;
@@ -1898,8 +1922,8 @@ class FreelancerKChart {
 
             this.setSymbol(data.contract || normalized);
             this.drawings = [];
-            this.pendingDrawPoint = null;
-            this.previewDrawing = null;
+            this.resetPendingDraw();
+            this.selectedDrawingIndex = null;
             this.renderDrawings();
 
             const globalSelector = document.getElementById('contract-selector');
@@ -3222,8 +3246,8 @@ class FreelancerKChart {
             if (tool === 'disabled') return;
             if (tool === 'clear') {
                 this.drawings = [];
-                this.pendingDrawPoint = null;
-                this.previewDrawing = null;
+                this.resetPendingDraw();
+                this.selectedDrawingIndex = null;
                 this.renderDrawings();
                 return;
             }
@@ -3237,6 +3261,14 @@ class FreelancerKChart {
             this.previewDrawing = null;
             this.renderDrawings();
         });
+
+        // 點擊圖表空白處取消選取。覆蓋層在游標模式是 pointer-events:none，
+        // 只有繪圖的命中區域會攔截事件，因此這裡收得到其餘的點擊。
+        this.drawingOverlay.parentElement?.addEventListener('click', (event) => {
+            if (event.target.closest('[data-drawing-index]')) return;
+            this.clearDrawingSelection();
+        });
+        this.setupDrawingKeyboard();
         const editor = document.getElementById('fl-fibonacci-editor');
         const editorForm = document.getElementById('fl-fibonacci-editor-form');
         editorForm?.addEventListener('submit', (event) => this.applyFibonacciEditor(event));
@@ -3249,10 +3281,78 @@ class FreelancerKChart {
         this.setDrawTool(this.drawTool);
     }
 
+    setupDrawingKeyboard() {
+        if (this.drawingKeyboardReady) return;
+        this.drawingKeyboardReady = true;
+
+        document.addEventListener('keydown', (event) => {
+            if (!['Backspace', 'Delete', 'Escape'].includes(event.key)) return;
+            if (event.ctrlKey || event.metaKey || event.altKey) return;
+            if (!this.isDrawingSurfaceVisible()) return;
+
+            const target = event.target;
+            const tagName = target?.tagName || '';
+            if (target?.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(tagName)) return;
+
+            if (event.key === 'Escape') {
+                const editor = document.getElementById('fl-fibonacci-editor');
+                if (editor && !editor.hidden) {
+                    this.closeFibonacciEditor();
+                    return;
+                }
+                this.resetPendingDraw();
+                this.selectedDrawingIndex = null;
+                this.renderDrawings();
+                return;
+            }
+
+            // Backspace 在瀏覽器預設可能觸發上一頁，刪除成功時必須攔下。
+            if (this.deleteSelectedDrawing()) event.preventDefault();
+        });
+    }
+
+    isDrawingSurfaceVisible() {
+        const mainEl = document.getElementById('fl-chart-main');
+        return Boolean(mainEl && mainEl.offsetParent !== null);
+    }
+
+    selectDrawing(drawingIndex) {
+        if (!Number.isInteger(drawingIndex) || !this.drawings[drawingIndex]) return;
+        if (this.selectedDrawingIndex === drawingIndex) return;
+        this.selectedDrawingIndex = drawingIndex;
+        this.renderDrawings();
+    }
+
+    clearDrawingSelection() {
+        if (this.selectedDrawingIndex === null) return;
+        this.selectedDrawingIndex = null;
+        this.renderDrawings();
+    }
+
+    deleteSelectedDrawing() {
+        if (this.selectedDrawingIndex === null) return false;
+        if (!this.drawings[this.selectedDrawingIndex]) {
+            this.selectedDrawingIndex = null;
+            return false;
+        }
+        this.drawings.splice(this.selectedDrawingIndex, 1);
+        this.selectedDrawingIndex = null;
+        this.resetPendingDraw();
+        this.closeFibonacciEditor();
+        this.renderDrawings();
+        return true;
+    }
+
+    resetPendingDraw() {
+        this.pendingDrawPoint = null;
+        this.pendingDrawPoints = [];
+        this.previewDrawing = null;
+    }
+
     setDrawTool(tool) {
         this.drawTool = tool;
-        this.pendingDrawPoint = null;
-        this.previewDrawing = null;
+        this.resetPendingDraw();
+        this.selectedDrawingIndex = null;
         document.querySelectorAll('.fl-draw-btn').forEach(btn => {
             btn.classList.toggle('active', btn.dataset.tool === tool);
         });
@@ -3274,8 +3374,14 @@ class FreelancerKChart {
     }
 
     handleDrawClick(event) {
-        if (this.drawTool === 'cursor') return;
-        if (event.target.closest('[data-fibonacci-index]')) return;
+        const hit = event.target.closest('[data-drawing-index]');
+        if (this.drawTool === 'cursor') {
+            if (!hit) return;
+            event.preventDefault();
+            event.stopPropagation();
+            this.selectDrawing(Number(hit.dataset.drawingIndex));
+            return;
+        }
         event.preventDefault();
         event.stopPropagation();
 
@@ -3284,13 +3390,25 @@ class FreelancerKChart {
 
         if (this.drawTool === 'horizontal') {
             this.drawings.push({ type: 'horizontal', price: point.price });
-            this.renderDrawings();
+            this.finishDrawing();
             return;
         }
 
         if (this.drawTool === 'vertical') {
             this.drawings.push({ type: 'vertical', time: point.time });
-            this.renderDrawings();
+            this.finishDrawing();
+            return;
+        }
+
+        // 趨勢擴展需要三個錨點：起漲、起跌，再加上回撤的起算點。
+        if (this.drawTool === 'fibextension') {
+            this.pendingDrawPoints.push(point);
+            if (this.pendingDrawPoints.length < 3) {
+                this.renderDrawings();
+                return;
+            }
+            this.drawings.push({ type: 'fibextension', points: this.pendingDrawPoints.slice(0, 3) });
+            this.finishDrawing();
             return;
         }
 
@@ -3311,22 +3429,25 @@ class FreelancerKChart {
             start,
             end
         });
-        this.pendingDrawPoint = null;
-        this.previewDrawing = null;
-        this.renderDrawings();
+        this.finishDrawing();
+    }
+
+    // 與 TradingView 一致：圖形一畫完就退回游標，避免連點時畫出第二個圖形。
+    finishDrawing() {
+        this.setDrawTool('cursor');
     }
 
     handleDrawingDoubleClick(event) {
-        const target = event.target.closest('[data-fibonacci-index]');
+        const target = event.target.closest('[data-drawing-index]');
         if (!target) return;
-        const drawingIndex = Number(target.dataset.fibonacciIndex);
+        const drawingIndex = Number(target.dataset.drawingIndex);
         const drawing = this.drawings[drawingIndex];
         if (!drawing || drawing.type !== 'fibonacci') return;
 
         event.preventDefault();
         event.stopPropagation();
-        this.pendingDrawPoint = null;
-        this.previewDrawing = null;
+        this.resetPendingDraw();
+        this.selectDrawing(drawingIndex);
 
         this.openFibonacciEditor(drawingIndex);
     }
@@ -3385,6 +3506,18 @@ class FreelancerKChart {
     }
 
     handleDrawMove(event) {
+        if (this.drawTool === 'fibextension') {
+            if (this.pendingDrawPoints.length === 0) return;
+            const point = this.getDrawPoint(event);
+            if (!point) return;
+            this.previewDrawing = {
+                type: 'fibextension',
+                points: [...this.pendingDrawPoints, point],
+                preview: true
+            };
+            this.renderDrawings();
+            return;
+        }
         if (!this.pendingDrawPoint || !['trendline', 'rect', 'fibonacci'].includes(this.drawTool)) return;
         const point = this.getDrawPoint(event);
         if (!point) return;
@@ -3417,31 +3550,64 @@ class FreelancerKChart {
         this.drawingOverlay.innerHTML = '';
         this.renderCostLineSegments();
 
-        [...this.drawings, this.previewDrawing].filter(Boolean).forEach((shape, drawingIndex) => {
-            if (shape.type === 'horizontal') {
-                const y = this.candleSeries.priceToCoordinate(shape.price);
-                if (y !== null) this.addSvgLine(0, y, width, y, shape.preview);
-                return;
-            }
-
-            if (shape.type === 'vertical') {
-                const x = this.chart.timeScale().timeToCoordinate(shape.time);
-                if (x !== null) this.addSvgLine(x, 0, x, height, shape.preview);
-                return;
-            }
-
-            const start = this.pointToCoordinate(shape.start);
-            const end = this.pointToCoordinate(shape.end);
-            if (!start || !end) return;
-
-            if (shape.type === 'fibonacci') {
-                this.addSvgFibonacci(shape, start, end, width, shape.preview ? null : drawingIndex);
-            } else if (shape.type === 'rect') {
-                this.addSvgRect(start, end, shape.preview);
-            } else {
-                this.addSvgLine(start.x, start.y, end.x, end.y, shape.preview);
-            }
+        this.drawings.forEach((shape, drawingIndex) => {
+            this.renderDrawingShape(shape, width, height, drawingIndex);
         });
+        if (this.previewDrawing) {
+            this.renderDrawingShape(this.previewDrawing, width, height, null);
+        }
+    }
+
+    renderDrawingShape(shape, width, height, drawingIndex) {
+        const preview = Boolean(shape.preview);
+        const index = preview ? null : drawingIndex;
+        const selected = index !== null && index === this.selectedDrawingIndex;
+
+        if (shape.type === 'horizontal') {
+            const y = this.candleSeries.priceToCoordinate(shape.price);
+            if (y === null) return;
+            this.addSvgLine(0, y, width, y, preview, index, selected);
+            if (selected) this.addSelectionHandles([{ x: width / 2, y }]);
+            return;
+        }
+
+        if (shape.type === 'vertical') {
+            const x = this.chart.timeScale().timeToCoordinate(shape.time);
+            if (x === null) return;
+            this.addSvgLine(x, 0, x, height, preview, index, selected);
+            if (selected) this.addSelectionHandles([{ x, y: height / 2 }]);
+            return;
+        }
+
+        if (shape.type === 'fibextension') {
+            const points = shape.points.map(point => this.pointToCoordinate(point));
+            if (points.some(point => !point)) return;
+            this.addSvgFibonacciExtension(shape, points, width, index, selected);
+            if (selected) this.addSelectionHandles(points);
+            return;
+        }
+
+        const start = this.pointToCoordinate(shape.start);
+        const end = this.pointToCoordinate(shape.end);
+        if (!start || !end) return;
+
+        if (shape.type === 'fibonacci') {
+            this.addSvgFibonacci(shape, start, end, width, index, selected);
+            if (selected) this.addSelectionHandles([start, end]);
+        } else if (shape.type === 'rect') {
+            this.addSvgRect(start, end, preview, index, selected);
+            if (selected) {
+                this.addSelectionHandles([
+                    { x: start.x, y: start.y },
+                    { x: end.x, y: start.y },
+                    { x: end.x, y: end.y },
+                    { x: start.x, y: end.y }
+                ]);
+            }
+        } else {
+            this.addSvgLine(start.x, start.y, end.x, end.y, preview, index, selected);
+            if (selected) this.addSelectionHandles([start, end]);
+        }
     }
 
     renderCostLineSegments() {
@@ -3512,29 +3678,80 @@ class FreelancerKChart {
         this.drawingOverlay.appendChild(polyline);
     }
 
-    addSvgLine(x1, y1, x2, y2, preview = false) {
+    addSvgLine(x1, y1, x2, y2, preview = false, drawingIndex = null, selected = false) {
         const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
         line.setAttribute('x1', x1);
         line.setAttribute('y1', y1);
         line.setAttribute('x2', x2);
         line.setAttribute('y2', y2);
-        line.setAttribute('stroke', preview ? '#9bbcff' : '#4facfe');
-        line.setAttribute('stroke-width', '2');
+        line.setAttribute('stroke', selected ? DRAWING_SELECTED_COLOR : (preview ? '#9bbcff' : '#4facfe'));
+        line.setAttribute('stroke-width', selected ? '3' : '2');
         line.setAttribute('stroke-dasharray', preview ? '6 5' : '');
         this.drawingOverlay.appendChild(line);
+
+        if (drawingIndex !== null) this.addSvgHitLine(x1, y1, x2, y2, drawingIndex);
     }
 
-    addSvgRect(start, end, preview = false) {
+    addSvgRect(start, end, preview = false, drawingIndex = null, selected = false) {
+        const x = Math.min(start.x, end.x);
+        const y = Math.min(start.y, end.y);
+        const width = Math.abs(end.x - start.x);
+        const height = Math.abs(end.y - start.y);
         const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        rect.setAttribute('x', Math.min(start.x, end.x));
-        rect.setAttribute('y', Math.min(start.y, end.y));
-        rect.setAttribute('width', Math.abs(end.x - start.x));
-        rect.setAttribute('height', Math.abs(end.y - start.y));
+        rect.setAttribute('x', x);
+        rect.setAttribute('y', y);
+        rect.setAttribute('width', width);
+        rect.setAttribute('height', height);
         rect.setAttribute('fill', preview ? 'rgba(79,172,254,0.08)' : 'rgba(79,172,254,0.12)');
-        rect.setAttribute('stroke', preview ? '#9bbcff' : '#4facfe');
-        rect.setAttribute('stroke-width', '2');
+        rect.setAttribute('stroke', selected ? DRAWING_SELECTED_COLOR : (preview ? '#9bbcff' : '#4facfe'));
+        rect.setAttribute('stroke-width', selected ? '3' : '2');
         rect.setAttribute('stroke-dasharray', preview ? '6 5' : '');
         this.drawingOverlay.appendChild(rect);
+
+        if (drawingIndex === null) return;
+        // 命中區只取邊框，否則框內的滑鼠事件會被吃掉而無法拖曳圖表。
+        const hitRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        hitRect.setAttribute('x', x);
+        hitRect.setAttribute('y', y);
+        hitRect.setAttribute('width', width);
+        hitRect.setAttribute('height', height);
+        hitRect.setAttribute('fill', 'none');
+        hitRect.setAttribute('stroke', 'transparent');
+        hitRect.setAttribute('stroke-width', String(DRAWING_HIT_WIDTH));
+        hitRect.setAttribute('pointer-events', 'stroke');
+        hitRect.setAttribute('cursor', 'pointer');
+        hitRect.setAttribute('data-drawing-index', String(drawingIndex));
+        this.drawingOverlay.appendChild(hitRect);
+    }
+
+    addSvgHitLine(x1, y1, x2, y2, drawingIndex) {
+        const hitLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        hitLine.setAttribute('x1', x1);
+        hitLine.setAttribute('y1', y1);
+        hitLine.setAttribute('x2', x2);
+        hitLine.setAttribute('y2', y2);
+        hitLine.setAttribute('stroke', 'transparent');
+        hitLine.setAttribute('stroke-width', String(DRAWING_HIT_WIDTH));
+        hitLine.setAttribute('pointer-events', 'stroke');
+        hitLine.setAttribute('cursor', 'pointer');
+        hitLine.setAttribute('data-drawing-index', String(drawingIndex));
+        this.drawingOverlay.appendChild(hitLine);
+    }
+
+    addSelectionHandles(points) {
+        points.forEach(point => {
+            if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+            const handle = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+            handle.setAttribute('x', point.x - 3.5);
+            handle.setAttribute('y', point.y - 3.5);
+            handle.setAttribute('width', '7');
+            handle.setAttribute('height', '7');
+            handle.setAttribute('fill', '#111827');
+            handle.setAttribute('stroke', DRAWING_SELECTED_COLOR);
+            handle.setAttribute('stroke-width', '2');
+            handle.setAttribute('pointer-events', 'none');
+            this.drawingOverlay.appendChild(handle);
+        });
     }
 
     formatFibonacciPrice(price, grouping = true) {
@@ -3548,7 +3765,90 @@ class FreelancerKChart {
         });
     }
 
-    addSvgFibonacci(shape, start, end, width, drawingIndex = null) {
+    // 斐波那契趨勢擴展：層級價 = P3 + (P2 - P1) × 比例，與 TradingView 相同。
+    addSvgFibonacciExtension(shape, points, width, drawingIndex = null, selected = false) {
+        const preview = Boolean(shape.preview);
+        const opacity = preview ? '0.62' : '0.92';
+
+        for (let index = 1; index < points.length; index += 1) {
+            const trend = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            trend.setAttribute('x1', points[index - 1].x);
+            trend.setAttribute('y1', points[index - 1].y);
+            trend.setAttribute('x2', points[index].x);
+            trend.setAttribute('y2', points[index].y);
+            trend.setAttribute('stroke', selected ? DRAWING_SELECTED_COLOR : FIBONACCI_EXTENSION_TREND_COLOR);
+            trend.setAttribute('stroke-width', selected ? '2' : '1.5');
+            trend.setAttribute('stroke-dasharray', '5 4');
+            trend.setAttribute('opacity', opacity);
+            trend.setAttribute('vector-effect', 'non-scaling-stroke');
+            this.drawingOverlay.appendChild(trend);
+            if (drawingIndex !== null) {
+                this.addSvgHitLine(
+                    points[index - 1].x, points[index - 1].y,
+                    points[index].x, points[index].y,
+                    drawingIndex
+                );
+            }
+        }
+
+        // 只有三個錨點都定下來才算完整的擴展，否則僅顯示趨勢線預覽。
+        if (points.length < 3) return;
+        const [p1, p2, p3] = shape.points;
+        const span = p2.price - p1.price;
+        // 水平線跨在第二、第三個錨點之間；兩點同一根 K 棒時仍保留最小寬度。
+        const x1 = Math.min(points[1].x, points[2].x);
+        const lineEnd = Math.max(points[1].x, points[2].x, x1 + FIBONACCI_EXTENSION_MIN_SPAN);
+        // 標籤預設在線的左側；線太靠左時翻到右側，否則文字會被畫面切掉。
+        const labelOnLeft = x1 > 120;
+        const labelX = labelOnLeft ? x1 - 8 : lineEnd + 8;
+
+        FIBONACCI_EXTENSION_LEVELS.forEach(level => {
+            const price = p3.price + (span * level.value);
+            const y = this.candleSeries.priceToCoordinate(price);
+            if (y === null || y === undefined || !Number.isFinite(y)) return;
+
+            const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            line.setAttribute('x1', x1);
+            line.setAttribute('y1', y);
+            line.setAttribute('x2', lineEnd);
+            line.setAttribute('y2', y);
+            line.setAttribute('stroke', selected ? DRAWING_SELECTED_COLOR : level.color);
+            line.setAttribute('stroke-width', '1');
+            line.setAttribute('opacity', opacity);
+            line.setAttribute('vector-effect', 'non-scaling-stroke');
+            line.setAttribute('data-fibonacci-level', String(level.value));
+            if (drawingIndex !== null) {
+                line.setAttribute('data-drawing-index', String(drawingIndex));
+                this.addSvgHitLine(x1, y, lineEnd, y, drawingIndex);
+            }
+            this.drawingOverlay.appendChild(line);
+
+            const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            label.setAttribute('x', labelX);
+            // 標籤在線的側邊而非上方，因此垂直置中對齊該層級的價位。
+            label.setAttribute('y', Math.max(12, y + 4));
+            label.setAttribute('text-anchor', labelOnLeft ? 'end' : 'start');
+            label.setAttribute('fill', level.color);
+            label.setAttribute('font-size', '11');
+            label.setAttribute('font-family', 'Arial, sans-serif');
+            label.setAttribute('font-weight', '600');
+            label.setAttribute('opacity', opacity);
+            label.setAttribute('paint-order', 'stroke');
+            label.setAttribute('stroke', '#111827');
+            label.setAttribute('stroke-width', '3');
+            label.setAttribute('stroke-linejoin', 'round');
+            label.setAttribute('data-fibonacci-label', String(level.value));
+            if (drawingIndex !== null) {
+                label.setAttribute('data-drawing-index', String(drawingIndex));
+                label.setAttribute('pointer-events', 'all');
+                label.setAttribute('cursor', 'pointer');
+            }
+            label.textContent = `${level.value} (${this.formatFibonacciPrice(price)})`;
+            this.drawingOverlay.appendChild(label);
+        });
+    }
+
+    addSvgFibonacci(shape, start, end, width, drawingIndex = null, selected = false) {
         const levels = [
             { value: 0, color: '#ffffff' },
             { value: 0.236, color: '#ffffff' },
@@ -3569,31 +3869,22 @@ class FreelancerKChart {
             const y = start.y + ((end.y - start.y) * level.value);
             const price = shape.start.price
                 + ((shape.end.price - shape.start.price) * level.value);
+            const isAnchor = level.value === 0 || level.value === 1;
             const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
             line.setAttribute('x1', x1);
             line.setAttribute('y1', y);
             line.setAttribute('x2', lineEnd);
             line.setAttribute('y2', y);
-            line.setAttribute('stroke', level.color);
-            line.setAttribute('stroke-width', level.value === 0 || level.value === 1 ? '1.5' : '1');
+            line.setAttribute('stroke', selected && isAnchor ? DRAWING_SELECTED_COLOR : level.color);
+            line.setAttribute('stroke-width', isAnchor ? (selected ? '2.5' : '1.5') : '1');
             line.setAttribute('opacity', opacity);
             line.setAttribute('vector-effect', 'non-scaling-stroke');
             line.setAttribute('data-fibonacci-level', String(level.value));
-            if (drawingIndex !== null) line.setAttribute('data-fibonacci-index', String(drawingIndex));
+            if (drawingIndex !== null) line.setAttribute('data-drawing-index', String(drawingIndex));
             this.drawingOverlay.appendChild(line);
 
             if (drawingIndex !== null) {
-                const hitLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-                hitLine.setAttribute('x1', x1);
-                hitLine.setAttribute('y1', y);
-                hitLine.setAttribute('x2', lineEnd);
-                hitLine.setAttribute('y2', y);
-                hitLine.setAttribute('stroke', 'transparent');
-                hitLine.setAttribute('stroke-width', '12');
-                hitLine.setAttribute('pointer-events', 'stroke');
-                hitLine.setAttribute('cursor', 'pointer');
-                hitLine.setAttribute('data-fibonacci-index', String(drawingIndex));
-                this.drawingOverlay.appendChild(hitLine);
+                this.addSvgHitLine(x1, y, lineEnd, y, drawingIndex);
             }
 
             const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
@@ -3611,7 +3902,7 @@ class FreelancerKChart {
             label.setAttribute('stroke-linejoin', 'round');
             label.setAttribute('data-fibonacci-label', String(level.value));
             if (drawingIndex !== null) {
-                label.setAttribute('data-fibonacci-index', String(drawingIndex));
+                label.setAttribute('data-drawing-index', String(drawingIndex));
                 label.setAttribute('pointer-events', 'all');
                 label.setAttribute('cursor', 'pointer');
             }
@@ -3628,7 +3919,7 @@ class FreelancerKChart {
             handle.setAttribute('stroke', '#ffffff');
             handle.setAttribute('stroke-width', '1.5');
             handle.setAttribute('opacity', opacity);
-            if (drawingIndex !== null) handle.setAttribute('data-fibonacci-index', String(drawingIndex));
+            if (drawingIndex !== null) handle.setAttribute('data-drawing-index', String(drawingIndex));
             this.drawingOverlay.appendChild(handle);
         });
     }
