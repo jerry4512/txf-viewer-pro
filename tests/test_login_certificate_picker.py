@@ -58,6 +58,8 @@ def test_login_parser_keeps_legacy_json_compatibility():
 
 
 def test_login_parser_stages_browser_selected_certificate(monkeypatch, tmp_path):
+    # Windows does not expose os.fchmod; exercise that path on every platform.
+    monkeypatch.delattr(os, "fchmod", raising=False)
     monkeypatch.setattr(main, "_CERTIFICATE_DIR", str(tmp_path))
     client = TestClient(_build_parser_app())
 

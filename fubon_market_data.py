@@ -21,6 +21,15 @@ from fubon_neo.fugle_marketdata.rest.base_rest import FugleAPIError
 TAIPEI = timezone(timedelta(hours=8))
 
 
+def _contract_has_expired(delivery_date: str, now: datetime) -> bool:
+    try:
+        expiry = date.fromisoformat(delivery_date[:10])
+    except (TypeError, ValueError):
+        return False
+    # Expiring index futures stop trading at 13:30 and have no night session.
+    return now >= datetime(expiry.year, expiry.month, expiry.day, 13, 30, tzinfo=TAIPEI)
+
+
 class FubonMarketDataError(RuntimeError):
     """Safe, credential-free error raised by the market-data adapter."""
 
@@ -691,7 +700,17 @@ class FubonMarketDataClient:
         if not alias:
             return None
         cached = self._contracts.get(alias)
-        if cached and not force and time.monotonic() - cached[0] < 1800:
+        now = datetime.now(TAIPEI)
+        rolling = alias.endswith(("R1", "R2"))
+        # Recheck both R1 and R2 across the expiry-time boundary, even when
+        # only R2 was cached. Cache age is measured with a monotonic clock.
+        cutoff = now.replace(hour=13, minute=30, second=0, microsecond=0)
+        cached_at = now - timedelta(seconds=time.monotonic() - cached[0]) if cached else now
+        expired_cache = rolling and (
+            (cached and _contract_has_expired(cached[1].delivery_date, now))
+            or cached_at < cutoff <= now
+        )
+        if cached and not force and not expired_cache and time.monotonic() - cached[0] < 1800:
             return cached[1]
         if self.rest is None:
             return None
@@ -702,7 +721,6 @@ class FubonMarketDataClient:
             if root not in self.FUTURES_ROOTS:
                 return None
             rows = self._query_tickers(root)
-            today = datetime.now(TAIPEI).date()
             active = []
             for row in rows:
                 symbol = str(row.get("symbol") or "")
@@ -713,7 +731,7 @@ class FubonMarketDataClient:
                     end_date = datetime.strptime(end_text[:10], "%Y-%m-%d").date()
                 except ValueError:
                     continue
-                if end_date >= today:
+                if not _contract_has_expired(end_date.isoformat(), now):
                     active.append((end_date, symbol, row))
             active.sort(key=lambda item: (item[0], item[1]))
             if len(active) <= rank:
@@ -780,8 +798,8 @@ class FubonMarketDataClient:
     def resolve_stock_contract(
         self, code: str, force: bool = False
     ) -> Optional[FubonContract]:
-        symbol = str(code or "").strip()
-        if not symbol or not symbol.isdigit() or self.stock_rest is None:
+        symbol = str(code or "").strip().upper()
+        if not symbol or not symbol.isascii() or not symbol.isalnum() or self.stock_rest is None:
             return None
         cached = self._stock_contracts.get(symbol)
         if cached and not force and time.monotonic() - cached[0] < 1800:

@@ -634,6 +634,31 @@
             flex: 1;
             min-width: 6px;
         }
+        .fl-chart-levels {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+        }
+        .fl-chart-levels label {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            font-size: 11px;
+            color: #b8c3d4;
+        }
+        .fl-chart-levels input {
+            box-sizing: border-box;
+            width: 76px;
+            margin: 0;
+            padding: 4px 5px;
+            color: #f0f3f8;
+            background: #141b26;
+            border: 1px solid #3c4b61;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .fl-chart-toolbar { flex-wrap: wrap; }
         .fl-chart-period-control {
             height: 34px;
             display: inline-flex;
@@ -867,6 +892,87 @@
             cursor: crosshair;
             pointer-events: auto;
         }
+        .fl-fibonacci-editor {
+            position: absolute;
+            inset: 0;
+            z-index: 30;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(4, 7, 12, 0.58);
+        }
+        .fl-fibonacci-editor[hidden] {
+            display: none;
+        }
+        .fl-fibonacci-editor-card {
+            width: min(320px, calc(100% - 32px));
+            padding: 16px;
+            border: 1px solid #3a4354;
+            border-radius: 10px;
+            background: #1c1f26;
+            box-shadow: 0 16px 42px rgba(0,0,0,0.48);
+            color: #f3f4f6;
+        }
+        .fl-fibonacci-editor-title {
+            margin-bottom: 13px;
+            font-size: 15px;
+            font-weight: 700;
+        }
+        .fl-fibonacci-editor-fields {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+        .fl-fibonacci-editor-fields label {
+            display: grid;
+            gap: 5px;
+            color: #b8c0cf;
+            font-size: 12px;
+        }
+        .fl-fibonacci-editor-fields input {
+            min-width: 0;
+            height: 34px;
+            padding: 0 9px;
+            border: 1px solid #4a5261;
+            border-radius: 6px;
+            outline: none;
+            background: #292d35;
+            color: #ffffff;
+            font: 600 14px/1 Arial, sans-serif;
+        }
+        .fl-fibonacci-editor-fields input:focus {
+            border-color: #4facfe;
+        }
+        .fl-fibonacci-editor-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            margin-top: 15px;
+        }
+        .fl-fibonacci-editor-actions button {
+            flex: 0 0 auto;
+            width: 76px;
+            min-width: 76px;
+            height: 32px;
+            padding: 0 12px;
+            border: 1px solid #465065;
+            border-radius: 6px;
+            background: #272d39;
+            color: #dce3ee;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 600;
+            line-height: 1;
+            white-space: nowrap;
+        }
+        .fl-fibonacci-editor-actions button[type="submit"] {
+            border-color: #367fd0;
+            background: #2563a8;
+            color: #ffffff;
+        }
         .fl-chart-legend {
             position: absolute;
             top: 12px;
@@ -992,10 +1098,36 @@
             min-height: 0;
             display: grid;
             grid-template-columns: minmax(0, 1fr);
-            grid-template-rows: repeat(4, minmax(0, 1fr));
+            grid-template-rows: repeat(5, minmax(0, 1fr));
             gap: 6px;
             padding: 6px;
             background: #0d0f14;
+        }
+        .fl-weighted-periods {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            padding: 5px 6px;
+            align-items: center;
+            font-size: 11px;
+            color: #929baa;
+        }
+        .fl-weighted-periods button {
+            width: auto;
+            flex: 1 1 auto;
+            margin: 0;
+            font: inherit;
+            background: #151a23;
+            border: 1px solid #343d4c;
+            border-radius: 4px;
+            color: #cbd5e1;
+            padding: 3px 7px;
+            cursor: pointer;
+        }
+        .fl-weighted-periods button[aria-pressed="true"] {
+            background: #173c5d;
+            border-color: #4facfe;
+            color: #fff;
         }
         .fl-weighted-card {
             min-width: 0;
@@ -1093,7 +1225,7 @@
             }
             #fl-right-panel .fl-weighted-grid {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
-                grid-template-rows: repeat(2, minmax(0, 1fr));
+                grid-template-rows: repeat(3, minmax(0, 1fr));
             }
             .fl-chart-toolbar {
                 flex-wrap: wrap;
@@ -1133,7 +1265,7 @@
             }
             #fl-right-panel .fl-weighted-grid {
                 grid-template-columns: minmax(0, 1fr);
-                grid-template-rows: repeat(4, minmax(0, 1fr));
+                grid-template-rows: repeat(5, minmax(0, 1fr));
             }
         }
 
@@ -2908,6 +3040,17 @@
                             <option value="D">日線</option>
                         </select>
                     </label>
+                    <label class="fl-chart-period-control" title="以 30 分 K 收盤價計算 20 期簡單移動平均">
+                        <input id="fl-ma30-toggle" type="checkbox" style="width:auto;margin:0;">
+                        <span style="color:#b798ff;">30K 20MA</span>
+                    </label>
+                    <div class="fl-chart-levels" role="group" aria-label="自訂水平價位">
+                        <label>壓力二<input type="number" step="any" min="0" inputmode="decimal" data-level="resistance2" aria-label="壓力二" placeholder="價位"></label>
+                        <label>壓力一<input type="number" step="any" min="0" inputmode="decimal" data-level="resistance1" aria-label="壓力一" placeholder="價位"></label>
+                        <label>多空線<input type="number" step="any" min="0" inputmode="decimal" data-level="pivot" aria-label="多空線" placeholder="價位"></label>
+                        <label>支撐一<input type="number" step="any" min="0" inputmode="decimal" data-level="support1" aria-label="支撐一" placeholder="價位"></label>
+                        <label>支撐二<input type="number" step="any" min="0" inputmode="decimal" data-level="support2" aria-label="支撐二" placeholder="價位"></label>
+                    </div>
                     <div id="fl-chart-market-label" class="fl-chart-market-label" aria-live="polite">
                         <span class="fl-market-dot" aria-hidden="true"></span>
                         <span id="fl-chart-market-text">期交所即時</span>
@@ -2927,12 +3070,28 @@
                         <button class="fl-draw-btn" data-tool="rect" title="矩形框">
                             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="6" width="14" height="12"/><circle cx="5" cy="6" r="1.2"/><circle cx="19" cy="18" r="1.2"/></svg>
                         </button>
+                        <button class="fl-draw-btn" data-tool="fibonacci" title="斐波那契回撤" aria-label="斐波那契回撤">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 9h16M4 13h16M4 17h16M4 21h16"/><path d="M6 3l12 18"/></svg>
+                        </button>
                         <button class="fl-draw-btn" data-tool="disabled" title="文字">
                             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h12M12 5v14"/><path d="M9 19h6"/></svg>
                         </button>
                         <button class="fl-draw-btn" data-tool="clear" title="清除繪圖">
                             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 15l8-8a3 3 0 0 1 4.2 0l1.8 1.8a3 3 0 0 1 0 4.2l-6 6H7l-3-3z"/><path d="M10 9l6 6"/><path d="M14 19h6"/></svg>
                         </button>
+                    </div>
+                    <div id="fl-fibonacci-editor" class="fl-fibonacci-editor" role="dialog" aria-modal="true" aria-labelledby="fl-fibonacci-editor-title" hidden>
+                        <form id="fl-fibonacci-editor-form" class="fl-fibonacci-editor-card">
+                            <div id="fl-fibonacci-editor-title" class="fl-fibonacci-editor-title">編輯斐波那契價格</div>
+                            <div class="fl-fibonacci-editor-fields">
+                                <label>0 價格<input id="fl-fibonacci-start-price" type="text" inputmode="decimal" autocomplete="off"></label>
+                                <label>1 價格<input id="fl-fibonacci-end-price" type="text" inputmode="decimal" autocomplete="off"></label>
+                            </div>
+                            <div class="fl-fibonacci-editor-actions">
+                                <button type="button" data-action="cancel">取消</button>
+                                <button type="submit">套用</button>
+                            </div>
+                        </form>
                     </div>
                     <div class="fl-chart-stack">
                         <div class="fl-chart-primary">
@@ -2964,11 +3123,20 @@
              ───────────────────────────────────────────── -->
         <div id="fl-right-panel" style="width:26%; min-width:280px; max-width:400px; display:flex; flex-direction:column; flex-shrink:0; min-height:0;">
 
-            <!-- 四大權值股：四張圖依右欄高度平均自適應 -->
+            <!-- 四大權值股與 ETF：五張圖依右欄高度平均自適應 -->
             <div id="fl-weighted-stocks" class="fl-block fl-weighted-stocks">
                 <div class="fl-block-header" style="display:flex; align-items:center; justify-content:space-between;">
-                    <span>四大權值股</span>
+                    <span>四大權值股＋00981A</span>
                     <span id="fl-weighted-source" style="font-size:0.68rem; color:#26de81; font-weight:600;">● 富邦即時</span>
+                </div>
+                <div class="fl-weighted-periods" role="group" aria-label="右側圖表週期">
+                    <span>當日</span>
+                    <button type="button" data-period="intraday" aria-pressed="true">分時</button>
+                    <button type="button" data-period="1" aria-pressed="false">1分</button>
+                    <button type="button" data-period="3" aria-pressed="false">3分</button>
+                    <button type="button" data-period="5" aria-pressed="false">5分</button>
+                    <button type="button" data-period="15" aria-pressed="false">15分</button>
+                    <button type="button" data-period="60" aria-pressed="false">60分</button>
                 </div>
                 <div class="fl-weighted-grid">
                     <div class="fl-weighted-card" data-code="2330">
@@ -2998,6 +3166,13 @@
                             <span id="fl-weighted-value-2308" class="fl-weighted-value">--</span>
                         </div>
                         <div id="fl-weighted-chart-2308" class="fl-weighted-chart"></div>
+                    </div>
+                    <div class="fl-weighted-card" data-code="00981A">
+                        <div class="fl-weighted-card-head">
+                            <span class="fl-weighted-name">00981A 統一台股增長</span>
+                            <span id="fl-weighted-value-00981A" class="fl-weighted-value">--</span>
+                        </div>
+                        <div id="fl-weighted-chart-00981A" class="fl-weighted-chart"></div>
                     </div>
                 </div>
             </div>

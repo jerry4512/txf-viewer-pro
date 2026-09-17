@@ -134,6 +134,7 @@ _WEIGHTED_STOCK_DEFS = (
     ("2454", "聯發科"),
     ("2317", "鴻海"),
     ("2308", "台達電"),
+    ("00981A", "統一台股增長"),
 )
 _WEIGHTED_STOCK_CODES = {code for code, _ in _WEIGHTED_STOCK_DEFS}
 _weighted_stock_state_lock = threading.Lock()
@@ -1003,7 +1004,10 @@ async def _stage_certificate_upload(upload) -> str:
     total_bytes = 0
     try:
         try:
-            os.fchmod(file_descriptor, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(file_descriptor, 0o600)
+            else:
+                os.chmod(staged_path, 0o600)
         except OSError:
             pass
         with os.fdopen(file_descriptor, "wb") as staged_file:
@@ -3566,9 +3570,12 @@ async def get_major_weighted_stocks_intraday():
         )
         change_base = reference or open_price or first_price
         bars = []
-        for row in df[["time", "price", "avg", "volume"]].itertuples(index=False):
+        for row in df[["time", "Open", "High", "Low", "price", "avg", "volume"]].itertuples(index=False):
             bars.append({
                 "time": int(row.time),
+                "open": safe_float(row.Open),
+                "high": safe_float(row.High),
+                "low": safe_float(row.Low),
                 "price": safe_float(row.price),
                 "avg": safe_float(row.avg),
                 "volume": safe_int(row.volume),

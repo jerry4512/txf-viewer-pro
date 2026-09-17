@@ -1399,6 +1399,7 @@ const FREELANCER_MACD = Object.freeze({
 
 class FreelancerKChart {
     constructor() {
+        this.ma30Bars = new Map();
         this.currentPeriod = document.getElementById('fl-chart-period')?.value || '5min';
         this.sessionMode = localStorage.getItem('fl-txf-session-mode') === 'day'
             ? 'day'
@@ -1417,6 +1418,8 @@ class FreelancerKChart {
         this.costLineSegments = [];
         this.costResetMarkers = [];
         this.kbarsCache = [];
+        this.ma30Bars.clear();
+        this.ma30Series?.setData([]);
         this.isLoading = false;
         this.isSwitchingContract = false;
         this.loadRequestId = 0;
@@ -1433,6 +1436,7 @@ class FreelancerKChart {
         this.pendingDrawPoint = null;
         this.previewDrawing = null;
         this.drawingOverlay = null;
+        this.fibonacciEditIndex = null;
         this.overlayRenderFrame = null;
         this.chartPointerActive = false;
         this.chartInteractionSyncReady = false;
@@ -1468,7 +1472,7 @@ class FreelancerKChart {
             },
             rightPriceScale: {
                 borderColor: '#c9ced8',
-                scaleMargins: { top: 0.08, bottom: 0.08 },
+                scaleMargins: { top: 0.08, bottom: 0.25 },
                 minimumWidth: 88
             },
             timeScale: {
@@ -1511,6 +1515,23 @@ class FreelancerKChart {
             wickUpColor: '#dfe5ef',
             wickDownColor: '#dfe5ef',
             priceFormat: { type: 'price', precision: 0, minMove: 1 }
+        });
+        this.volumeSeries = this.chart.addHistogramSeries({
+            priceFormat: { type: 'volume' }, priceScaleId: 'volume',
+            priceLineVisible: false, lastValueVisible: false
+        });
+        this.volumeSeries.priceScale().applyOptions({
+            scaleMargins: { top: 0.80, bottom: 0 }, borderVisible: false
+        });
+        this.ma30Series = this.chart.addLineSeries({
+            color: '#b798ff', lineWidth: 2, title: '30K 20MA',
+            visible: false, priceLineVisible: false,
+            priceFormat: { type: 'price', precision: 1, minMove: 0.1 }
+        });
+        const maToggle = document.getElementById('fl-ma30-toggle');
+        if (maToggle) maToggle.addEventListener('change', () => {
+            this.ma30Series.applyOptions({ visible: maToggle.checked });
+            this.rebuildMa30();
         });
         const costLineOptions = {
             // 原生序列只負責讓成本值參與自動縮放；實際橘線以分段 SVG
@@ -1588,6 +1609,7 @@ class FreelancerKChart {
         this.setupProductSwitch();
         this.syncSessionToolbar();
         this.setupDrawingTools();
+        this.setupPriceLevels();
         this.setupChartInteractionSync(mainEl);
         this.reload();
     }
@@ -1999,6 +2021,7 @@ class FreelancerKChart {
     }
 
     rebuildMacd() {
+        this.rebuildMa30();
         this.macdCache = this.emptyMacdCache();
         this.macdByTime.clear();
         const macdData = [];
@@ -2027,6 +2050,7 @@ class FreelancerKChart {
     }
 
     updateMacdForLatestBar() {
+        this.rebuildMa30();
         const index = this.kbarsCache.length - 1;
         if (index < 0) {
             this.clearMacd();
@@ -2526,6 +2550,7 @@ class FreelancerKChart {
             this.loadedStartDate = rangeStart;
             this.hasMoreHistory = rangeStart > FREELANCER_HISTORY_FLOOR;
             this.candleSeries.setData(this.kbarsCache);
+            this.volumeSeries.setData(this.kbarsCache.map(bar => this.volumePoint(bar)));
             this.rebuildCostLine();
             this.rebuildMacd();
             if (visibleRange && addedCount > 0) {
@@ -2575,8 +2600,11 @@ class FreelancerKChart {
         this.hasMoreHistory = true;
         this.showHistoryStatus('');
         this.kbarsCache = [];
+        this.ma30Bars.clear();
+        this.ma30Series?.setData([]);
         this.lastRealtimeTickAt = 0;
         this.candleSeries.setData([]);
+            this.volumeSeries?.setData([]);
         this.clearCostLine();
         this.clearMacd();
         this.updateLegend(null);
@@ -2734,6 +2762,7 @@ class FreelancerKChart {
                 end
             );
             this.candleSeries.setData(this.kbarsCache);
+            this.volumeSeries.setData(this.kbarsCache.map(bar => this.volumePoint(bar)));
             this.rebuildCostLine();
             this.rebuildMacd();
             const latestBar = this.kbarsCache[this.kbarsCache.length - 1];
@@ -2913,6 +2942,7 @@ class FreelancerKChart {
             this.kbarsCache = Array.from(mergedByTime.values())
                 .sort((a, b) => Number(a.time) - Number(b.time));
             this.candleSeries.setData(this.kbarsCache);
+            this.volumeSeries.setData(this.kbarsCache.map(bar => this.volumePoint(bar)));
             this.rebuildCostLine();
             this.rebuildMacd();
             this.updateLegend(this.kbarsCache[this.kbarsCache.length - 1]);
@@ -2956,6 +2986,34 @@ class FreelancerKChart {
         }
     }
 
+    rebuildMa30() {
+        if (!this.ma30Series) return;
+        const bars = [...this.ma30Bars.values()].sort((a, b) => a.time - b.time);
+        const points = new Map();
+        const displayed = new Set(this.kbarsCache.map(bar => bar.time));
+        let sum = 0;
+        bars.forEach((bar, index) => {
+            sum += bar.close;
+            if (index >= 20) sum -= bars[index - 20].close;
+            if (index < 19) return;
+            // Plot on the displayed candle containing the final observation,
+            // without inserting extra timestamps into the chart's time axis.
+            const time = getKbarBucketTime(bar.observedAt, this.currentPeriod, true);
+            if (displayed.has(time)) points.set(time, { time, value: sum / 20 });
+        });
+        this.ma30Series.setData([...points.values()].sort((a, b) => a.time - b.time));
+    }
+
+    recordMa30(price, timestamp, isCloseTimestamp) {
+        if (!Number.isFinite(Number(price)) || Number(price) <= 0) return;
+        const time = getKbarBucketTime(timestamp, '30min', isCloseTimestamp);
+        const observedAt = Number(timestamp) + (isCloseTimestamp ? 0 : 0.001);
+        const previous = this.ma30Bars.get(time);
+        if (!previous || observedAt >= previous.observedAt) {
+            this.ma30Bars.set(time, { time, observedAt, close: Number(price) });
+        }
+    }
+
     aggregateBars(data) {
         const result = [];
         let currentBar = null;
@@ -2963,6 +3021,7 @@ class FreelancerKChart {
         data.forEach(k => {
             const t = Number(k.time);
             if (this.sessionMode === 'day' && !this.isDaySessionTimestamp(t)) return;
+            this.recordMa30(Number(k.close), t, true);
             const bucketT = getKbarBucketTime(t, this.currentPeriod, true);
             if (!currentBar || bucketT !== currentBar.time) {
                 if (currentBar) result.push(currentBar);
@@ -2971,19 +3030,21 @@ class FreelancerKChart {
                     open: k.open,
                     high: k.high,
                     low: k.low,
-                    close: k.close
+                    close: k.close,
+                    volume: Math.max(0, Number(k.volume) || 0)
                 };
             } else {
                 currentBar.high = Math.max(currentBar.high, k.high);
                 currentBar.low = Math.min(currentBar.low, k.low);
                 currentBar.close = k.close;
+                currentBar.volume += Math.max(0, Number(k.volume) || 0);
             }
         });
         if (currentBar) result.push(currentBar);
         return result.sort((a, b) => a.time - b.time);
     }
 
-    onTick(price, time, force = false) {
+    onTick(price, time, force = false, tickVolume = 0) {
         if (
             !this.candleSeries
             || !price
@@ -2994,6 +3055,7 @@ class FreelancerKChart {
         if (this.sessionMode === 'day' && !this.isDaySessionTimestamp(t)) return;
         flUpdateWeightedSpreadFutures(price, t);
         this.lastRealtimeTickAt = Date.now();
+        this.recordMa30(Number(price), t, false);
         const bucketT = getKbarBucketTime(t, this.currentPeriod, false);
 
         const existingLast = this.kbarsCache[this.kbarsCache.length - 1];
@@ -3004,7 +3066,10 @@ class FreelancerKChart {
         ) {
             const staleTime = existingLast.time;
             this.kbarsCache = [];
+        this.ma30Bars.clear();
+        this.ma30Series?.setData([]);
             this.candleSeries.setData([]);
+            this.volumeSeries?.setData([]);
             this.clearCostLine();
             this.clearMacd();
             this.updateLegend(null);
@@ -3019,9 +3084,10 @@ class FreelancerKChart {
         }
 
         if (this.kbarsCache.length === 0) {
-            const firstBar = { time: bucketT, open: price, high: price, low: price, close: price };
+            const firstBar = { time: bucketT, open: price, high: price, low: price, close: price, volume: Math.max(0, Number(tickVolume) || 0) };
             this.kbarsCache.push(firstBar);
             this.candleSeries.setData(this.kbarsCache);
+            this.volumeSeries.setData(this.kbarsCache.map(bar => this.volumePoint(bar)));
             this.updateCostLineForBar(firstBar);
             this.updateMacdForLatestBar();
             this.updateLegend(firstBar);
@@ -3036,9 +3102,10 @@ class FreelancerKChart {
                 !visibleRange
                 || visibleRange.to >= this.kbarsCache.length - 2
             );
-            const newBar = { time: bucketT, open: price, high: price, low: price, close: price };
+            const newBar = { time: bucketT, open: price, high: price, low: price, close: price, volume: Math.max(0, Number(tickVolume) || 0) };
             this.kbarsCache.push(newBar);
             this.candleSeries.update(newBar);
+            this.volumeSeries.update(this.volumePoint(newBar));
             this.updateCostLineForBar(newBar);
             this.updateMacdForLatestBar();
             this.updateLegend(newBar);
@@ -3052,11 +3119,18 @@ class FreelancerKChart {
         last.close = price;
         last.high = Math.max(last.high, price);
         last.low = Math.min(last.low, price);
+        last.volume = (Number(last.volume) || 0) + Math.max(0, Number(tickVolume) || 0);
         this.candleSeries.update(last);
+        this.volumeSeries.update(this.volumePoint(last));
         this.updateCostLineForBar(last);
         this.updateMacdForLatestBar();
         this.updateLegend(last);
         this.updateCountdown();
+    }
+
+    volumePoint(bar) {
+        return { time: bar.time, value: Math.max(0, Number(bar.volume) || 0),
+            color: bar.close >= bar.open ? '#ef554a' : '#26a69a' };
     }
 
     updateLegend(bar) {
@@ -3097,8 +3171,43 @@ class FreelancerKChart {
             <span>低=<span style="color:${color}">${bar.low}</span></span>
             <span>收=<span style="color:${color}">${bar.close}</span></span>
             <span style="color:${color}">${sign}${diff.toFixed(0)} (${sign}${pct.toFixed(2)}%)</span>
+            <span style="color:#9faec4">VOL ${(Number(bar.volume ?? this.kbarsCache.find(item => item.time === bar.time)?.volume) || 0).toLocaleString()}</span>
             ${costLabel}
         `;
+    }
+
+    setupPriceLevels() {
+        this.priceLevelLines = {};
+        const definitions = {
+            resistance2: ['壓力二', '#66bdbf'], resistance1: ['壓力一', '#66bdbf'],
+            pivot: ['多空線', '#ffffff'],
+            support1: ['支撐一', '#acb250'], support2: ['支撐二', '#acb250']
+        };
+        document.querySelectorAll('.fl-chart-levels input').forEach(input => {
+            const key = input.dataset.level;
+            const definition = definitions[key];
+            if (!definition) return;
+            const update = () => {
+                const price = Number(input.value);
+                if (!input.value.trim() || !Number.isFinite(price) || price <= 0) {
+                    if (this.priceLevelLines[key]) {
+                        this.candleSeries.removePriceLine(this.priceLevelLines[key]);
+                        delete this.priceLevelLines[key];
+                    }
+                    return;
+                }
+                const options = {
+                    price, title: definition[0], color: definition[1],
+                    lineWidth: key === 'pivot' ? 2 : 1,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true
+                };
+                if (this.priceLevelLines[key]) this.priceLevelLines[key].applyOptions(options);
+                else this.priceLevelLines[key] = this.candleSeries.createPriceLine(options);
+            };
+            input.addEventListener('input', update);
+            update();
+        });
     }
 
     setupDrawingTools() {
@@ -3122,10 +3231,20 @@ class FreelancerKChart {
         });
 
         this.drawingOverlay.addEventListener('click', (event) => this.handleDrawClick(event));
+        this.drawingOverlay.addEventListener('dblclick', (event) => this.handleDrawingDoubleClick(event));
         this.drawingOverlay.addEventListener('mousemove', (event) => this.handleDrawMove(event));
         this.drawingOverlay.addEventListener('mouseleave', () => {
             this.previewDrawing = null;
             this.renderDrawings();
+        });
+        const editor = document.getElementById('fl-fibonacci-editor');
+        const editorForm = document.getElementById('fl-fibonacci-editor-form');
+        editorForm?.addEventListener('submit', (event) => this.applyFibonacciEditor(event));
+        editor?.querySelector('[data-action="cancel"]')?.addEventListener('click', () => {
+            this.closeFibonacciEditor();
+        });
+        editor?.addEventListener('click', (event) => {
+            if (event.target === editor) this.closeFibonacciEditor();
         });
         this.setDrawTool(this.drawTool);
     }
@@ -3156,6 +3275,7 @@ class FreelancerKChart {
 
     handleDrawClick(event) {
         if (this.drawTool === 'cursor') return;
+        if (event.target.closest('[data-fibonacci-index]')) return;
         event.preventDefault();
         event.stopPropagation();
 
@@ -3179,24 +3299,104 @@ class FreelancerKChart {
             return;
         }
 
+        let start = this.pendingDrawPoint;
+        let end = point;
+        // 與 TradingView 的回撤方向一致：0 固定為高價，1 固定為低價。
+        if (this.drawTool === 'fibonacci' && start.price < end.price) {
+            [start, end] = [end, start];
+        }
+
         this.drawings.push({
             type: this.drawTool,
-            start: this.pendingDrawPoint,
-            end: point
+            start,
+            end
         });
         this.pendingDrawPoint = null;
         this.previewDrawing = null;
         this.renderDrawings();
     }
 
+    handleDrawingDoubleClick(event) {
+        const target = event.target.closest('[data-fibonacci-index]');
+        if (!target) return;
+        const drawingIndex = Number(target.dataset.fibonacciIndex);
+        const drawing = this.drawings[drawingIndex];
+        if (!drawing || drawing.type !== 'fibonacci') return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        this.pendingDrawPoint = null;
+        this.previewDrawing = null;
+
+        this.openFibonacciEditor(drawingIndex);
+    }
+
+    openFibonacciEditor(drawingIndex) {
+        const drawing = this.drawings[drawingIndex];
+        const editor = document.getElementById('fl-fibonacci-editor');
+        const startInput = document.getElementById('fl-fibonacci-start-price');
+        const endInput = document.getElementById('fl-fibonacci-end-price');
+        if (!drawing || drawing.type !== 'fibonacci' || !editor || !startInput || !endInput) return;
+
+        this.fibonacciEditIndex = drawingIndex;
+        startInput.value = this.formatFibonacciPrice(drawing.start.price, false);
+        endInput.value = this.formatFibonacciPrice(drawing.end.price, false);
+        editor.hidden = false;
+        window.setTimeout(() => {
+            startInput.focus();
+            startInput.select();
+        }, 0);
+    }
+
+    closeFibonacciEditor() {
+        const editor = document.getElementById('fl-fibonacci-editor');
+        if (editor) editor.hidden = true;
+        this.fibonacciEditIndex = null;
+    }
+
+    applyFibonacciEditor(event) {
+        event.preventDefault();
+        const drawing = this.drawings[this.fibonacciEditIndex];
+        const startInput = document.getElementById('fl-fibonacci-start-price');
+        const endInput = document.getElementById('fl-fibonacci-end-price');
+        if (!drawing || drawing.type !== 'fibonacci' || !startInput || !endInput) return;
+
+        const startText = startInput.value.replaceAll(',', '').trim();
+        const endText = endInput.value.replaceAll(',', '').trim();
+        const startPrice = Number(startText);
+        const endPrice = Number(endText);
+        if (!startText || !Number.isFinite(startPrice)) {
+            startInput.setCustomValidity('請輸入正確的數字價格');
+            startInput.reportValidity();
+            return;
+        }
+        startInput.setCustomValidity('');
+        if (!endText || !Number.isFinite(endPrice)) {
+            endInput.setCustomValidity('請輸入正確的數字價格');
+            endInput.reportValidity();
+            return;
+        }
+        endInput.setCustomValidity('');
+
+        drawing.start.price = startPrice;
+        drawing.end.price = endPrice;
+        this.closeFibonacciEditor();
+        this.renderDrawings();
+    }
+
     handleDrawMove(event) {
-        if (!this.pendingDrawPoint || (this.drawTool !== 'trendline' && this.drawTool !== 'rect')) return;
+        if (!this.pendingDrawPoint || !['trendline', 'rect', 'fibonacci'].includes(this.drawTool)) return;
         const point = this.getDrawPoint(event);
         if (!point) return;
+        let start = this.pendingDrawPoint;
+        let end = point;
+        if (this.drawTool === 'fibonacci' && start.price < end.price) {
+            [start, end] = [end, start];
+        }
         this.previewDrawing = {
             type: this.drawTool,
-            start: this.pendingDrawPoint,
-            end: point,
+            start,
+            end,
             preview: true
         };
         this.renderDrawings();
@@ -3217,7 +3417,7 @@ class FreelancerKChart {
         this.drawingOverlay.innerHTML = '';
         this.renderCostLineSegments();
 
-        [...this.drawings, this.previewDrawing].filter(Boolean).forEach(shape => {
+        [...this.drawings, this.previewDrawing].filter(Boolean).forEach((shape, drawingIndex) => {
             if (shape.type === 'horizontal') {
                 const y = this.candleSeries.priceToCoordinate(shape.price);
                 if (y !== null) this.addSvgLine(0, y, width, y, shape.preview);
@@ -3234,7 +3434,9 @@ class FreelancerKChart {
             const end = this.pointToCoordinate(shape.end);
             if (!start || !end) return;
 
-            if (shape.type === 'rect') {
+            if (shape.type === 'fibonacci') {
+                this.addSvgFibonacci(shape, start, end, width, shape.preview ? null : drawingIndex);
+            } else if (shape.type === 'rect') {
                 this.addSvgRect(start, end, shape.preview);
             } else {
                 this.addSvgLine(start.x, start.y, end.x, end.y, shape.preview);
@@ -3335,6 +3537,102 @@ class FreelancerKChart {
         this.drawingOverlay.appendChild(rect);
     }
 
+    formatFibonacciPrice(price, grouping = true) {
+        const value = Number(price);
+        if (!Number.isFinite(value)) return '--';
+        const digits = Number.isInteger(value) ? 0 : 2;
+        return value.toLocaleString('en-US', {
+            useGrouping: grouping,
+            minimumFractionDigits: 0,
+            maximumFractionDigits: digits
+        });
+    }
+
+    addSvgFibonacci(shape, start, end, width, drawingIndex = null) {
+        const levels = [
+            { value: 0, color: '#ffffff' },
+            { value: 0.236, color: '#ffffff' },
+            { value: 0.382, color: '#ff0000' },
+            { value: 0.5, color: '#ffffff' },
+            { value: 0.618, color: '#ff0000' },
+            { value: 0.707, color: '#ffffff' },
+            { value: 0.786, color: '#ffffff' },
+            { value: 0.886, color: '#ffffff' },
+            { value: 1, color: '#ffffff' }
+        ];
+        const x1 = Math.min(start.x, end.x);
+        const lineEnd = Math.max(x1, width - 90);
+        const labelX = lineEnd - 8;
+        const opacity = shape.preview ? '0.62' : '0.92';
+
+        levels.forEach(level => {
+            const y = start.y + ((end.y - start.y) * level.value);
+            const price = shape.start.price
+                + ((shape.end.price - shape.start.price) * level.value);
+            const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            line.setAttribute('x1', x1);
+            line.setAttribute('y1', y);
+            line.setAttribute('x2', lineEnd);
+            line.setAttribute('y2', y);
+            line.setAttribute('stroke', level.color);
+            line.setAttribute('stroke-width', level.value === 0 || level.value === 1 ? '1.5' : '1');
+            line.setAttribute('opacity', opacity);
+            line.setAttribute('vector-effect', 'non-scaling-stroke');
+            line.setAttribute('data-fibonacci-level', String(level.value));
+            if (drawingIndex !== null) line.setAttribute('data-fibonacci-index', String(drawingIndex));
+            this.drawingOverlay.appendChild(line);
+
+            if (drawingIndex !== null) {
+                const hitLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                hitLine.setAttribute('x1', x1);
+                hitLine.setAttribute('y1', y);
+                hitLine.setAttribute('x2', lineEnd);
+                hitLine.setAttribute('y2', y);
+                hitLine.setAttribute('stroke', 'transparent');
+                hitLine.setAttribute('stroke-width', '12');
+                hitLine.setAttribute('pointer-events', 'stroke');
+                hitLine.setAttribute('cursor', 'pointer');
+                hitLine.setAttribute('data-fibonacci-index', String(drawingIndex));
+                this.drawingOverlay.appendChild(hitLine);
+            }
+
+            const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            label.setAttribute('x', labelX);
+            label.setAttribute('y', Math.max(12, y - 4));
+            label.setAttribute('text-anchor', 'end');
+            label.setAttribute('fill', level.color);
+            label.setAttribute('font-size', '11');
+            label.setAttribute('font-family', 'Arial, sans-serif');
+            label.setAttribute('font-weight', '600');
+            label.setAttribute('opacity', opacity);
+            label.setAttribute('paint-order', 'stroke');
+            label.setAttribute('stroke', '#111827');
+            label.setAttribute('stroke-width', '3');
+            label.setAttribute('stroke-linejoin', 'round');
+            label.setAttribute('data-fibonacci-label', String(level.value));
+            if (drawingIndex !== null) {
+                label.setAttribute('data-fibonacci-index', String(drawingIndex));
+                label.setAttribute('pointer-events', 'all');
+                label.setAttribute('cursor', 'pointer');
+            }
+            label.textContent = `${level.value} (${this.formatFibonacciPrice(price)})`;
+            this.drawingOverlay.appendChild(label);
+        });
+
+        [start, end].forEach(point => {
+            const handle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            handle.setAttribute('cx', point.x);
+            handle.setAttribute('cy', point.y);
+            handle.setAttribute('r', '3');
+            handle.setAttribute('fill', '#111827');
+            handle.setAttribute('stroke', '#ffffff');
+            handle.setAttribute('stroke-width', '1.5');
+            handle.setAttribute('opacity', opacity);
+            if (drawingIndex !== null) handle.setAttribute('data-fibonacci-index', String(drawingIndex));
+            this.drawingOverlay.appendChild(handle);
+        });
+    }
+
     scheduleOverlayRender() {
         if (this.overlayRenderFrame !== null) return;
         this.overlayRenderFrame = window.requestAnimationFrame(() => {
@@ -3406,7 +3704,9 @@ function ensureFreelancerChart(symbol = FREELANCER_DEFAULT_SYMBOL) {
 
 class FreelancerWeightedStocksPane {
     constructor() {
-        this.codes = ['2330', '2454', '2317', '2308'];
+        this.codes = ['2330', '2454', '2317', '2308', '00981A'];
+        this.period = 'intraday';
+        this.stockPayloads = {};
         this.charts = {};
         this.stockState = {};
         this.refreshTimer = null;
@@ -3416,6 +3716,9 @@ class FreelancerWeightedStocksPane {
 
     init() {
         if (!window.LightweightCharts) return;
+        document.querySelectorAll('.fl-weighted-periods button[data-period]').forEach(button => {
+            button.onclick = () => this.setPeriod(button.dataset.period);
+        });
         this.codes.forEach(code => this.ensureChart(code));
         this.attachResizeObserver();
         this.load();
@@ -3457,8 +3760,8 @@ class FreelancerWeightedStocksPane {
                     return `${hh}:${mm}`;
                 }
             },
-            handleScroll: { mouseWheel: false, pressedMouseMove: false },
-            handleScale: { axisPressedMouseMove: false, mouseWheel: false, pinch: false }
+            handleScroll: false,
+            handleScale: false
         });
 
         // Lightweight Charts 的時間軸是依「資料點數」等距排列，不是依時間差。
@@ -3477,6 +3780,12 @@ class FreelancerWeightedStocksPane {
             topColor: FREELANCER_MARKET_COLORS.flatTop,
             bottomColor: FREELANCER_MARKET_COLORS.flatBottom,
             lineWidth: 2,
+            priceFormat: { type: 'price', precision: 2, minMove: 0.01 }
+        });
+        const candleSeries = chart.addCandlestickSeries({
+            upColor: '#ef5350', downColor: '#26a69a',
+            wickUpColor: '#ef5350', wickDownColor: '#26a69a',
+            borderVisible: false, visible: false,
             priceFormat: { type: 'price', precision: 2, minMove: 0.01 }
         });
         const avgSeries = chart.addLineSeries({
@@ -3505,6 +3814,7 @@ class FreelancerWeightedStocksPane {
         this.charts[code] = {
             chart,
             priceSeries,
+            candleSeries,
             avgSeries,
             volumeSeries,
             timeAnchorSeries,
@@ -3514,6 +3824,125 @@ class FreelancerWeightedStocksPane {
             sessionEnd: null
         };
         this.resizeOne(code);
+    }
+
+    setPeriod(period) {
+        if (!['intraday', '1', '3', '5', '15', '60'].includes(period)) return;
+        this.period = period;
+        document.querySelectorAll('.fl-weighted-periods button[data-period]').forEach(button => {
+            button.setAttribute('aria-pressed', String(button.dataset.period === period));
+        });
+        for (const code of this.codes) {
+            const parts = this.charts[code];
+            if (!parts) continue;
+            const intraday = period === 'intraday';
+            parts.priceSeries.setData([]);
+            parts.avgSeries.setData([]);
+            parts.candleSeries.setData([]);
+            parts.volumeSeries.setData([]);
+            parts.timeAnchorSeries.setData([]);
+            parts.sessionStart = null;
+            parts.sessionEnd = null;
+            parts.priceSeries.applyOptions({ visible: intraday });
+            parts.avgSeries.applyOptions({ visible: intraday });
+            parts.candleSeries.applyOptions({ visible: !intraday });
+            if (parts.openPriceLine) {
+                parts.priceSeries.removePriceLine(parts.openPriceLine);
+                parts.openPriceLine = null;
+            }
+            parts.hourAxis.style.display = intraday ? '' : 'none';
+            parts.chart.applyOptions({ timeScale: {
+                tickMarkFormatter: intraday ? () => '' : time => {
+                    const date = new Date((Number(time) + 28800) * 1000);
+                    return `${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}`;
+                }
+            }});
+            if (this.stockPayloads[code]) this.renderStock(this.stockPayloads[code]);
+        }
+        this.resize();
+    }
+
+    candleBars(stock, minutes) {
+        const grouped = new Map();
+        const bars = [...(stock.bars || [])].sort((a, b) => Number(a.time) - Number(b.time));
+        const session = bars.length ? this.weightedSessionBounds(bars[bars.length - 1].time) : null;
+        if (!session) return [];
+        for (const bar of bars) {
+            const closeTime = Number(bar.time);
+            const open = Number(bar.open), high = Number(bar.high), low = Number(bar.low);
+            const close = Number(bar.price);
+            if (![open, high, low, close].every(v => Number.isFinite(v) && v > 0)) continue;
+            if (closeTime < session.start || closeTime > session.end) continue;
+            // Close-stamped 09:01..09:05 bars belong to the 09:00 five-minute candle.
+            const time = session.start + Math.floor(Math.max(0, closeTime - session.start - 1) / (minutes * 60)) * minutes * 60;
+            const existing = grouped.get(time);
+            if (existing) {
+                existing.high = Math.max(existing.high, high);
+                existing.low = Math.min(existing.low, low);
+                existing.close = close;
+                existing.volume += Math.max(0, Number(bar.volume) || 0);
+            } else {
+                grouped.set(time, { time, open, high, low, close, volume: Math.max(0, Number(bar.volume) || 0) });
+            }
+        }
+        return [...grouped.values()];
+    }
+
+    renderCandles(code, fit = true) {
+        const parts = this.charts[code], stock = this.stockPayloads[code];
+        if (!parts || !stock) return;
+        const bars = this.candleBars(stock, Number(this.period));
+        parts.candleSeries.setData(bars.map(({ volume, ...bar }) => bar));
+        parts.volumeSeries.setData(bars.map(bar => ({
+            time: bar.time, value: bar.volume,
+            color: bar.close >= bar.open ? '#ef5350' : '#26a69a'
+        })));
+        if (bars.length) {
+            this.updateValue(code, stock.last || bars[bars.length - 1].close, stock.change_pct, stock.change);
+        } else {
+            const valueEl = document.getElementById(`fl-weighted-value-${code}`);
+            if (valueEl) valueEl.textContent = '無 K 線資料';
+        }
+        if (fit) parts.chart.timeScale().fitContent();
+    }
+
+    cacheRealtimeBar(event, isCandle) {
+        const code = String(event.code);
+        const price = Number(isCandle ? event.close : event.price);
+        const timestamp = Number(event.time);
+        if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(timestamp)) return;
+        const session = this.weightedSessionBounds(timestamp);
+        if (!session || timestamp < session.start || timestamp > session.end) return;
+        let stock = this.stockPayloads[code];
+        const oldBars = stock?.bars || [];
+        const previousSession = oldBars.length ? this.weightedSessionBounds(oldBars[oldBars.length - 1].time) : null;
+        if (!stock || previousSession?.start !== session.start) {
+            stock = { code, bars: [], open: Number(event.open) || price, reference: Number(event.reference) || 0 };
+            this.stockPayloads[code] = stock;
+        }
+        const time = Math.min(session.end, Math.floor(timestamp / 60) * 60 + 60);
+        const index = stock.bars.findIndex(bar => Number(bar.time) === time);
+        const previous = index >= 0 ? stock.bars[index] : null;
+        // Late candle corrections replace a minute; late ticks cannot move the quote backwards.
+        if (!isCandle && stock.bars.length && time < Number(stock.bars[stock.bars.length - 1].time)) return;
+        const bar = {
+            time, price,
+            open: isCandle ? Number(event.open) || price : Number(previous?.open) || price,
+            high: isCandle ? Number(event.high) || price : Math.max(Number(previous?.high) || price, price),
+            low: isCandle ? Number(event.low) || price : Math.min(Number(previous?.low) || price, price),
+            avg: Number(event.avg) || Number(previous?.avg) || price,
+            volume: isCandle ? Math.max(0, Number(event.volume) || 0)
+                : (Number(previous?.volume) || 0) + Math.max(0, Number(event.tick_volume) || 0)
+        };
+        if (index >= 0) stock.bars[index] = bar;
+        else stock.bars.push(bar);
+        stock.bars.sort((a, b) => Number(a.time) - Number(b.time));
+        if (time === Number(stock.bars[stock.bars.length - 1].time)) {
+            stock.last = price;
+            stock.reference = Number(event.reference) || stock.reference || 0;
+            stock.change = stock.reference ? price - stock.reference : Number(event.change) || 0;
+            stock.change_pct = stock.reference ? stock.change / stock.reference * 100 : Number(event.change_pct) || 0;
+        }
     }
 
     weightedSessionBounds(timestamp) {
@@ -3596,8 +4025,13 @@ class FreelancerWeightedStocksPane {
 
     renderStock(stock) {
         const code = stock.code;
+        this.stockPayloads[code] = stock;
         this.ensureChart(code);
         const parts = this.charts[code];
+        if (this.period !== 'intraday') {
+            this.renderCandles(code);
+            return;
+        }
         const barMap = new Map();
         (stock.bars || [])
             .filter(b => Number.isFinite(Number(b.price)) && Number.isFinite(Number(b.time)))
@@ -3772,6 +4206,11 @@ class FreelancerWeightedStocksPane {
     updateTick(tick) {
         const code = String(tick?.code || '');
         if (!this.codes.includes(code)) return;
+        this.cacheRealtimeBar(tick, false);
+        if (this.period !== 'intraday') {
+            this.renderCandles(code, false);
+            return;
+        }
         this.ensureChart(code);
         const parts = this.charts[code];
         if (!parts) return;
@@ -3833,6 +4272,11 @@ class FreelancerWeightedStocksPane {
     updateKbar(kbar) {
         const code = String(kbar?.code || '');
         if (!this.codes.includes(code)) return;
+        this.cacheRealtimeBar(kbar, true);
+        if (this.period !== 'intraday') {
+            this.renderCandles(code, false);
+            return;
+        }
         this.ensureChart(code);
         const parts = this.charts[code];
         if (!parts) return;
@@ -3915,9 +4359,7 @@ class FreelancerWeightedStocksPane {
         const height = el.clientHeight;
         if (width > 0 && height > 0) {
             parts.chart.resize(width, height);
-            if (parts.sessionStart && parts.sessionEnd) {
-                parts.chart.timeScale().fitContent();
-            }
+            parts.chart.timeScale().fitContent();
             this.updateHourAxis(code);
         }
     }
@@ -5815,7 +6257,15 @@ if (loginBtn) {
                 method: 'POST',
                 body: formData
             });
-            const data = await res.json();
+            let data;
+            try {
+                data = await res.json();
+            } catch (parseError) {
+                document.getElementById('login-msg').innerText =
+                    `登入失敗：伺服器回應格式異常（HTTP ${res.status}），請查看伺服器錯誤紀錄。`;
+                loginBtn.disabled = false;
+                return;
+            }
             if (res.ok && data.status === 'success') {
                 startApp(data.contract);
             } else {
@@ -6036,7 +6486,7 @@ function connectWebSocket() {
         if (mSelector && mSelector.value === 'freelancer') {
             if (msg.type === 'tick') {
                 if (freelancerChartPane) {
-                    freelancerChartPane.onTick(msg.data.price, msg.data.time);
+                    freelancerChartPane.onTick(msg.data.price, msg.data.time, false, msg.data.tick_volume);
                 }
                 if (freelancerChartPane?.symbol === 'TXFR1') {
                     flUpdateTodayAmplitudeFromTick(

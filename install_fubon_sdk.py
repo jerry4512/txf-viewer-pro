@@ -79,7 +79,15 @@ def main() -> int:
         if result.returncode != 0:
             return result.returncode
 
-    installed = installed_version()
+    # A first --user install can create a site-packages directory that was
+    # absent from this process's sys.path at startup. Check in a fresh Python
+    # process so the newly created user site is included.
+    verification = subprocess.run(
+        [sys.executable, "-c",
+         "import importlib.metadata; print(importlib.metadata.version('fubon-neo'))"],
+        check=False, capture_output=True, text=True,
+    )
+    installed = verification.stdout.strip() if verification.returncode == 0 else None
     if installed != VERSION:
         print(
             f"[富邦 SDK] 安裝後版本不符：{installed or '未偵測到'}",
